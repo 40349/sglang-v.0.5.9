@@ -468,6 +468,20 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
+        print(
+            f"[TRACE-4 FINISHED cls={type(self).__name__}] rid={req.rid} "
+            f"has_sub={req.has_sub_contexts} page={self.page_size} "
+            f"eagle={self.is_eagle} protected={req.cache_protected_len} "
+            f"sub_nodes={req.sub_context_last_nodes is not None}"
+        )
+
+        # CacheSlide (Stage B): the prompt was already inserted per-namespace during
+        # `cache_unfinished_req`. Just unlock those leaves and free the generated tail
+        # (the continuation is not cached in any namespace here).
+        if req.sub_context_last_nodes is not None:
+            self._finish_sub_contexts(req, kv_indices)
+            return
+
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
         keys = self._page_align_keys(keys)
@@ -496,15 +510,56 @@ class RadixCache(BasePrefixCache):
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
 
+    def _finish_sub_contexts(self, req: Req, kv_indices: torch.Tensor):
+        """CacheSlide (Stage B): finish a request whose prompt was cached per-namespace.
+
+        The prompt KV [0:cache_protected_len) is owned and locked by the per-namespace
+        leaves recorded in ``req.sub_context_last_nodes`` -- it stays in the tree, we
+        only release those locks. Everything after the prompt (the decode continuation)
+        is not cached in any namespace, so its slots are freed here.
+        """
+        prompt_len = req.cache_protected_len
+        # Free the generated tail (not owned by any namespace node).
+        if prompt_len < len(kv_indices):
+            self.token_to_kv_pool_allocator.free(kv_indices[prompt_len:])
+
+        # Release the per-namespace prompt locks taken in cache_unfinished_req.
+        for node in req.sub_context_last_nodes:
+            self.dec_lock_ref(node)
+        req.sub_context_last_nodes = None
+        req.sub_context_owned_lens = None
+
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:
             return
 
+        print(
+            f"[TRACE-4 UNFINISHED cls={type(self).__name__}] rid={req.rid} "
+            f"chunked={chunked} has_sub={req.has_sub_contexts} "
+            f"protected={req.cache_protected_len}"
+        )
+
         token_ids = req.fill_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+
+        # CacheSlide (Stage B): insert the prompt as one node PER sub-context namespace
+        # instead of a single default-namespace node. Handles chunked prefill too: each
+        # chunk extends every namespace by the newly-covered slice of its segment
+        # (`sub_context_owned_lens` tracks per-segment progress). NOTE: this deliberately
+        # does not wire cross-namespace prefix matching for decode continuation, so
+        # generated output is not correct yet -- the goal is an observable per-namespace
+        # tree that also survives chunked prefill without leaking/double-freeing KV.
+        if (
+            req.has_sub_contexts
+            and self.page_size == 1
+            and not self.is_eagle
+            and len(token_ids) <= sum(len(s) for s in req.sub_context_ids)
+        ):
+            self._cache_unfinished_sub_contexts(req, token_ids, kv_indices)
+            return
 
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
@@ -560,6 +615,92 @@ class RadixCache(BasePrefixCache):
             req.prefix_indices = new_indices
 
         req.last_node = new_last_node
+
+    def _cache_unfinished_sub_contexts(
+        self, req: Req, token_ids: List[int], kv_indices: torch.Tensor
+    ):
+        """CacheSlide (Stage B): insert the (possibly partial) prompt block-by-block,
+        each under its own ``extra_key`` namespace, and lock each block's leaf so the
+        prompt KV survives across chunks and into decode.
+
+        Chunk-safe: ``token_ids`` is the cumulative prefill prefix so far. Each call
+        extends every reached segment up to its currently-covered end; per-segment
+        progress is tracked in ``req.sub_context_owned_lens`` so only freshly-computed
+        duplicate slots are freed. Locks are fully self-owned here: the scheduler's
+        per-chunk lock lives on ``req.last_node`` which we reset to the (no-op) root, so
+        the previous chunk's namespace locks are released and re-taken symmetrically.
+        """
+        values = kv_indices.to(dtype=torch.int64, copy=True)
+        priority = getattr(req, "priority", 0) or 0
+        end_k = len(token_ids)  # cumulative prefill length so far
+
+        # Release the scheduler lock (root => no-op) and the previous chunk's namespace
+        # locks; we re-take fresh namespace locks below.
+        self.dec_lock_ref(req.last_node)
+        if req.sub_context_last_nodes is not None:
+            for node in req.sub_context_last_nodes:
+                self.dec_lock_ref(node)
+
+        if req.sub_context_owned_lens is None:
+            req.sub_context_owned_lens = [0] * len(req.sub_context_extra_keys)
+
+        seg_last_nodes = []
+        matched_indices = []
+        for i, (seg_ids, seg_key, offset) in enumerate(req.iter_sub_contexts()):
+            covered_end = min(offset + len(seg_ids), end_k)
+            if covered_end <= offset:
+                continue  # this segment not reached by the current chunk yet
+            seg_key_ids = token_ids[offset:covered_end]
+            radix_key = RadixKey(seg_key_ids, seg_key)
+
+            result = self.insert(
+                InsertParams(
+                    key=radix_key, value=values[offset:covered_end], priority=priority
+                )
+            )
+            # Free freshly-computed slots that duplicate what is already in this
+            # namespace beyond what THIS request had previously inserted.
+            owned = req.sub_context_owned_lens[i]
+            if result.prefix_len > owned:
+                self.token_to_kv_pool_allocator.free(
+                    kv_indices[offset + owned : offset + result.prefix_len]
+                )
+
+            # Re-point req_to_token at the tree-owned slots for this block.
+            seg_match = self.match_prefix(MatchPrefixParams(key=radix_key))
+            seg_indices = seg_match.device_indices
+            assert len(seg_indices) == covered_end - offset, (
+                f"{len(seg_indices)=}, {covered_end - offset=}, extra_key={seg_key!r}"
+            )
+            self.req_to_token_pool.write(
+                (req.req_pool_idx, slice(offset, covered_end)), seg_indices
+            )
+
+            self.inc_lock_ref(seg_match.last_device_node)
+            seg_last_nodes.append(seg_match.last_device_node)
+            matched_indices.append(seg_indices)
+            req.sub_context_owned_lens[i] = covered_end - offset
+
+        req.sub_context_last_nodes = seg_last_nodes
+
+        # Segments are contiguous from 0, so this is exactly the [0:end_k] prefix.
+        prompt_indices = (
+            torch.cat(matched_indices) if matched_indices else kv_indices[:0]
+        )
+        req.cache_protected_len = len(prompt_indices)
+        if len(prompt_indices) < len(kv_indices):
+            req.prefix_indices = torch.cat(
+                [prompt_indices, kv_indices[len(prompt_indices) :]]
+            )
+        else:
+            req.prefix_indices = prompt_indices
+        # Neutralize the scheduler's per-chunk lock pairing: root inc/dec are no-ops.
+        req.last_node = self.root_node
+
+        print(
+            f"[TRACE-4 SUBCTX-INSERT] rid={req.rid} end_k={end_k} "
+            f"segments={[(k, o) for k, o in zip(req.sub_context_extra_keys, req.sub_context_owned_lens)]}"
+        )
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)

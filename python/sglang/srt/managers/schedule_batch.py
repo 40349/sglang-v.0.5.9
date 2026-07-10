@@ -542,6 +542,8 @@ class Req(ReqDllmMixin):
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
+        sub_context_ids: Optional[List[List[int]]] = None,
+        sub_context_extra_keys: Optional[List[str]] = None,
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
@@ -605,6 +607,22 @@ class Req(ReqDllmMixin):
             ) + lora_id  # lora_id is concatenated to the extra key
 
         self.extra_key = extra_key
+
+        # CacheSlide: ordered per-block token ids and their radix namespaces.
+        # concat(sub_context_ids) == origin_input_ids. None for normal requests.
+        self.sub_context_ids = sub_context_ids
+        self.sub_context_extra_keys = sub_context_extra_keys
+        # Per-block radix hit lengths (filled during scheduling; parallel to keys).
+        self.sub_context_match_lens: Optional[List[int]] = None
+        # CacheSlide (Stage B): the per-namespace leaf nodes locked when the prompt
+        # was inserted in `cache_unfinished_req`. Non-None marks that this request's
+        # prompt lives under sub-context namespaces (not the default None namespace),
+        # so `cache_finished_req` unlocks these instead of re-inserting.
+        self.sub_context_last_nodes: Optional[List] = None
+        # CacheSlide (Stage B): how many tokens of each segment this request has already
+        # inserted into its namespace, accumulated across chunked-prefill chunks. Used to
+        # free only the freshly-computed duplicate slots (parallel to sub_context_ids).
+        self.sub_context_owned_lens: Optional[List[int]] = None
 
         # # --- 強制攔截：只要是我們自訂的 subcontext，強制不生成任何新 token ---
         # if self.extra_key in ["system_prompt_key", "tools_key", "messages_key"]:
@@ -821,9 +839,34 @@ class Req(ReqDllmMixin):
         self.init_diffusion_llm(dllm_config)
 
         # --- 追蹤 Scheduler 建立 Req ---
-        print(f"[TRACE-3 Scheduler] 建立 Req 實例, rid={self.rid}")
-        print(f"[TRACE-3 Scheduler] self.extra_key={getattr(self, 'extra_key', '實例無此屬性')}")
+        # print(f"[TRACE-3 Scheduler] 建立 Req 實例, rid={self.rid}")
+        # print(f"[TRACE-3 Scheduler] self.extra_key={getattr(self, 'extra_key', '實例無此屬性')}")
+        if self.sub_context_extra_keys:
+            print(
+                f"[TRACE-3 Scheduler] sub_context_extra_keys={self.sub_context_extra_keys} "
+                f"segment_lens={[len(s) for s in (self.sub_context_ids or [])]}"
+            )
         # -----------------------------
+
+    @property
+    def has_sub_contexts(self) -> bool:
+        """CacheSlide: whether this request was split into per-namespace blocks."""
+        return bool(self.sub_context_extra_keys) and bool(self.sub_context_ids)
+
+    def iter_sub_contexts(self):
+        """Yield ``(segment_token_ids, extra_key, offset)`` for each block in order.
+
+        ``offset`` is the block's starting index within ``origin_input_ids`` so the
+        finished KV cache can be sliced per block for per-namespace radix insertion.
+        """
+        if not self.has_sub_contexts:
+            return
+        offset = 0
+        for seg_ids, seg_key in zip(
+            self.sub_context_ids, self.sub_context_extra_keys
+        ):
+            yield seg_ids, seg_key, offset
+            offset += len(seg_ids)
 
     @property
     def seqlen(self) -> int:

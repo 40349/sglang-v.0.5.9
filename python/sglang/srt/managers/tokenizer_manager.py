@@ -672,6 +672,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         input_embeds = None
         input_text = obj.text
         token_type_ids = None
+        # CacheSlide: per-block token ids / namespaces (None unless request is split).
+        sub_context_ids = None
+        sub_context_extra_keys = None
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
@@ -694,9 +697,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "the engine with skip_tokenizer_init=False."
                 )
 
-            input_ids, token_type_ids = await self._tokenize_texts(
-                input_text, is_cross_encoder_request
-            )
+            if isinstance(obj, GenerateReqInput) and obj.sub_contexts:
+                # CacheSlide: tokenize each block independently so its token ids
+                # match its own radix namespace, then stitch into one sequence.
+                contents = [sc["content"] for sc in obj.sub_contexts]
+                sub_context_extra_keys = [sc["extra_key"] for sc in obj.sub_contexts]
+                sub_context_ids, _ = await self._tokenize_texts(
+                    contents, is_cross_encoder_request
+                )
+                input_ids = [tok for seg in sub_context_ids for tok in seg]
+            else:
+                input_ids, token_type_ids = await self._tokenize_texts(
+                    input_text, is_cross_encoder_request
+                )
 
         if self.mm_processor and obj.contains_mm_input():
             if obj.image_data is not None and not isinstance(obj.image_data, list):
@@ -745,7 +758,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self._validate_one_request(obj, input_ids)
         trace_slice_end(RequestStage.TOKENIZE, obj.rid)
         return self._create_tokenized_object(
-            obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
+            obj,
+            input_text,
+            input_ids,
+            input_embeds,
+            mm_inputs,
+            token_type_ids,
+            sub_context_ids=sub_context_ids,
+            sub_context_extra_keys=sub_context_extra_keys,
         )
 
     def _validate_one_request(
@@ -899,6 +919,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         input_embeds: Optional[Union[List[float], None]] = None,
         mm_inputs: Optional[Dict] = None,
         token_type_ids: Optional[List[int]] = None,
+        sub_context_ids: Optional[List[List[int]]] = None,
+        sub_context_extra_keys: Optional[List[str]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
         # Parse sampling parameters
@@ -943,6 +965,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
+                sub_context_ids=sub_context_ids,
+                sub_context_extra_keys=sub_context_extra_keys,
                 routing_key=obj.routing_key,
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
@@ -962,8 +986,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
 
         # --- 追蹤 Tokenizer ---
-        print(f"[TRACE-2 Tokenizer] 準備建立 Req, rid={tokenized_obj.rid}")
-        print(f"[TRACE-2 Tokenizer] extra_key={getattr(tokenized_obj, 'extra_key', 'Lose')}")
+        # print(f"[TRACE-2 Tokenizer] 準備建立 Req, rid={tokenized_obj.rid}")
+        # print(f"[TRACE-2 Tokenizer] extra_key={getattr(tokenized_obj, 'extra_key', 'Lose')}")
+        _sc_keys = getattr(tokenized_obj, "sub_context_extra_keys", None)
+        if _sc_keys:
+            _sc_ids = getattr(tokenized_obj, "sub_context_ids", None) or []
+            _sc_lens = [len(seg) for seg in _sc_ids]
+            print(
+                f"[TRACE-2 Tokenizer] sub_contexts: extra_keys={_sc_keys} "
+                f"segment_token_lens={_sc_lens}"
+            )
 
         return tokenized_obj
 

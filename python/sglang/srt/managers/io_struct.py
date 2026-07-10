@@ -251,6 +251,13 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
+    # CacheSlide sub-contexts. An ordered list of logically-distinct blocks that
+    # openclaw splits a single request into (e.g. system_prompt / tools / messages).
+    # Each item is a dict {"content": str, "extra_key": str}. Every block is
+    # tokenized independently and matched/inserted in its own radix namespace
+    # (keyed by its extra_key), then stitched into a single sequence for one decode.
+    sub_contexts: Optional[List[Dict[str, str]]] = None
+
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
@@ -299,6 +306,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             ValueError: If inputs are not properly specified (e.g., none or all of
                        text, input_ids, input_embeds are provided)
         """
+        self._normalize_sub_contexts()
         self._validate_inputs()
         self._determine_batch_size()
         self._handle_parallel_sampling()
@@ -307,6 +315,22 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             self._normalize_single_inputs()
         else:
             self._normalize_batch_inputs()
+
+    def _normalize_sub_contexts(self):
+        """CacheSlide: derive a single ``text`` prompt from ``sub_contexts``.
+
+        openclaw sends the request pre-split into ordered blocks. We concatenate
+        their contents so batch-size detection and the rest of the pipeline see one
+        single prompt; the actual per-block tokenization (and per-namespace radix
+        matching) happens in ``TokenizerManager._tokenize_one_request``.
+        """
+        if not self.sub_contexts:
+            return
+        if self.text is not None or self.input_ids is not None:
+            # Explicit text/input_ids take precedence; sub_contexts is only used to
+            # carry the per-block extra_key namespaces alongside them.
+            return
+        self.text = "".join(sc["content"] for sc in self.sub_contexts)
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
@@ -678,6 +702,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
+            sub_contexts=self.sub_contexts,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -752,6 +777,12 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
+
+    # CacheSlide: per-block token ids and their radix namespaces (extra_keys),
+    # parallel lists in prompt order. ``concat(sub_context_ids) == input_ids``.
+    # None when the request was not split into sub-contexts.
+    sub_context_ids: Optional[List[List[int]]] = None
+    sub_context_extra_keys: Optional[List[str]] = None
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None

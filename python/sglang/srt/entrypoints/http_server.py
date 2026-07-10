@@ -649,9 +649,10 @@ if os.environ.get("SGLANG_DUMPER_SERVER_PORT") == "reuse":
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
-    # Trace Request
-    print(f"\n[TRACE-1 HTTP] 收到請求 rid={obj.rid}")
-    print(f"[TRACE-1 HTTP] extra_key={obj.extra_key}")
+    _keys = [sc["extra_key"] for sc in obj.sub_contexts] if obj.sub_contexts else None
+    print(f"[TRACE-1 HTTP] 收到請求 rid={obj.rid}")
+    print(f"[TRACE-1 HTTP] sub_context extra_keys={_keys}")
+
 
     if obj.stream:
 
