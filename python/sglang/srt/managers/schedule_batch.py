@@ -1005,12 +1005,22 @@ class Req(ReqDllmMixin):
         """CCPE: match each sub-context in its own namespace, log the hit, and stitch
         the contiguous cached prefix so prefill reuses those KV slots.
 
-        Segments are matched independently but only reused while they form a
-        contiguous prefix from position 0: take fully-hit segments in order and stop
-        at the first that is not fully reused (partial hit, or the ``input_len - 1``
-        cap that keeps >=1 token to compute). The stitched slots become
-        ``prefix_indices`` (so ``#cached-token`` reflects the reuse) and per-segment
-        reused lengths are seeded into ``sub_context_owned_lens`` so
+        Matching is exhaustive: the loop never breaks, so every non-empty segment is
+        probed and ``sub_context_match_lens`` records its full hit length even when the
+        hit ends up unused -- that is the data WCA needs to size the cross-namespace
+        opportunity.
+
+        Reuse is the conservative part. A segment's hit is stitched in only while the
+        reused slots still form a contiguous prefix from position 0. Contiguity is
+        broken by a partial hit (``take < len(seg_ids)``) or by the ``input_len - 1``
+        cap that keeps >=1 token to compute; a segment that misses entirely, or that is
+        empty, contributes nothing but leaves contiguity intact, so a later segment can
+        still be stitched. Once broken, subsequent segments are still matched but never
+        reused.
+
+        The stitched slots become ``prefix_indices`` (so ``#cached-token`` reflects the
+        reuse) and per-segment *reused* lengths -- 0 for matched-but-unused segments --
+        are seeded into ``sub_context_owned_lens`` so
         ``RadixCache._cache_unfinished_sub_contexts`` treats them as already-owned and
         does not free the reused slots.
 
