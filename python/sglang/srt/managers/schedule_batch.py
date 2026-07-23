@@ -614,6 +614,16 @@ class Req(ReqDllmMixin):
         self.sub_context_extra_keys = sub_context_extra_keys
         # Per-block radix hit lengths (filled during scheduling; parallel to keys).
         self.sub_context_match_lens: Optional[List[int]] = None
+        # WCA: the actual KV slots each block hit in its own namespace, and the nodes
+        # that own them (both parallel to sub_context_ids; entry is None where the block
+        # missed or is empty). Recorded by `_stitch_sub_contexts` for EVERY block, not
+        # just the contiguously-reusable ones, so a later stage can adjust and reuse the
+        # hits that contiguity currently forces us to drop. The nodes are lock-ref'd
+        # while these indices are live -- an unlocked slot can be evicted and reallocated
+        # under us, which would silently feed garbage KV into attention -- so the two
+        # fields are always cleared together by `release_sub_context_match_locks`.
+        self.sub_context_match_indices: Optional[List[Optional[torch.Tensor]]] = None
+        self.sub_context_match_nodes: Optional[List[Optional[Any]]] = None
         # CacheSlide (Stage B): the per-namespace leaf nodes locked when the prompt
         # was inserted in `cache_unfinished_req`. Non-None marks that this request's
         # prompt lives under sub-context namespaces (not the default None namespace),
@@ -1001,14 +1011,33 @@ class Req(ReqDllmMixin):
 
         self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
 
+    def release_sub_context_match_locks(self, tree_cache: BasePrefixCache) -> None:
+        """WCA: drop the per-block match locks taken in ``_stitch_sub_contexts``.
+
+        Idempotent -- safe to call when nothing is held. Clears
+        ``sub_context_match_indices`` together with the nodes: once unlocked the slots
+        may be evicted, so keeping the indices around would leave dangling references.
+        """
+        if self.sub_context_match_nodes is None:
+            self.sub_context_match_indices = None
+            return
+        for node in self.sub_context_match_nodes:
+            if node is not None:
+                tree_cache.dec_lock_ref(node)
+        self.sub_context_match_nodes = None
+        self.sub_context_match_indices = None
+
     def _stitch_sub_contexts(self, tree_cache: BasePrefixCache) -> None:
         """CCPE: match each sub-context in its own namespace, log the hit, and stitch
         the contiguous cached prefix so prefill reuses those KV slots.
 
         Matching is exhaustive: the loop never breaks, so every non-empty segment is
-        probed and ``sub_context_match_lens`` records its full hit length even when the
-        hit ends up unused -- that is the data WCA needs to size the cross-namespace
-        opportunity.
+        probed and its result is recorded even when the hit ends up unused -- that is
+        the raw material WCA needs. ``sub_context_match_lens`` holds the hit length,
+        ``sub_context_match_indices`` the actual KV slots, and
+        ``sub_context_match_nodes`` the owning nodes, which are lock-ref'd here so the
+        slots cannot be evicted out from under a later reuse pass. All three are
+        parallel to ``sub_context_ids``, with None/0 where a segment missed.
 
         Reuse is the conservative part. A segment's hit is stitched in only while the
         reused slots still form a contiguous prefix from position 0. Contiguity is
@@ -1024,9 +1053,10 @@ class Req(ReqDllmMixin):
         ``RadixCache._cache_unfinished_sub_contexts`` treats them as already-owned and
         does not free the reused slots.
 
-        NOTE (first-cut): the reused prefix nodes are not locked here, so this is only
-        safe without eviction pressure; robust locking lands with WCA. Decode output is
-        still approximate (no cross-namespace position/attention correction yet).
+        NOTE (first-cut): only the match locks above are taken -- the *stitched* prefix
+        is still protected solely by them, so reuse remains safe only for as long as
+        they are held; full lock coverage lands with WCA. Decode output is still
+        approximate (no cross-namespace position/attention correction yet).
         """
 
         def _preview(ids, head: int = 10, tail: int = 5) -> str:
@@ -1035,22 +1065,39 @@ class Req(ReqDllmMixin):
                 return str(ids)
             return f"{ids[:head]} ... {ids[-tail:]}"
 
+        # A re-scheduled request (e.g. after retraction) stitches again; drop the locks
+        # the previous pass took before recording a fresh set.
+        self.release_sub_context_match_locks(tree_cache)
+
         max_prefix_len = max(len(self.fill_ids) - 1, 0)
         stitched: List[torch.Tensor] = []
         match_lens: List[int] = []
         owned: List[int] = []
+        match_indices: List[Optional[torch.Tensor]] = []
+        match_nodes: List[Optional[Any]] = []
         total = 0
         contiguous = True
         for seg_ids, seg_key, _offset in self.iter_sub_contexts():
             if len(seg_ids) == 0:
                 match_lens.append(0)
                 owned.append(0)
+                match_indices.append(None)
+                match_nodes.append(None)
                 continue
             seg_match = tree_cache.match_prefix(
                 MatchPrefixParams(key=RadixKey(token_ids=seg_ids, extra_key=seg_key))
             )
             hit = len(seg_match.device_indices)
             match_lens.append(hit)
+            if hit > 0:
+                # Lock before the slots are handed to WCA: they must outlive scheduling
+                # and survive until forward has read them.
+                tree_cache.inc_lock_ref(seg_match.last_device_node)
+                match_nodes.append(seg_match.last_device_node)
+                match_indices.append(seg_match.device_indices)
+            else:
+                match_nodes.append(None)
+                match_indices.append(None)
             print(
                 f"[TRACE-4 RadixCache] sub-context match rid={self.rid} "
                 f"extra_key={seg_key!r} hit={hit}/{len(seg_ids)} "
@@ -1071,6 +1118,8 @@ class Req(ReqDllmMixin):
 
         self.sub_context_match_lens = match_lens
         self.sub_context_owned_lens = owned
+        self.sub_context_match_indices = match_indices
+        self.sub_context_match_nodes = match_nodes
         if stitched:
             self.prefix_indices = torch.cat(stitched)
         else:

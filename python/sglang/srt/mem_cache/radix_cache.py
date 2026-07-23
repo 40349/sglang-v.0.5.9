@@ -475,6 +475,11 @@ class RadixCache(BasePrefixCache):
             f"sub_nodes={req.sub_context_last_nodes is not None}"
         )
 
+        # Safety net: a request that finished without ever reaching
+        # `_cache_unfinished_sub_contexts` (gate declined, or aborted while queued) still
+        # holds its scheduling-time match locks. Idempotent if already released there.
+        req.release_sub_context_match_locks(self)
+
         # CacheSlide (Stage B): the prompt was already inserted per-namespace during
         # `cache_unfinished_req`. Just unlock those leaves and free the generated tail
         # (the continuation is not cached in any namespace here).
@@ -682,6 +687,10 @@ class RadixCache(BasePrefixCache):
             req.sub_context_owned_lens[i] = covered_end - offset
 
         req.sub_context_last_nodes = seg_last_nodes
+        # Only now drop the scheduling-time match locks: the fresh per-namespace locks
+        # above already cover the prompt, so protection is continuous across the
+        # `insert` calls (which can evict).
+        req.release_sub_context_match_locks(self)
 
         # Segments are contiguous from 0, so this is exactly the [0:end_k] prefix.
         prompt_indices = (
