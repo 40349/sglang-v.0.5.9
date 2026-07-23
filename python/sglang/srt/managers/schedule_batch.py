@@ -955,7 +955,13 @@ class Req(ReqDllmMixin):
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
 
-        if tree_cache is not None:
+        if tree_cache is not None and self.has_sub_contexts:
+            # CCPE: sub-context requests are matched per-namespace, never against the
+            # default namespace (which would share a KV slot -- e.g. the warmup BOS --
+            # with a namespace node and trip the memory leak checker). The contiguous
+            # cached prefix is stitched from the per-namespace hits and reused.
+            self._stitch_sub_contexts(tree_cache)
+        elif tree_cache is not None:
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
@@ -994,6 +1000,78 @@ class Req(ReqDllmMixin):
             )
 
         self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
+
+    def _stitch_sub_contexts(self, tree_cache: BasePrefixCache) -> None:
+        """CCPE: match each sub-context in its own namespace, log the hit, and stitch
+        the contiguous cached prefix so prefill reuses those KV slots.
+
+        Segments are matched independently but only reused while they form a
+        contiguous prefix from position 0: take fully-hit segments in order and stop
+        at the first that is not fully reused (partial hit, or the ``input_len - 1``
+        cap that keeps >=1 token to compute). The stitched slots become
+        ``prefix_indices`` (so ``#cached-token`` reflects the reuse) and per-segment
+        reused lengths are seeded into ``sub_context_owned_lens`` so
+        ``RadixCache._cache_unfinished_sub_contexts`` treats them as already-owned and
+        does not free the reused slots.
+
+        NOTE (first-cut): the reused prefix nodes are not locked here, so this is only
+        safe without eviction pressure; robust locking lands with WCA. Decode output is
+        still approximate (no cross-namespace position/attention correction yet).
+        """
+
+        def _preview(ids, head: int = 10, tail: int = 5) -> str:
+            ids = list(ids)
+            if len(ids) <= head + tail:
+                return str(ids)
+            return f"{ids[:head]} ... {ids[-tail:]}"
+
+        max_prefix_len = max(len(self.fill_ids) - 1, 0)
+        stitched: List[torch.Tensor] = []
+        match_lens: List[int] = []
+        owned: List[int] = []
+        total = 0
+        contiguous = True
+        for seg_ids, seg_key, _offset in self.iter_sub_contexts():
+            if len(seg_ids) == 0:
+                match_lens.append(0)
+                owned.append(0)
+                continue
+            seg_match = tree_cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(token_ids=seg_ids, extra_key=seg_key))
+            )
+            hit = len(seg_match.device_indices)
+            match_lens.append(hit)
+            print(
+                f"[TRACE-4 RadixCache] sub-context match rid={self.rid} "
+                f"extra_key={seg_key!r} hit={hit}/{len(seg_ids)} "
+                f"hit_tokens={_preview(seg_ids[:hit])}"
+            )
+            take = 0
+            if contiguous and hit > 0:
+                take = min(hit, max_prefix_len - total)
+                if take <= 0:
+                    take = 0
+                    contiguous = False
+                else:
+                    stitched.append(seg_match.device_indices[:take])
+                    total += take
+                    if take < len(seg_ids):
+                        contiguous = False
+            owned.append(take)
+
+        self.sub_context_match_lens = match_lens
+        self.sub_context_owned_lens = owned
+        if stitched:
+            self.prefix_indices = torch.cat(stitched)
+        else:
+            self.prefix_indices = torch.empty(
+                (0,), dtype=torch.int64, device=tree_cache.device
+            )
+        self.last_node = tree_cache.root_node
+        self.last_host_node = tree_cache.root_node
+        self.host_hit_length = 0
+        self.mamba_branching_seqlen = None
+        self.cache_protected_len = len(self.prefix_indices)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):

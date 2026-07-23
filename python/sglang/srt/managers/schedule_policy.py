@@ -193,6 +193,10 @@ class SchedulePolicy:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             # NOTE: the prefix_indices must always be aligned with last_node
+            # CacheSlide: sub-context requests are matched/stitched per-namespace in
+            # Req.init_next_round_input (which always runs, unlike this LPM-only path),
+            # so the default-namespace match here is left as-is for sorting only and is
+            # harmlessly overwritten there.
             match_result = self.tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
@@ -209,13 +213,6 @@ class SchedulePolicy:
                 match_result.last_host_node,
                 match_result.host_hit_length,
             )
-
-            # CacheSlide: probe each sub-context in its own radix namespace.
-            # In Stage 0 this is informational (proves the per-block trees and their
-            # matches); cross-namespace KV stitching lands with CCPE/WCA (Stages 3-4),
-            # so the effective decode path above is unchanged.
-            if r.has_sub_contexts:
-                self._match_sub_contexts(r)
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -246,30 +243,33 @@ class SchedulePolicy:
                     )
         return temporary_deprioritized
 
-    def _match_sub_contexts(self, r: Req) -> None:
-        """CacheSlide: match each sub-context block against its own radix namespace.
-
-        Records per-block hit lengths on ``r.sub_context_match_lens`` (parallel to
-        ``r.sub_context_extra_keys``) for later CCPE/WCA stages, and logs them so the
-        three per-namespace trees are observable. Does not mutate ``r.prefix_indices``.
-        """
-        match_lens: List[int] = []
-        for seg_ids, seg_key, _offset in r.iter_sub_contexts():
-            if len(seg_ids) == 0:
-                match_lens.append(0)
-                continue
-            seg_match = self.tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(token_ids=seg_ids, extra_key=seg_key)
-                )
-            )
-            hit = len(seg_match.device_indices)
-            match_lens.append(hit)
-            print(
-                f"[TRACE-4 RadixCache] sub-context match rid={r.rid} "
-                f"extra_key={seg_key!r} hit={hit}/{len(seg_ids)}"
-            )
-        r.sub_context_match_lens = match_lens
+    # CacheSlide: superseded by Req._stitch_sub_contexts in schedule_batch.py, which
+    # runs unconditionally in init_next_round_input (this path is LPM-only). Kept here,
+    # commented out, for reference.
+    # def _match_sub_contexts(self, r: Req) -> None:
+    #     """CacheSlide: match each sub-context block against its own radix namespace.
+    #
+    #     Records per-block hit lengths on ``r.sub_context_match_lens`` (parallel to
+    #     ``r.sub_context_extra_keys``) for later CCPE/WCA stages, and logs them so the
+    #     three per-namespace trees are observable. Does not mutate ``r.prefix_indices``.
+    #     """
+    #     match_lens: List[int] = []
+    #     for seg_ids, seg_key, _offset in r.iter_sub_contexts():
+    #         if len(seg_ids) == 0:
+    #             match_lens.append(0)
+    #             continue
+    #         seg_match = self.tree_cache.match_prefix(
+    #             MatchPrefixParams(
+    #                 key=RadixKey(token_ids=seg_ids, extra_key=seg_key)
+    #             )
+    #         )
+    #         hit = len(seg_match.device_indices)
+    #         match_lens.append(hit)
+    #         print(
+    #             f"[TRACE-4 RadixCache] sub-context match rid={r.rid} "
+    #             f"extra_key={seg_key!r} hit={hit}/{len(seg_ids)}"
+    #         )
+    #     r.sub_context_match_lens = match_lens
 
     @staticmethod
     def _sort_by_longest_prefix(
