@@ -1059,6 +1059,15 @@ class Req(ReqDllmMixin):
         approximate (no cross-namespace position/attention correction yet).
         """
 
+        # CacheSlide sub-context caching is built on the radix tree (per-namespace
+        # match_prefix + root_node). ChunkCache -- selected by --disable-radix-cache --
+        # has none of it, so fail clearly instead of an opaque AttributeError later.
+        if not hasattr(tree_cache, "root_node"):
+            raise RuntimeError(
+                f"sub_contexts require the radix cache, but tree_cache is "
+                f"{type(tree_cache).__name__}. Remove --disable-radix-cache."
+            )
+
         def _preview(ids, head: int = 10, tail: int = 5) -> str:
             ids = list(ids)
             if len(ids) <= head + tail:

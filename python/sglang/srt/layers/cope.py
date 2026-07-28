@@ -129,6 +129,7 @@ def cope_attention(
     cope: ContextualPositionEmbedding,
     positions: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
+    q_offset: Optional[int] = None,
 ) -> torch.Tensor:
     """Reference causal self-attention with CoPE.
 
@@ -136,23 +137,36 @@ def cope_attention(
     added inside the softmax (fused RoPE kernels cannot express this). For
     correctness, training, and CKSim measurement -- not production throughput.
 
+    Supports rectangular attention: ``q_len`` (queries) may be shorter than
+    ``kv_len`` (keys), with the queries taken to be the trailing ``q_len`` positions
+    (``q_offset = kv_len - q_len``). This covers both prefill (q_len == kv_len, the
+    square causal case) and decode (q_len == 1 attending to all cached keys).
+
     Args:
-        query, key, value: ``[..., T, head_dim]`` (any leading batch/head dims).
+        query: ``[..., q_len, head_dim]``.
+        key, value: ``[..., kv_len, head_dim]``.
         cope: the :class:`ContextualPositionEmbedding` supplying the position bias.
         positions: optional CCPE position override forwarded to ``cope``.
         scale: softmax scale; defaults to ``1/sqrt(head_dim)``.
 
     Returns:
-        Attention output ``[..., T, head_dim]``.
+        Attention output ``[..., q_len, head_dim]``.
     """
     head_dim = query.shape[-1]
     scale = scale if scale is not None else 1.0 / math.sqrt(head_dim)
-    seq_len = query.shape[-2]
+    q_len, kv_len = query.shape[-2], key.shape[-2]
+    # Absolute position of the first query row. Defaults to the trailing-q_len case;
+    # query-block tiling passes an explicit offset so each block's rows keep their
+    # true absolute positions (and thus the correct causal window + CoPE positions).
+    if q_offset is None:
+        q_offset = kv_len - q_len
 
-    attn_logits = torch.matmul(query, key.transpose(-1, -2)) * scale
-    causal_mask = torch.ones(
-        seq_len, seq_len, dtype=torch.bool, device=query.device
-    ).tril()
+    attn_logits = torch.matmul(query, key.transpose(-1, -2)) * scale  # [.., q_len, kv_len]
+    # Query row i (absolute position q_offset + i) may attend key col j iff
+    # j <= q_offset + i. Reduces to a lower-triangular mask when q_len == kv_len.
+    rows = torch.arange(q_len, device=query.device).unsqueeze(-1) + q_offset
+    cols = torch.arange(kv_len, device=query.device).unsqueeze(0)
+    causal_mask = cols <= rows  # [q_len, kv_len]
 
     pos_logits = cope(query, attn_logits, causal_mask, positions=positions)
     # Position bias only applies to valid (causal) entries; mask the rest to -inf.

@@ -1,4 +1,5 @@
 cope_adapter/
+cope_merged/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

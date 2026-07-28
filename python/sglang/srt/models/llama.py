@@ -808,3 +808,16 @@ EntryClass = [
     InternLM3ForCausalLM,
     IQuestCoderForCausalLM,
 ]
+
+
+# CacheSlide: opt-in CoPE serving. Triggered here (bottom of the model module, after
+# LlamaAttention is defined) so the patch runs INSIDE each model-worker process --
+# env vars are inherited across SGLang's process spawn, a bare monkey-patch in the
+# launcher would not be. Set SGLANG_COPE_POS_EMB to the merged model's cope_pos_emb.pt
+# and launch with `--attention-backend torch_native`. No-op when the var is unset.
+import os as _os
+
+if _os.environ.get("SGLANG_COPE_POS_EMB"):
+    from sglang.srt.layers.cope_serving import enable_cope_serving as _enable_cope
+
+    _enable_cope(_os.environ["SGLANG_COPE_POS_EMB"])

@@ -95,9 +95,28 @@ def test_override_positions_and_gradients():
     print("[ok] position override runs and gradients reach pos_emb (trainable)")
 
 
+def test_decode_matches_square_last_row():
+    """Rectangular decode (q_len=1 over kv_len=N) must equal the square case's last
+    row -- same q/k => same gates => same CoPE positions => same output."""
+    torch.manual_seed(4)
+    b, h, t, d = 2, 3, 16, 8
+    q, k, v = (torch.randn(b, h, t, d, dtype=torch.float64) for _ in range(3))
+    cope = ContextualPositionEmbedding(head_dim=d, npos_max=t).double()
+    cope.pos_emb.data.normal_()
+
+    full = cope_attention(q, k, v, cope)  # [b,h,t,d]
+    # Decode: last query token attends to all t keys.
+    dec = cope_attention(q[:, :, -1:, :], k, v, cope)  # [b,h,1,d]
+    assert dec.shape == (b, h, 1, d)
+    assert torch.allclose(dec[:, :, 0, :], full[:, :, -1, :], atol=1e-10), \
+        (dec[:, :, 0, :] - full[:, :, -1, :]).abs().max()
+    print("[ok] rectangular decode (q_len=1) matches the square case's last row")
+
+
 if __name__ == "__main__":
     test_zero_init_reduces_to_plain_attention()
     test_positions_bounds_and_monotonicity()
     test_integer_positions_are_exact_gather()
     test_override_positions_and_gradients()
+    test_decode_matches_square_last_row()
     print("\nAll CoPE reference tests passed.")
