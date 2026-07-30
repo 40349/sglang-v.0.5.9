@@ -1,5 +1,8 @@
 cope_adapter/
 cope_merged/
+cope_merged_8k/
+cope_merged_8k_best/
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

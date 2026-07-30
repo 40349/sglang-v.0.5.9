@@ -56,21 +56,28 @@ def build_sub_contexts(capture: Dict[str, Any]) -> List[Dict[str, str]]:
     tools_json = json.dumps(tools, ensure_ascii=False, indent=2)
     user_text = _extract_user_text(messages)
 
+    # Llama-3 chat format: these ARE special tokens for the Llama-3.1 tokenizer
+    # (<|start_header_id|>=128006, <|eot_id|>=128009, ...), matching how the CoPE
+    # adapter was trained (apply_chat_template on the instruct tokenizer). The old
+    # ChatML <|im_start|> markers are NOT special tokens here -- they got split into
+    # subword junk, which is why the model echoed the tool JSON instead of answering.
+    def hdr(role: str) -> str:
+        return f"<|start_header_id|>{role}<|end_header_id|>\n\n"
+
+    eot = "<|eot_id|>"
+
     # Ordered blocks; each is tokenized + cached in its own radix namespace.
     return [
         {
-            "content": f"<|im_start|>system\n{system_prompt}\n\n# Available tools:\n",
+            "content": f"<|begin_of_text|>{hdr('system')}{system_prompt}\n\n# Available tools:\n",
             "extra_key": "system_prompt",
         },
         {
-            "content": f"{tools_json}\n<|im_end|>\n",
+            "content": f"{tools_json}{eot}",
             "extra_key": "tools",
         },
         {
-            "content": (
-                f"<|im_start|>user\n{user_text}<|im_end|>\n"
-                f"<|im_start|>assistant\n"
-            ),
+            "content": f"{hdr('user')}{user_text}{eot}{hdr('assistant')}",
             "extra_key": "messages",
         },
     ]

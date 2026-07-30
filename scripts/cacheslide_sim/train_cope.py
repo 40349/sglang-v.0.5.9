@@ -53,6 +53,13 @@ _cope_mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_cope_mod)
 ContextualPositionEmbedding = _cope_mod.ContextualPositionEmbedding
 
+# Query-block size for the training CoPE forward. The non-tiled forward materialises
+# [B,H,T,T] tensors (int64 gather indices are 8 bytes each) -- ~137GB just for the two
+# index tensors at T=16384, OOM even on an H200. Query rows are independent, so tiling
+# is exact and bounds peak memory to O(H*block*kv_len). seq_len <= block => one block
+# (no tiling). Set from --tile_q.
+_TRAIN_Q_BLOCK = 2048
+
 
 # ---------------------------------------------------------------------------
 # 1. CoPE attention -- monkey-patch LlamaAttention.forward (RoPE removed)
@@ -442,6 +449,11 @@ def main():
     ap.add_argument("--lora_rank", type=int, default=16)
     ap.add_argument("--lora_alpha", type=int, default=32)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--pos_emb_lr", type=float, default=None,
+                    help="separate LR for the CoPE pos_emb (default: same as --lr). "
+                         "The gate reverse-cumsum makes pos_emb gradients scale ~O(seq_len), "
+                         "so long-seq runs (>=4096) are more stable with pos_emb_lr < lr, "
+                         "e.g. lr/5 .. lr/10.")
     ap.add_argument("--steps", type=int, default=2000, help="optimizer steps")
     ap.add_argument("--batch_size", type=int, default=1, help="micro-batch size")
     ap.add_argument("--grad_accum", type=int, default=8,
@@ -520,7 +532,22 @@ def main():
     print(f"train={len(train_ds)} eval={len(eval_ds)}  "
           f"effective_batch={args.batch_size * args.grad_accum}")
 
-    opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
+    # Two param groups: pos_emb (the global positional backbone -- its reverse-cumsum
+    # gradient scales with seq_len) can take a lower LR than the LoRA deltas. The cosine
+    # scheduler scales every group by the same factor, so the ratio holds throughout.
+    pos_emb_params = [p for n, p in model.named_parameters()
+                      if p.requires_grad and "cope.pos_emb" in n]
+    lora_params = [p for n, p in model.named_parameters()
+                   if p.requires_grad and "lora_" in n]
+    pos_emb_lr = args.pos_emb_lr if args.pos_emb_lr is not None else args.lr
+    opt = torch.optim.AdamW(
+        [{"params": lora_params, "lr": args.lr},
+         {"params": pos_emb_params, "lr": pos_emb_lr}],
+        weight_decay=args.weight_decay,
+    )
+    print(f"optimizer: lora_lr={args.lr:.2e} ({len(lora_params)} tensors)  "
+          f"pos_emb_lr={pos_emb_lr:.2e} ({len(pos_emb_params)} tensors)  "
+          f"warmup={int(args.warmup_ratio * args.steps)} steps  clip={args.max_grad_norm}")
     sched = get_cosine_schedule_with_warmup(
         opt, int(args.warmup_ratio * args.steps), args.steps
     )
