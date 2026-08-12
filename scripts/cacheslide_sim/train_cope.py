@@ -60,6 +60,13 @@ ContextualPositionEmbedding = _cope_mod.ContextualPositionEmbedding
 # (no tiling). Set from --tile_q.
 _TRAIN_Q_BLOCK = 2048
 
+# Gate-selectivity regularizer config (set in main). OFF by default -> no stash, no
+# overhead, existing runs unchanged. When on, cope_attention_forward stashes the
+# detached layer input + valid mask so accumulate_gate_reg_grads can recompute the
+# gates OUTSIDE the gradient-checkpointed graph (an aux loss on the internal gates
+# would otherwise be severed by checkpointing). See accumulate_gate_reg_grads.
+_GATE_REG = {"on": False, "span_target": 512, "lam_span": 0.0, "lam_bimod": 0.0}
+
 
 # ---------------------------------------------------------------------------
 # 1. CoPE attention -- monkey-patch LlamaAttention.forward (RoPE removed)
@@ -101,6 +108,16 @@ def cope_attention_forward(
         valid = causal & (m > torch.finfo(m.dtype).min / 2)  # [B,1,T,T]
     else:
         valid = causal  # [T,T]
+
+    # Gate-selectivity regularizer needs the gates (sigmoid(q.k)), which are internal
+    # to this (possibly gradient-checkpointed) forward. Stash the DETACHED layer input
+    # + valid mask so accumulate_gate_reg_grads can recompute the gates outside the
+    # checkpoint graph and backprop the reg into this layer's q/k LoRA. Detach is what
+    # makes it checkpoint-safe (constant tensor, not freed) and scopes the reg to each
+    # layer's own q/k projections. No-op / no memory when the reg is off.
+    if _GATE_REG["on"]:
+        self._cope_hs = hidden_states.detach()
+        self._cope_valid = valid
 
     pos_bias = self.cope(query, logits, valid)  # [B,H,T,T]
 
@@ -178,6 +195,58 @@ def mark_trainable(model) -> List[nn.Parameter]:
             p.requires_grad_(True)
             trainable.append(p)
     return trainable
+
+
+def accumulate_gate_reg_grads(model, scale: float) -> Dict[str, float]:
+    """Backprop the gate-selectivity regularizer into each layer's q/k LoRA.
+
+    Recomputes the CoPE gates ``sigmoid(q.k * scale)`` for every attention layer from
+    the DETACHED layer input stashed by ``cope_attention_forward`` (so this is a fresh
+    small graph OUTSIDE the gradient-checkpointed backbone -- the only way an aux loss
+    on the internal gates survives checkpointing). Detach also scopes the reg to this
+    layer's own q/k projections (no backprop into lower layers), which is what we want:
+    each layer sculpts its own gates to be sparse+decisive.
+
+    Two terms, per query row ``i`` with contextual span ``span_i = sum_{j<=i} g_ij``:
+      * span-cap  ``relu(span_i - S)/S``  -- pushes each row's span under the position
+        budget ``S`` (= where pos_emb is well-trained) so long contexts don't overflow
+        / mass-collapse onto the top slot;
+      * bimodality ``g(1-g)`` -- pushes gates toward 0/1 so ``span`` counts a FEW
+        decisive boundaries (selective, the paper's mechanism) not a soft ~0.27 drift.
+
+    Backprops per layer (one gate tensor live at a time -> bounded peak memory) and
+    accumulates into ``.grad`` alongside the main loss. Returns mean diagnostics.
+    """
+    S = float(_GATE_REG["span_target"])
+    lam_s, lam_b = _GATE_REG["lam_span"], _GATE_REG["lam_bimod"]
+    tot = {"span": 0.0, "L_span": 0.0, "L_bimod": 0.0}
+    nl = 0
+    for m in model.modules():
+        if not (isinstance(m, LlamaAttention) and getattr(m, "_cope_hs", None) is not None):
+            continue
+        hs = m._cope_hs  # [B, T, hidden], detached (constant)
+        valid = m._cope_valid
+        B, T = hs.shape[0], hs.shape[1]
+        q = m.q_proj(hs).view(B, T, -1, m.head_dim).transpose(1, 2)  # [B,Hq,T,d]
+        k = m.k_proj(hs).view(B, T, -1, m.head_dim).transpose(1, 2)  # [B,Hkv,T,d]
+        k = repeat_kv(k, m.num_key_value_groups)
+        logits = torch.matmul(q, k.transpose(-1, -2)) * m.scaling  # [B,Hq,T,T]
+        vb = valid.view(1, 1, T, T) if valid.dim() == 2 else valid  # [B/1,1,T,T]
+        gates = torch.sigmoid(logits.float()) * vb  # zero on non-causal/pad keys
+        span = gates.sum(-1)  # [B,Hq,T]; pad query rows -> 0 -> relu 0 (self-masking)
+        L_span = torch.relu(span - S).div(S).mean()
+        n_valid = vb.sum().clamp(min=1).float() * gates.shape[1]  # entries * heads
+        L_bimod = (gates * (1.0 - gates)).sum() / n_valid
+        reg = lam_s * L_span + lam_b * L_bimod
+        (scale * reg).backward()
+        tot["span"] += span.mean().item()
+        tot["L_span"] += L_span.item()
+        tot["L_bimod"] += L_bimod.item()
+        nl += 1
+    if nl:
+        for kk in tot:
+            tot[kk] /= nl
+    return tot
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +531,20 @@ def main():
     ap.add_argument("--warmup_ratio", type=float, default=0.03)
     ap.add_argument("--weight_decay", type=float, default=0.0)
     ap.add_argument("--max_grad_norm", type=float, default=1.0)
+    # --- Gate-selectivity regularizer (attacks the root cause of the length cliff:
+    # --- unregularized gates give span ~= 0.27*L, so long contexts overflow the pos
+    # --- budget / mass-collapse. See accumulate_gate_reg_grads.) OFF at 0.
+    ap.add_argument("--gate_reg", type=float, default=0.0,
+                    help="span-cap coefficient (lambda_span); >0 turns the gate "
+                         "regularizer ON. Penalizes relu(span - gate_span_target)/target "
+                         "per query row so contextual span stays under the position budget.")
+    ap.add_argument("--gate_span_target", type=int, default=512,
+                    help="S: target max contextual span per query. Keep < npos_max (the "
+                         "well-trained slot range) so trained spans never hit the clamp.")
+    ap.add_argument("--gate_bimod", type=float, default=0.0,
+                    help="bimodality coefficient (lambda_bimod): penalizes g*(1-g) to push "
+                         "gates toward 0/1 (selective/decisive, the paper's mechanism). "
+                         "0 = span-cap only (gates shrink uniformly = length-normalized).")
     ap.add_argument("--eval_samples", type=int, default=200,
                     help="held-out conversations for perplexity eval")
     ap.add_argument("--eval_every", type=int, default=100, help="optimizer steps")
@@ -484,6 +567,11 @@ def main():
         args.output_dir = tempfile.mkdtemp(prefix="cope_smoke_")
 
     npos_max = args.npos_max or args.max_seq_len
+
+    _GATE_REG["on"] = args.gate_reg > 0 or args.gate_bimod > 0
+    _GATE_REG["span_target"] = args.gate_span_target
+    _GATE_REG["lam_span"] = args.gate_reg
+    _GATE_REG["lam_bimod"] = args.gate_bimod
 
     model, tok = build_model(args)
     model.to(args.device)
@@ -548,6 +636,10 @@ def main():
     print(f"optimizer: lora_lr={args.lr:.2e} ({len(lora_params)} tensors)  "
           f"pos_emb_lr={pos_emb_lr:.2e} ({len(pos_emb_params)} tensors)  "
           f"warmup={int(args.warmup_ratio * args.steps)} steps  clip={args.max_grad_norm}")
+    if _GATE_REG["on"]:
+        print(f"gate reg: ON  lam_span={args.gate_reg:.3g} span_target={args.gate_span_target} "
+              f"lam_bimod={args.gate_bimod:.3g}  (recomputes gates outside grad-ckpt; "
+              f"~1.5-2x attn compute)")
     sched = get_cosine_schedule_with_warmup(
         opt, int(args.warmup_ratio * args.steps), args.steps
     )
@@ -562,6 +654,7 @@ def main():
     best_ppl = float("inf")
     first_loss = None
 
+    reg_diag = {"span": 0.0, "L_span": 0.0, "L_bimod": 0.0}
     for step in range(args.steps):
         opt.zero_grad()
         micro_loss = 0.0
@@ -572,6 +665,11 @@ def main():
             ).loss / args.grad_accum
             loss.backward()
             micro_loss += loss.item()
+            # Aux gate-selectivity loss: recompute gates from the detached stash (outside
+            # the checkpointed graph) and accumulate its grads into q/k LoRA. Same 1/accum
+            # scale so it tracks the effective batch. No-op when the reg is off.
+            if _GATE_REG["on"]:
+                reg_diag = accumulate_gate_reg_grads(model, scale=1.0 / args.grad_accum)
 
         if not grad_seen["pos_emb"]:  # one-time sanity that both groups train
             for name, p in model.named_parameters():
@@ -589,8 +687,13 @@ def main():
         if first_loss is None:
             first_loss = micro_loss
         if step % max(1, args.steps // 20) == 0:
+            reg_str = ""
+            if _GATE_REG["on"]:
+                reg_str = (f"  span {reg_diag['span']:.1f}(->{_GATE_REG['span_target']}) "
+                           f"L_span {reg_diag['L_span']:.3f} L_bimod {reg_diag['L_bimod']:.3f}")
             print(f"step {step:5d}  loss {micro_loss:.4f}  "
-                  f"ppl {math.exp(min(micro_loss, 20)):.1f}  lr {sched.get_last_lr()[0]:.2e}")
+                  f"ppl {math.exp(min(micro_loss, 20)):.1f}  lr {sched.get_last_lr()[0]:.2e}"
+                  f"{reg_str}")
 
         is_last = step == args.steps - 1
         if (step + 1) % args.eval_every == 0 or is_last:
