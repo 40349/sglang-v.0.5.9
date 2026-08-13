@@ -1,0 +1,11 @@
+{
+  "proc": "http",
+  "stages": {
+    "tpl_render": {
+      "count": 53,
+      "total_ms": 664.8219,
+      "mean_us": 12543.809,
+      "max_us": 22314.797
+    }
+  }
+}

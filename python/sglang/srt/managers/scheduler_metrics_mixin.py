@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Optional, Union
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.forward_trace import ForwardTracer
 from sglang.srt.managers.io_struct import (
     DisaggregationMetrics,
     GetLoadReqInput,
@@ -29,7 +30,7 @@ from sglang.srt.metrics.collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, host_timer
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -95,6 +96,15 @@ class SchedulerMetricsMixin:
         self.kv_transfer_total_mb: float = 0.0
 
         self.stats = SchedulerStats()
+
+        # Sub-context forward-pass GPU timing. Deliberately independent of
+        # --enable-metrics so an A/B run needs no Prometheus scrape.
+        host_timer.init_host_timer("scheduler")
+        self.forward_tracer = (
+            ForwardTracer.maybe_create(tag=self.server_args.served_model_name)
+            if self.attn_tp_rank == 0
+            else None
+        )
 
         # Metrics
         self.current_scheduler_metrics_enabled = (
@@ -757,15 +767,24 @@ class SchedulerMetricsMixin:
 
     @contextmanager
     def record_forward_metrics(self: Scheduler, batch: ScheduleBatch):
-        if not (self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER):
+        with self._record_forward_trace(batch):
+            if not (self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER):
+                yield
+                return
+
+            category = "forward_" + batch.forward_mode.name.lower()
+            with self.forward_pass_device_timer.wrap(
+                metadata=dict(
+                    category=category,
+                    dp_cooperation_info=batch.dp_cooperation_info,
+                ),
+            ):
+                yield
+
+    @contextmanager
+    def _record_forward_trace(self: Scheduler, batch: ScheduleBatch):
+        if self.forward_tracer is None:
             yield
             return
-
-        category = "forward_" + batch.forward_mode.name.lower()
-        with self.forward_pass_device_timer.wrap(
-            metadata=dict(
-                category=category,
-                dp_cooperation_info=batch.dp_cooperation_info,
-            ),
-        ):
+        with self.forward_tracer.wrap(batch):
             yield

@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.evict_policy import (
     PriorityStrategy,
 )
 from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
+from sglang.srt.utils import host_timer
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -449,6 +450,7 @@ class RadixCache(BasePrefixCache):
         page_aligned_len = len(key) // self.page_size * self.page_size
         return key[:page_aligned_len]
 
+    @host_timer.timed("cache_finished")
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
         # In deterministic mode, disable finished request insertion to radix cache
@@ -534,6 +536,7 @@ class RadixCache(BasePrefixCache):
         req.sub_context_last_nodes = None
         req.sub_context_owned_lens = None
 
+    @host_timer.timed("cache_unfinished")
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
         if self.disable:

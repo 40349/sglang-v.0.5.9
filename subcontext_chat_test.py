@@ -1,4 +1,4 @@
-"""Smoke test for CacheSlide sub-contexts on the OpenAI chat endpoint.
+"""Smoke test for sub-contexts on the OpenAI chat endpoint.
 
 Mimics the mini-swe-agent loop: a fixed system prompt plus a message list that grows
 by one assistant/user pair per turn. Watch the server log while this runs -- each

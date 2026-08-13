@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
@@ -50,12 +51,41 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.utils import host_timer
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+# Sub-context A/B switch. When set, chat requests carry no sub-context split, so the
+# prompt takes the stock single-namespace radix path -- the baseline to measure
+# against, on the same binary and the same loaded weights.
+DISABLE_SUBCONTEXT = os.environ.get("SGLANG_DISABLE_SUBCONTEXT", "") not in ("", "0")
+if DISABLE_SUBCONTEXT:
+    logger.info("Sub-context split DISABLED (baseline mode)")
+
+# Dump every incoming chat body, so one agent run can be replayed verbatim against
+# both configs. Without a fixed request sequence the two runs diverge after the
+# first sampled token and the timings compare different conversations.
+_CAPTURE_PATH = os.environ.get("SGLANG_CAPTURE_REQUESTS", "")
+_capture_file = None
+
+
+def _capture_request(request: ChatCompletionRequest) -> None:
+    global _capture_file
+    if not _CAPTURE_PATH:
+        return
+    try:
+        if _capture_file is None:
+            _capture_file = open(_CAPTURE_PATH, "a", buffering=1)
+            logger.info("Sub-context: capturing chat requests to %s", _CAPTURE_PATH)
+        _capture_file.write(
+            json.dumps(request.model_dump(exclude_none=True), default=str) + "\n"
+        )
+    except Exception as e:  # capture must never break serving
+        logger.warning("Sub-context: request capture failed: %s", e)
 
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
@@ -95,6 +125,7 @@ class OpenAIServingChat(OpenAIServingBase):
         template_manager: TemplateManager,
     ):
         super().__init__(tokenizer_manager)
+        host_timer.init_host_timer("http")
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
@@ -242,6 +273,7 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
+        _capture_request(request)
         reasoning_effort = (
             request.chat_template_kwargs.pop("reasoning_effort", None)
             if request.chat_template_kwargs
@@ -360,6 +392,7 @@ class OpenAIServingChat(OpenAIServingBase):
         result.tool_call_constraint = tool_call_constraint
         return result
 
+    @host_timer.timed("subctx_split")
     def _compute_sub_context_ids(
         self,
         request: ChatCompletionRequest,
@@ -367,7 +400,7 @@ class OpenAIServingChat(OpenAIServingBase):
         tools: Optional[List[Dict]],
         prompt_ids: List[int],
     ) -> tuple[Optional[List[List[int]]], Optional[List[str]]]:
-        """CacheSlide: split ``prompt_ids`` into system_prompt / tools / messages blocks.
+        """Sub-context: split ``prompt_ids`` into system_prompt / tools / messages blocks.
 
         Each block is matched and inserted in its own radix namespace (its
         ``extra_key``), so the fixed head of an agent conversation is reused
@@ -383,7 +416,7 @@ class OpenAIServingChat(OpenAIServingBase):
         def _is_prefix(head: List[int], full: List[int]) -> bool:
             return bool(head) and len(full) >= len(head) and full[: len(head)] == head
 
-        if not prompt_ids or not messages:
+        if DISABLE_SUBCONTEXT or not prompt_ids or not messages:
             return None, None
 
         n_sys = 0
@@ -403,7 +436,7 @@ class OpenAIServingChat(OpenAIServingBase):
             try:
                 return list(tokenizer.apply_chat_template(msgs, tools=tls, **template_kwargs))
             except Exception as e:
-                logger.debug("CacheSlide: sub-context boundary render failed: %s", e)
+                logger.debug("Sub-context: sub-context boundary render failed: %s", e)
                 return None
 
         # Candidate boundaries for the fixed head, narrowest first. The wider candidate
@@ -448,6 +481,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return None, None
         return [ids for ids, _ in segments], [key for _, key in segments]
 
+    @host_timer.timed("tpl_render")
     def _apply_jinja_template(
         self,
         request: ChatCompletionRequest,
@@ -599,7 +633,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if is_multimodal:
                 prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
             else:
-                # CacheSlide: only the token-id path is split; the multimodal path
+                # Sub-context: only the token-id path is split; the multimodal path
                 # hands the decoded text back to the tokenizer, which would break the
                 # concat(segments) == input_ids invariant.
                 sub_context_ids, sub_context_extra_keys = self._compute_sub_context_ids(

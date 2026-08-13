@@ -1,0 +1,17 @@
+{
+  "proc": "http",
+  "stages": {
+    "subctx_split": {
+      "count": 53,
+      "total_ms": 35.3189,
+      "mean_us": 666.395,
+      "max_us": 1429.637
+    },
+    "tpl_render": {
+      "count": 52,
+      "total_ms": 694.5553,
+      "mean_us": 13356.833,
+      "max_us": 33535.673
+    }
+  }
+}
