@@ -258,6 +258,14 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # (keyed by its extra_key), then stitched into a single sequence for one decode.
     sub_contexts: Optional[List[Dict[str, str]]] = None
 
+    # CacheSlide: pre-split token ids for the same blocks, parallel to
+    # ``sub_context_extra_keys``. Used by the OpenAI chat path, which renders the chat
+    # template itself and therefore splits the rendered *ids* instead of raw text, so
+    # ``concat(sub_context_ids) == input_ids`` holds exactly. Ignored (with a warning)
+    # if that invariant does not hold.
+    sub_context_ids: Optional[List[List[int]]] = None
+    sub_context_extra_keys: Optional[List[str]] = None
+
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
@@ -703,6 +711,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             priority=self.priority,
             extra_key=self.extra_key,
             sub_contexts=self.sub_contexts,
+            sub_context_ids=self.sub_context_ids,
+            sub_context_extra_keys=self.sub_context_extra_keys,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,

@@ -1104,16 +1104,19 @@ class Req(ReqDllmMixin):
                 f"hit_tokens={_preview(seg_ids[:hit])}"
             )
             take = 0
-            if contiguous and hit > 0:
-                take = min(hit, max_prefix_len - total)
-                if take <= 0:
-                    take = 0
-                    contiguous = False
+            if contiguous:
+                if hit == 0:
+                    contiguous = False     
                 else:
-                    stitched.append(seg_match.device_indices[:take])
-                    total += take
-                    if take < len(seg_ids):
+                    take = min(hit, max_prefix_len - total)
+                    if take <= 0:
+                        take = 0
                         contiguous = False
+                    else:
+                        stitched.append(seg_match.device_indices[:take])
+                        total += take
+                        if take < len(seg_ids):
+                            contiguous = False
             owned.append(take)
 
         self.sub_context_match_lens = match_lens

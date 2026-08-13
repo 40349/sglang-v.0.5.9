@@ -755,6 +755,24 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         else:
             mm_inputs = None
 
+        # CacheSlide: the OpenAI chat path renders the chat template itself, so it
+        # arrives with `input_ids` already set (the branch above did no splitting) and
+        # carries the per-namespace split alongside. Accept it only if it really
+        # reconstructs the prompt -- a stale or mis-sliced split would silently feed
+        # the wrong tokens into the radix namespaces.
+        if sub_context_ids is None and getattr(obj, "sub_context_ids", None):
+            flat = [tok for seg in obj.sub_context_ids for tok in seg]
+            if input_ids is not None and flat == list(input_ids):
+                sub_context_ids = obj.sub_context_ids
+                sub_context_extra_keys = obj.sub_context_extra_keys
+            else:
+                logger.warning(
+                    "CacheSlide: ignoring sub_context_ids that do not concatenate to "
+                    "input_ids (%d vs %d tokens).",
+                    len(flat),
+                    len(input_ids) if input_ids is not None else 0,
+                )
+
         self._validate_one_request(obj, input_ids)
         trace_slice_end(RequestStage.TOKENIZE, obj.rid)
         return self._create_tokenized_object(

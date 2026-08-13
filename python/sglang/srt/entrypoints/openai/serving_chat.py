@@ -301,6 +301,8 @@ class OpenAIServingChat(OpenAIServingBase):
             return_routed_experts=request.return_routed_experts,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
+            sub_context_ids=processed_messages.sub_context_ids,
+            sub_context_extra_keys=processed_messages.sub_context_extra_keys,
             require_reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
@@ -358,6 +360,94 @@ class OpenAIServingChat(OpenAIServingBase):
         result.tool_call_constraint = tool_call_constraint
         return result
 
+    def _compute_sub_context_ids(
+        self,
+        request: ChatCompletionRequest,
+        messages: List[Dict],
+        tools: Optional[List[Dict]],
+        prompt_ids: List[int],
+    ) -> tuple[Optional[List[List[int]]], Optional[List[str]]]:
+        """CacheSlide: split ``prompt_ids`` into system_prompt / tools / messages blocks.
+
+        Each block is matched and inserted in its own radix namespace (its
+        ``extra_key``), so the fixed head of an agent conversation is reused
+        independently of the message tail that grows every turn.
+
+        The split is made on the already-rendered token ids -- the leading messages are
+        re-rendered only to locate the boundary -- so ``concat(segments) == prompt_ids``
+        holds exactly and the model still sees the untouched prompt. Templates that do
+        not render the system block as a literal prefix of the full prompt (or that
+        interleave the tool definitions into it) simply get a coarser split, or none.
+        """
+
+        def _is_prefix(head: List[int], full: List[int]) -> bool:
+            return bool(head) and len(full) >= len(head) and full[: len(head)] == head
+
+        if not prompt_ids or not messages:
+            return None, None
+
+        n_sys = 0
+        while n_sys < len(messages) and messages[n_sys].get("role") == "system":
+            n_sys += 1
+
+        tokenizer = self.tokenizer_manager.tokenizer
+        template_kwargs = dict(
+            tokenize=True,
+            add_generation_prompt=False,
+            reasoning_effort=request.reasoning_effort,
+            return_dict=False,
+            **(request.chat_template_kwargs if request.chat_template_kwargs else {}),
+        )
+
+        def render(msgs, tls) -> Optional[List[int]]:
+            try:
+                return list(tokenizer.apply_chat_template(msgs, tools=tls, **template_kwargs))
+            except Exception as e:
+                logger.debug("CacheSlide: sub-context boundary render failed: %s", e)
+                return None
+
+        # Candidate boundaries for the fixed head, narrowest first. The wider candidate
+        # covers templates that render the tool definitions into the *first user
+        # message* (Llama 3.x defaults to tools_in_user_message): there the system
+        # messages alone cannot even be rendered with tools attached -- the template
+        # raises "Cannot put tools in the first user message when there's no first user
+        # message!" -- while system + first user, i.e. tool definitions plus the task
+        # statement, is exactly the part that stays fixed for a whole agent trajectory.
+        head = None
+        head_with_tools = None
+        for k in ([n_sys, n_sys + 1] if n_sys else [1, 2]):
+            if k > len(messages):
+                continue
+            # k == len(messages) is allowed: on the very first turn the whole message
+            # list is the fixed head and the tail is just the generation prompt. That
+            # still splits usefully -- it seeds the head namespace, so turn 2 hits it
+            # instead of re-prefilling the entire prompt. An actually empty tail is
+            # dropped by the emptiness filter below.
+            rendered = render(messages[:k], tools)
+            if rendered is not None and _is_prefix(rendered, prompt_ids):
+                head, head_with_tools = messages[:k], rendered
+                break
+        if head_with_tools is None:
+            return None, None
+
+        segments: List[tuple[List[int], str]] = []
+        if tools:
+            head_no_tools = render(head, None)
+            if head_no_tools is not None and _is_prefix(head_no_tools, head_with_tools):
+                # Template appends the tool definitions after the system content, so
+                # they can live in a namespace of their own.
+                segments.append((head_no_tools, "system_prompt_key"))
+                segments.append((head_with_tools[len(head_no_tools) :], "tools_key"))
+        if not segments:
+            # No tools, or they are interleaved into the system block -- keep as one.
+            segments.append((head_with_tools, "system_prompt_key"))
+        segments.append((prompt_ids[len(head_with_tools) :], "messages_key"))
+
+        segments = [(ids, key) for ids, key in segments if ids]
+        if len(segments) < 2:
+            return None, None
+        return [ids for ids, _ in segments], [key for _, key in segments]
+
     def _apply_jinja_template(
         self,
         request: ChatCompletionRequest,
@@ -367,6 +457,8 @@ class OpenAIServingChat(OpenAIServingBase):
         """Apply Jinja chat template"""
         prompt = ""
         prompt_ids = []
+        sub_context_ids = None
+        sub_context_extra_keys = None
         openai_compatible_messages = []
         image_data = []
         video_data = []
@@ -506,6 +598,13 @@ class OpenAIServingChat(OpenAIServingBase):
 
             if is_multimodal:
                 prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+            else:
+                # CacheSlide: only the token-id path is split; the multimodal path
+                # hands the decoded text back to the tokenizer, which would break the
+                # concat(segments) == input_ids invariant.
+                sub_context_ids, sub_context_extra_keys = self._compute_sub_context_ids(
+                    request, openai_compatible_messages, tools, prompt_ids
+                )
 
         stop = request.stop
         image_data = image_data if image_data else None
@@ -520,6 +619,8 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
+            sub_context_ids=sub_context_ids,
+            sub_context_extra_keys=sub_context_extra_keys,
         )
 
     def _apply_conversation_template(
