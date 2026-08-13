@@ -1,10 +1,19 @@
 #!/bin/bash
-# A/B the sub-context mechanism against a pristine upstream sglang, on real
-# SWE-bench traffic.
+# A/B the sub-context mechanism on real SWE-bench traffic. Two comparisons,
+# answering two different questions -- pick by what you need to claim.
 #
-#   BASELINE   conda env $BASE_ENV, stock sglang==0.5.9 from PyPI, instrumented
-#              by instrument_sglang.py. No PYTHONPATH -- imports its own copy.
-#   TREATMENT  conda env $FORK_ENV + PYTHONPATH into this fork.
+#   toggle   Same env, same binary, same weights; the arms differ only by
+#            SGLANG_DISABLE_SUBCONTEXT. Costs the MECHANISM. Everything else
+#            about the fork sits on both sides and cancels. Use this one for
+#            "how much does sub-context add".
+#
+#   replay   $BASE_ENV (stock sglang==0.5.9 from PyPI, instrumented by
+#            instrument_sglang.py, no PYTHONPATH) vs $FORK_ENV + PYTHONPATH into
+#            this fork. Costs the FORK AS A WHOLE against upstream, and pays for
+#            it with two builds' worth of drift: on the last run decode -- which
+#            sub-context cannot touch -- moved 2.4%, which is larger than the
+#            prefill effect being measured. Do not attribute a per-stage delta
+#            from this mode to the mechanism.
 #
 # Setup (once). Python MUST match the fork env (3.12) -- the host-side stages are
 # pure-Python hot paths and 3.11+ sped those up a lot, so a version gap reads as
@@ -18,7 +27,13 @@
 #
 # Then:
 #   ./run_ab.sh record    capture one real agent run (run swe_test.sh alongside)
-#   ./run_ab.sh replay    replay it against both, report GPU + host-stage diffs
+#   ./run_ab.sh toggle    split off vs on, same binary   <-- start here
+#   ./run_ab.sh replay    upstream vs fork, two envs
+#
+# The TRACE-* probes are off unless SUBCTX_TRACE=1: they print per insert and
+# per namespace match, several of them from inside the regions host_timer is
+# measuring, and they only fire when the split is on -- so left enabled they
+# bill their own debug output to the mechanism under test.
 set -euo pipefail
 
 REPO=/home/t2503-3090/Desktop/MiaoChen/sglang-v.0.5.9
@@ -50,6 +65,8 @@ launch() {
   SGLANG_FORWARD_TRACE="$3" \
   SGLANG_STAGE_TRACE="$4" \
   SGLANG_CAPTURE_REQUESTS="$5" \
+  SGLANG_DISABLE_SUBCONTEXT="${SUBCTX_OFF:-}" \
+  SGLANG_SUBCTX_TRACE="${SUBCTX_TRACE:-}" \
   nohup python -u -m sglang.launch_server \
     --model-path "$MODEL" \
     --quantization moe_wna16 \
@@ -66,6 +83,18 @@ launch() {
     echo -n .; sleep 2
   done
   echo " TIMEOUT"; tail -30 "$OUT/server_${LOGTAG:-run}.log"; return 1
+}
+
+# Replay the capture against whatever server is up. swe_test.sh sends
+# --model meta-llama/Llama-3.1-8B-Instruct while the server actually holds
+# Qwen3-Coder, so the captured bodies carry the wrong name; pin it to what is
+# really loaded. The model field never reaches the prompt.
+# $1=trace  $2=stage prefix  $3=client json
+replay_arm() {
+  python "$REPO/subcontext_bench.py" replay "$OUT/requests.jsonl" \
+    --url "http://127.0.0.1:$PORT" \
+    --trace "$1" --stage-trace "$2" --out "$3" \
+    --model "$MODEL" --gen-tokens "$GEN_TOKENS"
 }
 
 # Confirm the baseline env is really stock and really instrumented.
@@ -95,8 +124,25 @@ if "_compute_sub_context_ids" in src:
     sys.exit("REFUSING: baseline has the sub-context split -- not a clean baseline")
 if "host_timer.timed" not in (root / "srt" / "mem_cache" / "radix_cache.py").read_text():
     sys.exit("baseline is NOT instrumented; run instrument_sglang.py in this env first")
+# The probes are copied, not shared, so the baseline can be running an older
+# host_timer than the fork. Without the marker it reports a window that starts
+# at process launch while the fork's starts after warm-up, and the difference
+# between two unequal windows gets read as mechanism cost.
+if "_check_mark" not in (root / "srt" / "utils" / "host_timer.py").read_text():
+    sys.exit("baseline has a stale host_timer (no warm-up marker).\n"
+             "Re-run instrument_sglang.py in this env to refresh the probes.")
 print("  baseline is stock + instrumented")
 PY
+}
+
+finish() {
+  # SIGTERM, not SIGKILL, so the timers get to flush.
+  pkill -TERM -f "sglang\.launch_server" 2>/dev/null || true
+  sleep 8
+  echo; echo "======== GPU (CUDA events) ========"
+  python "$REPO/subcontext_bench.py" report "$OUT/trace_base.jsonl" "$OUT/trace_sub.jsonl"
+  echo; echo "======== HOST (CPU stages) ========"
+  python "$REPO/subcontext_bench.py" stages "$OUT/stage_base" "$OUT/stage_sub"
 }
 
 case "${1:-}" in
@@ -125,30 +171,36 @@ EOF
     echo; echo "======== BASELINE (stock sglang) ========"
     LOGTAG=base launch "$BASE_ENV" "" "$OUT/trace_base.jsonl" "$OUT/stage_base" ""
     conda activate "$FORK_ENV"
-    # swe_test.sh sends --model meta-llama/Llama-3.1-8B-Instruct while the server
-    # actually holds Qwen3-Coder, so the captured bodies carry the wrong name.
-    # Pin it to what is really loaded; the model field never reaches the prompt.
-    python "$REPO/subcontext_bench.py" replay "$OUT/requests.jsonl" \
-      --url "http://127.0.0.1:$PORT" --trace "$OUT/trace_base.jsonl" \
-      --model "$MODEL" \
-      --gen-tokens "$GEN_TOKENS" --out "$OUT/client_base.json"
+    replay_arm "$OUT/trace_base.jsonl" "$OUT/stage_base" "$OUT/client_base.json"
 
     echo; echo "======== SUB-CONTEXT (this fork) ========"
     LOGTAG=sub launch "$FORK_ENV" "$REPO/python" "$OUT/trace_sub.jsonl" "$OUT/stage_sub" ""
-    python "$REPO/subcontext_bench.py" replay "$OUT/requests.jsonl" \
-      --url "http://127.0.0.1:$PORT" --trace "$OUT/trace_sub.jsonl" \
-      --model "$MODEL" \
-      --gen-tokens "$GEN_TOKENS" --out "$OUT/client_sub.json"
+    replay_arm "$OUT/trace_sub.jsonl" "$OUT/stage_sub" "$OUT/client_sub.json"
 
-    # SIGTERM, not SIGKILL, so the timers get to flush.
-    pkill -TERM -f "sglang\.launch_server" 2>/dev/null || true
-    sleep 8
+    finish
+    ;;
+  toggle)
+    # Same binary, same env, same weights -- the arms differ by one boolean.
+    # This is the comparison that costs the *mechanism*: everything else about
+    # the fork (extra_key plumbing, the stitch code path, this script's own
+    # probes) is present on both sides and cancels. What it cannot answer is
+    # "is my fork better than upstream" -- that needs `replay`.
+    [ -s "$OUT/requests.jsonl" ] || { echo "no capture; run '$0 record' first"; exit 1; }
+    echo "captured $(wc -l < "$OUT/requests.jsonl") requests"
 
-    echo; echo "======== GPU (CUDA events) ========"
-    python "$REPO/subcontext_bench.py" report "$OUT/trace_base.jsonl" "$OUT/trace_sub.jsonl"
-    echo; echo "======== HOST (CPU stages) ========"
-    python "$REPO/subcontext_bench.py" stages "$OUT/stage_base" "$OUT/stage_sub"
+    echo; echo "======== SPLIT OFF (same binary) ========"
+    SUBCTX_OFF=1 LOGTAG=off \
+      launch "$FORK_ENV" "$REPO/python" "$OUT/trace_base.jsonl" "$OUT/stage_base" ""
+    grep -q "Sub-context split DISABLED" "$OUT/server_off.log" \
+      || { echo "REFUSING: the split did not report itself disabled"; exit 1; }
+    replay_arm "$OUT/trace_base.jsonl" "$OUT/stage_base" "$OUT/client_base.json"
+
+    echo; echo "======== SPLIT ON ========"
+    LOGTAG=on launch "$FORK_ENV" "$REPO/python" "$OUT/trace_sub.jsonl" "$OUT/stage_sub" ""
+    replay_arm "$OUT/trace_sub.jsonl" "$OUT/stage_sub" "$OUT/client_sub.json"
+
+    finish
     ;;
   *)
-    echo "usage: $0 {record|replay}"; exit 1;;
+    echo "usage: $0 {record|replay|toggle}"; exit 1;;
 esac

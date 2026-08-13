@@ -84,6 +84,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     V1RerankReqInput,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.utils.subctx_trace import TRACE_ON, trace
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
@@ -649,9 +650,10 @@ if os.environ.get("SGLANG_DUMPER_SERVER_PORT") == "reuse":
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
-    _keys = [sc["extra_key"] for sc in obj.sub_contexts] if obj.sub_contexts else None
-    print(f"[TRACE-1 HTTP] 收到請求 rid={obj.rid}")
-    print(f"[TRACE-1 HTTP] sub_context extra_keys={_keys}")
+    if TRACE_ON:
+        _keys = [sc["extra_key"] for sc in obj.sub_contexts] if obj.sub_contexts else None
+        trace(f"[TRACE-1 HTTP] 收到請求 rid={obj.rid}")
+        trace(f"[TRACE-1 HTTP] sub_context extra_keys={_keys}")
 
 
     if obj.stream:

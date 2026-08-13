@@ -27,6 +27,22 @@ the prompt under extra_key=None instead of the per-namespace keys. The next
 request then misses every namespace, and the run reports 0% reuse -- measuring
 the harness, not the cache. Pass --full to use each captured request's own
 max_tokens instead.
+
+The functional floor is 2, but the useful floor is higher. Decode is what makes
+the GPU numbers readable: the mechanism cannot touch decode kernels, so the
+decode delta is a direct readout of this run's drift, and the prefill delta is
+only interpretable next to it. Measured: at 32 (1600 decode passes) the drift
+came in at 0.02%/-0.11% on a clock-locked card; dropping to 8 (400 passes) put
+it at +3.4%, larger than at 32 with the clocks unlocked. 32 is the sweet spot
+here -- low enough that prefill is ~28% of GPU time instead of ~5%, high enough
+that the control still works.
+
+--gen-tokens also caps an effect worth knowing about: the baseline caches its
+generated output while the sub-context path frees it, and the replay's regenerated
+tokens often match the recorded assistant reply verbatim for a few tokens (same
+model, same prompt), so the baseline reuses them next turn. That advantage is
+bounded by --gen-tokens and scales with it: 168 tokens at 32, 89 at 8. A real
+agent loop has no such bound.
 """
 
 from __future__ import annotations
@@ -116,6 +132,15 @@ def cmd_replay(args: argparse.Namespace) -> int:
                 f.write(json.dumps({"type": "measure_start"}) + "\n")
         except OSError as e:
             print(f"warning: cannot mark {args.trace} ({e})", file=sys.stderr)
+
+    # The host timers live in the server processes and cannot see the line above,
+    # so they watch for this file instead. Same instant, same window.
+    if args.stage_trace:
+        try:
+            with open(f"{args.stage_trace}.mark", "w") as f:
+                f.write(str(time.time()))
+        except OSError as e:
+            print(f"warning: cannot mark {args.stage_trace}.mark ({e})", file=sys.stderr)
 
     rows = []
     t_start = time.perf_counter()
@@ -224,12 +249,24 @@ def summarize(rows: List[dict]) -> Dict[str, float]:
     dec_ms = sum(r["gpu_ms"] for r in dec)
     new_tok = sum(r["new_tokens"] for r in ext)
     cached_tok = sum(r["cached_tokens"] for r in ext)
-    # Older traces predate matched_tokens; fall back to "matched == reused".
-    matched_tok = sum(r.get("matched_tokens", r["cached_tokens"]) for r in ext)
+    # Three trace vintages. Newest records the drop directly and is the only one
+    # that survives chunked prefill; the middle one derived it by subtracting a
+    # per-pass length from a per-request one, which goes negative by a chunk on
+    # every continuation pass; the oldest has neither field, so "matched" can
+    # only mean "reused" and the drop is unknowable rather than zero.
+    if any("discarded_tokens" in r for r in ext):
+        discarded_tok = sum(r.get("discarded_tokens", 0) for r in ext)
+    else:
+        discarded_tok = sum(r.get("matched_tokens", r["cached_tokens"]) for r in ext) - cached_tok
+    matched_tok = cached_tok + discarded_tok
+    # None, not 0, when the trace predates the field: "no request took the split
+    # path" and "the trace cannot say" are different claims and print differently.
+    sub_reqs = sum(r["sub_reqs"] for r in ext) if all("sub_reqs" in r for r in ext) else None
 
     return {
         "matched_tokens": matched_tok,
-        "discarded_tokens": matched_tok - cached_tok,
+        "discarded_tokens": discarded_tok,
+        "sub_reqs": sub_reqs,
         "prefill_passes": len(ext),
         "prefill_gpu_ms": ext_ms,
         "prefill_new_tokens": new_tok,
@@ -292,24 +329,44 @@ def cmd_report(args: argparse.Namespace) -> int:
         ("total_gpu_ms", "TOTAL GPU time", "ms"),
     ]
 
+    def gate_absent(arm: Dict[str, float]) -> bool:
+        """True when this arm never ran the contiguity gate, so a drop of zero is
+        not a measurement. None means the trace is too old to tell."""
+        return arm["sub_reqs"] == 0
+
     w = 26
     print(f"\n{'':{w}} {label_a:>18} {label_b:>18} {'delta':>18}")
     print("-" * (w + 58))
     for key, label, unit in keys:
         va, vb = a[key], b[key]
-        if key in ("hit_rate",):
+        na_a = na_b = False
+        if key == "discarded_tokens":
+            na_a, na_b = gate_absent(a), gate_absent(b)
+        if na_a or na_b:
+            delta = "n/a"
+        elif key in ("hit_rate",):
             delta = f"{vb - va:+.1f} pp"
         elif va:
             delta = f"{100.0 * (vb - va) / va:+.1f}%"
         else:
             delta = "n/a"
-        print(f"{label:{w}} {_fmt(va):>18} {_fmt(vb):>18} {delta:>18}")
+        sa = "n/a" if na_a else _fmt(va)
+        sb = "n/a" if na_b else _fmt(vb)
+        print(f"{label:{w}} {sa:>18} {sb:>18} {delta:>18}")
 
     if a["prefill_gpu_ms"]:
         saved = a["prefill_gpu_ms"] - b["prefill_gpu_ms"]
         print(
             f"\nprefill GPU time saved: {saved:,.1f} ms "
             f"({100.0 * saved / a['prefill_gpu_ms']:+.1f}%)"
+        )
+    if a["discarded_tokens"] < 0 or b["discarded_tokens"] < 0:
+        print(
+            "\nNOTE: a negative DROPPED count means this trace predates the fix that\n"
+            "records the drop at stitch time. It was derived by subtracting a\n"
+            "per-pass length from a per-request one, so every chunked-prefill\n"
+            "continuation pass reads one chunk short. Re-run to get a real number;\n"
+            "the other rows are unaffected."
         )
     if a["prefill_passes"] != b["prefill_passes"]:
         print(
@@ -328,48 +385,124 @@ STAGE_NOTES = {
     "cache_finished": "release locks / free tail",
 }
 
+# child -> enclosing stage. The two overlap, so only one may enter the total.
+#
+# Take the http-side cost from the child. subctx_split is measured directly --
+# the baseline's ~2 us is just the disabled early return, so the delta is very
+# nearly the level itself, and it reproduces to 0.4% across runs. tpl_render's
+# delta is a difference between two ~13 ms numbers that tokenize a ~12k-token
+# prompt with a heavy tail; its own run-to-run spread (~800 us) swamps the
+# ~680 us being resolved, and it swung +574 / +105 / +924 us over three runs of
+# the same comparison.
+#
+# They estimate the same quantity: subtracting the nested child from the parent
+# leaves the jinja work itself, which is identical in both arms and duly lands
+# on zero (-112 / -583 / +242 us over those runs). So this picks the better
+# estimator of one number, not a different number. cmd_stages prints the
+# residual so that assumption stays checkable.
+NESTED = {"subctx_split": "tpl_render"}
 
-def load_stages(prefix: str) -> Dict[str, Dict[str, float]]:
-    """Merge the per-process stage files a run wrote (<prefix>.http, .scheduler)."""
-    merged: Dict[str, Dict[str, float]] = {}
+
+def load_stages(prefix: str) -> tuple[Dict[str, Dict[str, float]], bool]:
+    """Merge the per-process stage files a run wrote (<prefix>.http, .scheduler).
+
+    Returns the merged stages and whether they came from the post-warm-up
+    window. ``measured`` is preferred but only when *every* process has it: a
+    mix of windows across processes is worse than one honest wide window.
+    """
     import glob
 
     hits = sorted(glob.glob(f"{prefix}.*"))
+    hits = [h for h in hits if not h.endswith(".mark")]
     if not hits:
         print(f"no stage files matching {prefix}.*", file=sys.stderr)
         sys.exit(1)
+
+    docs = []
     for path in hits:
         with open(path) as f:
-            doc = json.load(f)
-        for stage, s in doc["stages"].items():
+            docs.append((path, json.load(f)))
+    measured = all("measured" in doc for _, doc in docs)
+
+    merged: Dict[str, Dict[str, float]] = {}
+    for path, doc in docs:
+        for stage, s in doc["measured" if measured else "stages"].items():
+            # Stage names are global, not per-process; a collision would have one
+            # process silently overwrite the other's numbers.
+            if stage in merged:
+                print(f"warning: stage {stage!r} reported by more than one "
+                      f"process (last seen in {path}); numbers will be wrong",
+                      file=sys.stderr)
             merged[stage] = s
-    return merged
+    return merged, measured
 
 
 def cmd_stages(args: argparse.Namespace) -> int:
-    a = load_stages(args.baseline)
-    b = load_stages(args.treatment)
+    a, a_measured = load_stages(args.baseline)
+    b, b_measured = load_stages(args.treatment)
+    label_a, label_b = "baseline", "sub-context"
+
+    if not (a_measured and b_measured):
+        print("\nNOTE: at least one arm has no post-warm-up window, so these counts\n"
+              "      start at process launch and include the replay warm-up. The\n"
+              "      forward trace excludes it, so the two are not over the same\n"
+              "      window. Re-run with a --stage-trace passed to `replay`.")
 
     print(f"\n{'stage':<18} {'baseline':>22} {'sub-context':>22} {'added':>10}")
     print(f"{'':<18} {'calls   mean_us   tot_ms':>22} {'calls   mean_us   tot_ms':>22}")
     print("-" * 76)
 
     total_added = 0.0
+    skewed = []
     for stage in sorted(set(a) | set(b), key=lambda s: -(b.get(s, {}).get("total_ms", 0))):
         sa, sb = a.get(stage), b.get(stage)
         fa = (f"{sa['count']:>5} {sa['mean_us']:>9.1f} {sa['total_ms']:>8.1f}"
               if sa else f"{'-':>5} {'-':>9} {'-':>8}")
         fb = (f"{sb['count']:>5} {sb['mean_us']:>9.1f} {sb['total_ms']:>8.1f}"
               if sb else f"{'-':>5} {'-':>9} {'-':>8}")
-        added = (sb["total_ms"] if sb else 0.0) - (sa["total_ms"] if sa else 0.0)
-        # subctx_split is nested inside tpl_render; counting both double-counts it.
-        if stage != "subctx_split":
+        # Compare per-call cost scaled to a common call count, never raw totals.
+        # The arms can legitimately differ by a call or two -- a dump can land
+        # between a nested stage's add() and its parent's -- and subtracting
+        # unequal totals turns that off-by-one into phantom milliseconds.
+        n_ref = max(sa["count"] if sa else 0, sb["count"] if sb else 0)
+        norm = lambda s: (s["mean_us"] * n_ref / 1000.0) if s else 0.0
+        added = norm(sb) - norm(sa)
+        if sa and sb and sa["count"] != sb["count"]:
+            skewed.append((stage, sa["count"], sb["count"]))
+        if stage in NESTED.values():
+            note = "  (level only, see below)"
+        else:
             total_added += added
-        print(f"{stage:<18} {fa:>22} {fb:>22} {added:>+9.1f}ms")
+            note = ""
+        print(f"{stage:<18} {fa:>22} {fb:>22} {added:>+9.1f}ms{note}")
 
     print("-" * 76)
     print(f"{'TOTAL host overhead added':<18} {'':>45} {total_added:>+9.1f}ms")
-    print("\n(subctx_split is nested inside tpl_render and excluded from the total)")
+    n_req = max((s["count"] for s in list(a.values()) + list(b.values())), default=0)
+    if n_req:
+        print(f"{'  per request':<18} {'':>45} {1000.0 * total_added / n_req:>+9.1f}us")
+
+    print("\n(per-call means scaled to a common call count)")
+    for child, parent in NESTED.items():
+        if child not in b:
+            continue
+        print(f"\n{child} is nested inside {parent}, so only one enters the total:")
+        print(f"  {child:<20} counted  -- measured directly, baseline is the disabled path")
+        print(f"  {parent:<20} EXCLUDED -- its delta is a difference of two ~13ms numbers")
+        # The parent minus the nested child is the work both arms do identically.
+        # It should be zero; anything else means the split is not the whole story.
+        for label, arm in ((label_a, a), (label_b, b)):
+            if parent in arm:
+                net = arm[parent]["mean_us"] - arm.get(child, {}).get("mean_us", 0.0)
+                print(f"  {parent} minus {child}, {label:<20} {net:>10.1f} us/call")
+        if parent in a and parent in b:
+            resid = ((b[parent]["mean_us"] - b.get(child, {}).get("mean_us", 0.0))
+                     - (a[parent]["mean_us"] - a.get(child, {}).get("mean_us", 0.0)))
+            print(f"  -> residual (should be ~0)              {resid:>+10.1f} us/call")
+
+    for stage, ca, cb in skewed:
+        print(f"  WARNING: {stage} ran {ca} times in baseline but {cb} in sub-context")
+    print()
     for stage, note in STAGE_NOTES.items():
         if stage in a or stage in b:
             print(f"  {stage:<18} {note}")
@@ -399,6 +532,9 @@ def main() -> int:
     r.add_argument("--trace", default=None,
                    help="the server's SGLANG_FORWARD_TRACE path; marks where the "
                         "measured window begins so warm-up is excluded")
+    r.add_argument("--stage-trace", default=None,
+                   help="the server's SGLANG_STAGE_TRACE prefix; same purpose as "
+                        "--trace, for the host-side timers")
     r.add_argument("--no-flush", action="store_true")
     r.add_argument("--out", default=None, help="write per-request stats here")
     r.set_defaults(func=cmd_replay)

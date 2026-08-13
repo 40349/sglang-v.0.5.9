@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.evict_policy import (
 )
 from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
 from sglang.srt.utils import host_timer
+from sglang.srt.utils.subctx_trace import TRACE_ON, trace
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -425,10 +426,11 @@ class RadixCache(BasePrefixCache):
     def insert(self, params: InsertParams) -> InsertResult:
 
         # --- 追蹤 Radix Tree ---
-        print(f"[TRACE-4 RadixCache] 準備插入節點")
-        print(f"[TRACE-4 RadixCache] 插入的 key.extra_key={params.key.extra_key}")
+        if TRACE_ON:
+            trace(f"[TRACE-4 RadixCache] 準備插入節點")
+            trace(f"[TRACE-4 RadixCache] 插入的 key.extra_key={params.key.extra_key}")
         # ----------------------
-        
+
         if self.disable:
             return InsertResult(prefix_len=0)
 
@@ -470,19 +472,20 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        print(
-            f"[TRACE-4 FINISHED cls={type(self).__name__}] rid={req.rid} "
-            f"has_sub={req.has_sub_contexts} page={self.page_size} "
-            f"eagle={self.is_eagle} protected={req.cache_protected_len} "
-            f"sub_nodes={req.sub_context_last_nodes is not None}"
-        )
+        if TRACE_ON:
+            trace(
+                f"[TRACE-4 FINISHED cls={type(self).__name__}] rid={req.rid} "
+                f"has_sub={req.has_sub_contexts} page={self.page_size} "
+                f"eagle={self.is_eagle} protected={req.cache_protected_len} "
+                f"sub_nodes={req.sub_context_last_nodes is not None}"
+            )
 
         # Safety net: a request that finished without ever reaching
         # `_cache_unfinished_sub_contexts` (gate declined, or aborted while queued) still
         # holds its scheduling-time match locks. Idempotent if already released there.
         req.release_sub_context_match_locks(self)
 
-        # CacheSlide (Stage B): the prompt was already inserted per-namespace during
+        # Sub-context (Stage B): the prompt was already inserted per-namespace during
         # `cache_unfinished_req`. Just unlock those leaves and free the generated tail
         # (the continuation is not cached in any namespace here).
         if req.sub_context_last_nodes is not None:
@@ -518,7 +521,7 @@ class RadixCache(BasePrefixCache):
         self.dec_lock_ref(req.last_node)
 
     def _finish_sub_contexts(self, req: Req, kv_indices: torch.Tensor):
-        """CacheSlide (Stage B): finish a request whose prompt was cached per-namespace.
+        """Sub-context (Stage B): finish a request whose prompt was cached per-namespace.
 
         The prompt KV [0:cache_protected_len) is owned and locked by the per-namespace
         leaves recorded in ``req.sub_context_last_nodes`` -- it stays in the tree, we
@@ -542,18 +545,19 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return
 
-        print(
-            f"[TRACE-4 UNFINISHED cls={type(self).__name__}] rid={req.rid} "
-            f"chunked={chunked} has_sub={req.has_sub_contexts} "
-            f"protected={req.cache_protected_len}"
-        )
+        if TRACE_ON:
+            trace(
+                f"[TRACE-4 UNFINISHED cls={type(self).__name__}] rid={req.rid} "
+                f"chunked={chunked} has_sub={req.has_sub_contexts} "
+                f"protected={req.cache_protected_len}"
+            )
 
         token_ids = req.fill_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # CacheSlide (Stage B): insert the prompt as one node PER sub-context namespace
+        # Sub-context (Stage B): insert the prompt as one node PER sub-context namespace
         # instead of a single default-namespace node. Handles chunked prefill too: each
         # chunk extends every namespace by the newly-covered slice of its segment
         # (`sub_context_owned_lens` tracks per-segment progress). NOTE: this deliberately
@@ -627,7 +631,7 @@ class RadixCache(BasePrefixCache):
     def _cache_unfinished_sub_contexts(
         self, req: Req, token_ids: List[int], kv_indices: torch.Tensor
     ):
-        """CacheSlide (Stage B): insert the (possibly partial) prompt block-by-block,
+        """Sub-context (Stage B): insert the (possibly partial) prompt block-by-block,
         each under its own ``extra_key`` namespace, and lock each block's leaf so the
         prompt KV survives across chunks and into decode.
 
@@ -709,10 +713,11 @@ class RadixCache(BasePrefixCache):
         # Neutralize the scheduler's per-chunk lock pairing: root inc/dec are no-ops.
         req.last_node = self.root_node
 
-        print(
-            f"[TRACE-4 SUBCTX-INSERT] rid={req.rid} end_k={end_k} "
-            f"segments={[(k, o) for k, o in zip(req.sub_context_extra_keys, req.sub_context_owned_lens)]}"
-        )
+        if TRACE_ON:
+            trace(
+                f"[TRACE-4 SUBCTX-INSERT] rid={req.rid} end_k={end_k} "
+                f"segments={[(k, o) for k, o in zip(req.sub_context_extra_keys, req.sub_context_owned_lens)]}"
+            )
 
     def pretty_print(self):
         self._print_helper(self.root_node, 0)

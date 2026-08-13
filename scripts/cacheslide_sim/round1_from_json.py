@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""CacheSlide round-1 driver.
+"""Sub-context round-1 driver.
 
 Reads an openclaw normalized-request JSON capture, splits it into the three
-CacheSlide sub-contexts (system_prompt / tools / messages), and POSTs a single
+sub-contexts (system_prompt / tools / messages), and POSTs a single
 `/generate` request to a running sglang server with the `sub_contexts` field.
 
-This exercises Stage 0 of the CacheSlide pipeline end-to-end: the server tokenizes
+This exercises Stage 0 of the sub-context pipeline end-to-end: the server tokenizes
 each block independently, matches/inserts it in its own radix namespace, prints the
 three per-namespace radix trees (TRACE-1..4 + pretty_print), and decodes the turn-1
 output. See ~/.claude/plans/linked-wandering-bonbon.md.
@@ -47,7 +47,7 @@ def _extract_user_text(messages: List[Dict[str, Any]]) -> str:
 
 
 def build_sub_contexts(capture: Dict[str, Any]) -> List[Dict[str, str]]:
-    """Turn a normalized-request capture into ordered CacheSlide sub-contexts."""
+    """Turn a normalized-request capture into ordered sub-contexts."""
     ctx = capture.get("context", {})
     system_prompt = ctx.get("systemPrompt", "") or ""
     tools = ctx.get("tools", []) or []
@@ -102,7 +102,7 @@ def main() -> int:
 
     sub_contexts = build_sub_contexts(capture)
 
-    print("=== CacheSlide round-1 sub-contexts ===")
+    print("=== Sub-context round-1 blocks ===")
     for sc in sub_contexts:
         preview = sc["content"][:80].replace("\n", "\\n")
         print(f"  extra_key={sc['extra_key']:<14} chars={len(sc['content']):>6}  {preview!r}")

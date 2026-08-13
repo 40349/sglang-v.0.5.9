@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""CacheSlide cross-context reuse test.
+"""Cross-context reuse test.
 
-Goal: reproduce the CacheSlide approximation error (the WCA baseline). Two requests
+Goal: reproduce the cross-context approximation error (the WCA baseline). Two requests
 share the SAME `tools` and `messages` sub-contexts but have DIFFERENT `system_prompt`.
 
 Because each block is cached in its own radix namespace, the second request's
@@ -152,7 +152,7 @@ def main() -> int:
         "B": build_sub_contexts(capture, variant_system),
     }
 
-    print("=== CacheSlide cross-context test ===")
+    print("=== Cross-context reuse test ===")
     print(f"  system_prompt A chars={len(original_system)}")
     print(f"  system_prompt B chars={len(variant_system)}")
     print(f"  order={args.order}")

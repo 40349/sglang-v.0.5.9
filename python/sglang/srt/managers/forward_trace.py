@@ -65,15 +65,32 @@ class ForwardTracer:
             # stitch: once a non-final segment misses or only partially hits, every
             # later segment's hit is dropped even though it was matched and locked.
             # prefix_indices holds only what was stitched, so that waste is invisible
-            # unless the matched totals are recorded next to it.
-            matched_tokens = 0
+            # unless it is recorded next to it.
+            #
+            # The drop is taken from where `_stitch_sub_contexts` recorded it, and
+            # drained on read, so one stitch is counted once no matter how many
+            # forward passes chunked prefill splits the request into. Deriving it
+            # here from sum(sub_context_match_lens) instead would compare a
+            # per-request quantity against a per-pass one and report a negative
+            # drop of exactly one chunk on every continuation pass.
+            discarded_tokens = 0
             for req in reqs:
-                lens = getattr(req, "sub_context_match_lens", None)
-                matched_tokens += sum(lens) if lens else len(req.prefix_indices)
+                d = getattr(req, "sub_context_discarded", 0) or 0
+                if d:
+                    req.sub_context_discarded = 0
+                    discarded_tokens += d
+            matched_tokens = cached_tokens + discarded_tokens
+            # How many of these requests took the split path at all. A run with
+            # none of them did not observe zero drops -- the contiguity gate it
+            # would have measured is not in the code path. Reporting that as 0
+            # invites reading "0 vs 0" as evidence the gate behaves.
+            sub_reqs = sum(1 for req in reqs if getattr(req, "has_sub_contexts", False))
         else:
             new_tokens = bs  # one token per sequence per decode step
             cached_tokens = 0
             matched_tokens = 0
+            discarded_tokens = 0
+            sub_reqs = 0
 
         return {
             "ct": self._ct,
@@ -82,6 +99,8 @@ class ForwardTracer:
             "new_tokens": new_tokens,
             "cached_tokens": cached_tokens,
             "matched_tokens": matched_tokens,
+            "discarded_tokens": discarded_tokens,
+            "sub_reqs": sub_reqs,
             "t_rel": round(time.perf_counter() - self._t0, 6),
         }
 

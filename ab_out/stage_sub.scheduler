@@ -2,22 +2,42 @@
   "proc": "scheduler",
   "stages": {
     "cache_finished": {
-      "count": 54,
-      "total_ms": 7.8386,
-      "mean_us": 145.159,
-      "max_us": 227.689
+      "count": 53,
+      "total_ms": 7.0879,
+      "mean_us": 133.735,
+      "max_us": 226.101
     },
     "cache_unfinished": {
       "count": 55,
-      "total_ms": 69.3866,
-      "mean_us": 1261.574,
-      "max_us": 2642.973
+      "total_ms": 69.1909,
+      "mean_us": 1258.017,
+      "max_us": 2597.467
     },
     "match": {
       "count": 55,
-      "total_ms": 45.0892,
-      "mean_us": 819.804,
-      "max_us": 1662.626
+      "total_ms": 38.5316,
+      "mean_us": 700.575,
+      "max_us": 1467.026
+    }
+  },
+  "measured": {
+    "cache_finished": {
+      "count": 49,
+      "total_ms": 6.9554,
+      "mean_us": 141.947,
+      "max_us": 226.101
+    },
+    "cache_unfinished": {
+      "count": 51,
+      "total_ms": 68.6977,
+      "mean_us": 1347.013,
+      "max_us": 2597.467
+    },
+    "match": {
+      "count": 51,
+      "total_ms": 38.2395,
+      "mean_us": 749.794,
+      "max_us": 1467.026
     }
   }
 }

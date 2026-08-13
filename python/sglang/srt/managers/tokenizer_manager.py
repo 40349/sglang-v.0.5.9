@@ -45,6 +45,7 @@ from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
+from sglang.srt.utils.subctx_trace import TRACE_ON, trace
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -672,7 +673,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         input_embeds = None
         input_text = obj.text
         token_type_ids = None
-        # CacheSlide: per-block token ids / namespaces (None unless request is split).
+        # Sub-context: per-block token ids / namespaces (None unless request is split).
         sub_context_ids = None
         sub_context_extra_keys = None
         is_cross_encoder_request = (
@@ -698,7 +699,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 )
 
             if isinstance(obj, GenerateReqInput) and obj.sub_contexts:
-                # CacheSlide: tokenize each block independently so its token ids
+                # Sub-context: tokenize each block independently so its token ids
                 # match its own radix namespace, then stitch into one sequence.
                 contents = [sc["content"] for sc in obj.sub_contexts]
                 sub_context_extra_keys = [sc["extra_key"] for sc in obj.sub_contexts]
@@ -755,7 +756,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         else:
             mm_inputs = None
 
-        # CacheSlide: the OpenAI chat path renders the chat template itself, so it
+        # Sub-context: the OpenAI chat path renders the chat template itself, so it
         # arrives with `input_ids` already set (the branch above did no splitting) and
         # carries the per-namespace split alongside. Accept it only if it really
         # reconstructs the prompt -- a stale or mis-sliced split would silently feed
@@ -767,7 +768,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 sub_context_extra_keys = obj.sub_context_extra_keys
             else:
                 logger.warning(
-                    "CacheSlide: ignoring sub_context_ids that do not concatenate to "
+                    "Sub-context: ignoring sub_context_ids that do not concatenate to "
                     "input_ids (%d vs %d tokens).",
                     len(flat),
                     len(input_ids) if input_ids is not None else 0,
@@ -1006,14 +1007,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # --- 追蹤 Tokenizer ---
         # print(f"[TRACE-2 Tokenizer] 準備建立 Req, rid={tokenized_obj.rid}")
         # print(f"[TRACE-2 Tokenizer] extra_key={getattr(tokenized_obj, 'extra_key', 'Lose')}")
-        _sc_keys = getattr(tokenized_obj, "sub_context_extra_keys", None)
-        if _sc_keys:
-            _sc_ids = getattr(tokenized_obj, "sub_context_ids", None) or []
-            _sc_lens = [len(seg) for seg in _sc_ids]
-            print(
-                f"[TRACE-2 Tokenizer] sub_contexts: extra_keys={_sc_keys} "
-                f"segment_token_lens={_sc_lens}"
-            )
+        if TRACE_ON:
+            _sc_keys = getattr(tokenized_obj, "sub_context_extra_keys", None)
+            if _sc_keys:
+                _sc_ids = getattr(tokenized_obj, "sub_context_ids", None) or []
+                _sc_lens = [len(seg) for seg in _sc_ids]
+                trace(
+                    f"[TRACE-2 Tokenizer] sub_contexts: extra_keys={_sc_keys} "
+                    f"segment_token_lens={_sc_lens}"
+                )
 
         return tokenized_obj
 

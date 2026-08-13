@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.utils.subctx_trace import TRACE_ON, trace
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.metrics.collector import (
     DPCooperationInfo,
@@ -609,12 +610,15 @@ class Req(ReqDllmMixin):
 
         self.extra_key = extra_key
 
-        # CacheSlide: ordered per-block token ids and their radix namespaces.
+        # Sub-context: ordered per-block token ids and their radix namespaces.
         # concat(sub_context_ids) == origin_input_ids. None for normal requests.
         self.sub_context_ids = sub_context_ids
         self.sub_context_extra_keys = sub_context_extra_keys
         # Per-block radix hit lengths (filled during scheduling; parallel to keys).
         self.sub_context_match_lens: Optional[List[int]] = None
+        # Tokens matched in the tree that the contiguity rule then refused to
+        # stitch. Set by `_stitch_sub_contexts`, drained by whoever reports it.
+        self.sub_context_discarded: int = 0
         # WCA: the actual KV slots each block hit in its own namespace, and the nodes
         # that own them (both parallel to sub_context_ids; entry is None where the block
         # missed or is empty). Recorded by `_stitch_sub_contexts` for EVERY block, not
@@ -625,12 +629,12 @@ class Req(ReqDllmMixin):
         # fields are always cleared together by `release_sub_context_match_locks`.
         self.sub_context_match_indices: Optional[List[Optional[torch.Tensor]]] = None
         self.sub_context_match_nodes: Optional[List[Optional[Any]]] = None
-        # CacheSlide (Stage B): the per-namespace leaf nodes locked when the prompt
+        # Sub-context (Stage B): the per-namespace leaf nodes locked when the prompt
         # was inserted in `cache_unfinished_req`. Non-None marks that this request's
         # prompt lives under sub-context namespaces (not the default None namespace),
         # so `cache_finished_req` unlocks these instead of re-inserting.
         self.sub_context_last_nodes: Optional[List] = None
-        # CacheSlide (Stage B): how many tokens of each segment this request has already
+        # Sub-context (Stage B): how many tokens of each segment this request has already
         # inserted into its namespace, accumulated across chunked-prefill chunks. Used to
         # free only the freshly-computed duplicate slots (parallel to sub_context_ids).
         self.sub_context_owned_lens: Optional[List[int]] = None
@@ -852,8 +856,8 @@ class Req(ReqDllmMixin):
         # --- 追蹤 Scheduler 建立 Req ---
         # print(f"[TRACE-3 Scheduler] 建立 Req 實例, rid={self.rid}")
         # print(f"[TRACE-3 Scheduler] self.extra_key={getattr(self, 'extra_key', '實例無此屬性')}")
-        if self.sub_context_extra_keys:
-            print(
+        if TRACE_ON and self.sub_context_extra_keys:
+            trace(
                 f"[TRACE-3 Scheduler] sub_context_extra_keys={self.sub_context_extra_keys} "
                 f"segment_lens={[len(s) for s in (self.sub_context_ids or [])]}"
             )
@@ -861,7 +865,7 @@ class Req(ReqDllmMixin):
 
     @property
     def has_sub_contexts(self) -> bool:
-        """CacheSlide: whether this request was split into per-namespace blocks."""
+        """Sub-context: whether this request was split into per-namespace blocks."""
         return bool(self.sub_context_extra_keys) and bool(self.sub_context_ids)
 
     def iter_sub_contexts(self):
@@ -1100,11 +1104,12 @@ class Req(ReqDllmMixin):
             else:
                 match_nodes.append(None)
                 match_indices.append(None)
-            print(
-                f"[TRACE-4 RadixCache] sub-context match rid={self.rid} "
-                f"extra_key={seg_key!r} hit={hit}/{len(seg_ids)} "
-                f"hit_tokens={_preview(seg_ids[:hit])}"
-            )
+            if TRACE_ON:
+                trace(
+                    f"[TRACE-4 RadixCache] sub-context match rid={self.rid} "
+                    f"extra_key={seg_key!r} hit={hit}/{len(seg_ids)} "
+                    f"hit_tokens={_preview(seg_ids[:hit])}"
+                )
             take = 0
             if contiguous:
                 if hit == 0:
@@ -1125,6 +1130,15 @@ class Req(ReqDllmMixin):
         self.sub_context_owned_lens = owned
         self.sub_context_match_indices = match_indices
         self.sub_context_match_nodes = match_nodes
+        # Matched but not stitched -- the tokens the contiguity rule threw away.
+        # The tree walk and the inc_lock_ref above were already paid for them, and
+        # prefix_indices keeps no trace, so this is the only place both halves
+        # exist. Record it here rather than letting a reader subtract
+        # len(prefix_indices) from sum(match_lens) downstream: that mixes a
+        # per-request quantity with a per-pass one, and chunked prefill rewrites
+        # prefix_indices between passes to include the chunk just computed, so the
+        # subtraction goes negative by exactly one chunk on every continuation.
+        self.sub_context_discarded = sum(match_lens) - sum(owned)
         if stitched:
             self.prefix_indices = torch.cat(stitched)
         else:

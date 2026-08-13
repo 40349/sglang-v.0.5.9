@@ -193,7 +193,7 @@ class SchedulePolicy:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             # NOTE: the prefix_indices must always be aligned with last_node
-            # CacheSlide: sub-context requests are matched/stitched per-namespace in
+            # Sub-context requests are matched/stitched per-namespace in
             # Req.init_next_round_input (which always runs, unlike this LPM-only path),
             # so the default-namespace match here is left as-is for sorting only and is
             # harmlessly overwritten there.
@@ -243,11 +243,11 @@ class SchedulePolicy:
                     )
         return temporary_deprioritized
 
-    # CacheSlide: superseded by Req._stitch_sub_contexts in schedule_batch.py, which
+    # Sub-context: superseded by Req._stitch_sub_contexts in schedule_batch.py, which
     # runs unconditionally in init_next_round_input (this path is LPM-only). Kept here,
     # commented out, for reference.
     # def _match_sub_contexts(self, r: Req) -> None:
-    #     """CacheSlide: match each sub-context block against its own radix namespace.
+    #     """Sub-context: match each sub-context block against its own radix namespace.
     #
     #     Records per-block hit lengths on ``r.sub_context_match_lens`` (parallel to
     #     ``r.sub_context_extra_keys``) for later CCPE/WCA stages, and logs them so the

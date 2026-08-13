@@ -15,6 +15,12 @@ Stages are named identically in both configs and placed at the branch point, so
 the same name covers the stock path and the sub-context path. Running once with
 ``SGLANG_DISABLE_SUBCONTEXT=1`` and once without, then subtracting per stage,
 gives the added cost directly.
+
+Counters accumulate from process start, which includes the replay client's
+warm-up generations. Once that client creates ``<SGLANG_STAGE_TRACE>.mark`` a
+second accumulator opens and is reported as ``measured``, matching the window
+the forward trace's ``measure_start`` marker defines. Comparing the two traces
+over different windows is how warm-up cost ends up attributed to a mechanism.
 """
 
 from __future__ import annotations
@@ -45,6 +51,10 @@ class HostTimer:
         self._proc = proc
         # stage -> [count, total_ns, max_ns]
         self._stages: Dict[str, List[int]] = {}
+        # Same shape, but started fresh when the replay client marks the end of
+        # warm-up. None until then. See _check_mark.
+        self._measured: Optional[Dict[str, List[int]]] = None
+        self._mark_path: Optional[str] = f"{path}.mark"
         self._lock = threading.Lock()
         self._last_dump = time.perf_counter()
         self._since_dump = 0
@@ -66,18 +76,43 @@ class HostTimer:
                 os.kill(os.getpid(), sig)
 
         return handler
-        logger.info("HostTimer: writing stage timings to %s", self._path)
+
+    def _check_mark(self) -> None:
+        """Open a second accumulator once the replay client marks warm-up over.
+
+        The forward trace gets its ``measure_start`` for free -- client and
+        server append to the same file. The stages cannot: they live in two
+        server processes while the marker is created by a third, so there is no
+        in-process signal to hook. A stat() on an agreed path is the cheapest
+        thing that crosses that boundary. It runs outside the timed region
+        (``add`` is called after the elapsed time has been taken) and stops
+        entirely once the marker has been seen.
+
+        Counting into a fresh dict rather than subtracting a baseline keeps
+        max_us honest: a maximum cannot be un-summed.
+        """
+        if not os.path.exists(self._mark_path):
+            return
+        with self._lock:
+            if self._measured is None:
+                self._measured = {}
+        self._mark_path = None  # seen; never stat again
 
     def add(self, stage: str, ns: int) -> None:
+        if self._mark_path is not None:
+            self._check_mark()
         with self._lock:
-            slot = self._stages.get(stage)
-            if slot is None:
-                self._stages[stage] = [1, ns, ns]
-            else:
-                slot[0] += 1
-                slot[1] += ns
-                if ns > slot[2]:
-                    slot[2] = ns
+            for table in (self._stages, self._measured):
+                if table is None:
+                    continue
+                slot = table.get(stage)
+                if slot is None:
+                    table[stage] = [1, ns, ns]
+                else:
+                    slot[0] += 1
+                    slot[1] += ns
+                    if ns > slot[2]:
+                        slot[2] = ns
             self._since_dump += 1
             due = (
                 self._since_dump >= _DUMP_EVERY_N
@@ -86,24 +121,33 @@ class HostTimer:
         if due:
             self.dump()
 
+    @staticmethod
+    def _snapshot(table: Dict[str, List[int]]) -> Dict[str, Dict[str, float]]:
+        return {
+            stage: {
+                "count": c,
+                "total_ms": round(total / 1e6, 4),
+                "mean_us": round(total / c / 1e3, 3),
+                "max_us": round(mx / 1e3, 3),
+            }
+            for stage, (c, total, mx) in sorted(table.items())
+        }
+
     def dump(self) -> None:
         with self._lock:
             if not self._stages:
                 return
-            snapshot = {
-                stage: {
-                    "count": c,
-                    "total_ms": round(total / 1e6, 4),
-                    "mean_us": round(total / c / 1e3, 3),
-                    "max_us": round(mx / 1e3, 3),
-                }
-                for stage, (c, total, mx) in sorted(self._stages.items())
-            }
+            doc = {"proc": self._proc, "stages": self._snapshot(self._stages)}
+            # Present only once the warm-up marker has been seen. Readers should
+            # prefer it and say so when it is missing, rather than silently
+            # reporting a window that includes warm-up.
+            if self._measured is not None:
+                doc["measured"] = self._snapshot(self._measured)
             self._last_dump = time.perf_counter()
             self._since_dump = 0
         try:
             with open(self._path, "w") as f:
-                json.dump({"proc": self._proc, "stages": snapshot}, f, indent=2)
+                json.dump(doc, f, indent=2)
         except OSError as e:
             logger.warning("HostTimer: cannot write %s (%s)", self._path, e)
 

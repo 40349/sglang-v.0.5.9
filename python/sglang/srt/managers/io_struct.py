@@ -251,14 +251,14 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
-    # CacheSlide sub-contexts. An ordered list of logically-distinct blocks that
+    # Sub-contexts. An ordered list of logically-distinct blocks that
     # openclaw splits a single request into (e.g. system_prompt / tools / messages).
     # Each item is a dict {"content": str, "extra_key": str}. Every block is
     # tokenized independently and matched/inserted in its own radix namespace
     # (keyed by its extra_key), then stitched into a single sequence for one decode.
     sub_contexts: Optional[List[Dict[str, str]]] = None
 
-    # CacheSlide: pre-split token ids for the same blocks, parallel to
+    # Sub-context: pre-split token ids for the same blocks, parallel to
     # ``sub_context_extra_keys``. Used by the OpenAI chat path, which renders the chat
     # template itself and therefore splits the rendered *ids* instead of raw text, so
     # ``concat(sub_context_ids) == input_ids`` holds exactly. Ignored (with a warning)
@@ -325,7 +325,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             self._normalize_batch_inputs()
 
     def _normalize_sub_contexts(self):
-        """CacheSlide: derive a single ``text`` prompt from ``sub_contexts``.
+        """Sub-context: derive a single ``text`` prompt from ``sub_contexts``.
 
         openclaw sends the request pre-split into ordered blocks. We concatenate
         their contents so batch-size detection and the rest of the pipeline see one
@@ -788,7 +788,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
 
-    # CacheSlide: per-block token ids and their radix namespaces (extra_keys),
+    # Sub-context: per-block token ids and their radix namespaces (extra_keys),
     # parallel lists in prompt order. ``concat(sub_context_ids) == input_ids``.
     # None when the request was not split into sub-contexts.
     sub_context_ids: Optional[List[List[int]]] = None
