@@ -30,12 +30,20 @@ TRAIN_LOG="${LOG_DIR}/train_cope_${JOB}.log"
 # and point it at that run's cope_adapter_last.pt -- best.pt carries no optimizer state.
 RESUME_FROM=""
 
-# 2e-4, not the 1e-3 the first Llama run used. 1e-3 took pos/attn from 0.030 to 0.148
-# (CoPE became load-bearing, which was the point) but perplexity then oscillated 12-21
-# instead of descending. gate_bias is frozen by default for the same reason: it decides
-# which table slot a token lands in, and training it alongside pos_emb makes the two
-# chase each other.
-POS_EMB_LR=2e-4
+# Back to 1e-3, with gate_bias FROZEN -- a combination that has never actually run.
+# History: 6e-6 gave pos/attn 0.005 (inert, ppl fine); 1e-3 with a TRAINABLE gate_bias
+# gave pos/attn 0.148 (CoPE load-bearing) but oscillating ppl; 2e-4 with gate_bias frozen
+# gave clean convergence (Qwen3-8B, ppl 3.18 = 0.87x the RoPE baseline) but pos/attn stuck
+# at 0.017 -- inert again, the LoRA doing all the work. The oscillation at 1e-3 was
+# attributed to gate_bias chasing pos_emb, but that fix and the LR cut landed together, so
+# this run isolates the one variable that was changed for the wrong reason.
+#
+# Watch pos/attn at the step-149 eval: still under ~0.03 there and the problem is not the
+# learning rate, it is that next-token prediction on this corpus does not need position at
+# all -- a position-free model already beats the RoPE baseline on it. The fallback is then
+# to freeze the LoRA for the first N steps so pos_emb is the only thing that can reduce
+# the loss.
+POS_EMB_LR=1e-3
 
 # Rows [0, TRAIN_ROWS) train; the tail stays unseen for verify_cope --skip_samples.
 TRAIN_ROWS=60000
