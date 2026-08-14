@@ -910,6 +910,15 @@ def main():
     ap.add_argument("--resume", default=None,
                     help="path to a cope_adapter_last.pt written by this script; "
                          "restores weights, optimizer, scheduler and step counter")
+    ap.add_argument("--lora_warmup_steps", type=int, default=0,
+                    help="freeze the LoRA for the first N steps so pos_emb is the ONLY "
+                         "parameter that can reduce the loss. Without this the LoRA "
+                         "absorbs everything: measured on Qwen3-8B, it drove ppl 199.7 "
+                         "-> 3.18 while pos/attn stayed at 0.017, i.e. the position table "
+                         "never became load-bearing and no learning rate fixed it (a 167x "
+                         "range moved pos/attn only 0.005 -> 0.029). Starting from a "
+                         "RoPE-less model at ppl ~200, pos_emb alone has to carry the "
+                         "positional work before the LoRA is allowed to help.")
     ap.add_argument("--keep_rope", action="store_true",
                     help="CONTROL RUN: train the identical LoRA setup but leave RoPE in "
                          "place and attach no CoPE. Without this the CoPE numbers are "
@@ -1136,10 +1145,23 @@ def main():
                 f"nothing left to run. Raise --steps to continue training it."
             )
 
+    # LoRA warmup: freeze the adapters so the only downhill direction is through pos_emb.
+    # requires_grad=False leaves their .grad as None, so AdamW skips them entirely and no
+    # stale momentum is applied when they are released.
+    if args.lora_warmup_steps and not args.keep_rope:
+        for p_ in lora_params:
+            p_.requires_grad_(False)
+        print(f"LoRA frozen for the first {args.lora_warmup_steps} steps "
+              f"({len(lora_params)} tensors); only pos_emb can reduce the loss")
+
     reg_diag = {"span": 0.0, "span_max": 0.0, "L_span": 0.0, "L_bimod": 0.0}
     eval_batches = args.eval_batches or None
     pos_ratio_and_reset()  # discard whatever the baseline pass accumulated
     for step in range(start_step, args.steps):
+        if args.lora_warmup_steps and step == args.lora_warmup_steps and not args.keep_rope:
+            for p_ in lora_params:
+                p_.requires_grad_(True)
+            print(f"step {step:5d}  LoRA released ({len(lora_params)} tensors now training)")
         opt.zero_grad()
         micro_loss = 0.0
         for _ in range(args.grad_accum):
@@ -1155,7 +1177,10 @@ def main():
             if _GATE_REG["on"]:
                 reg_diag = accumulate_gate_reg_grads(model, scale=1.0 / args.grad_accum)
 
-        if not grad_seen["pos_emb"]:  # one-time sanity that both groups train
+        # Keep checking until BOTH have been seen: under --lora_warmup_steps the LoRA
+        # has no gradient for the first N steps, and a pos_emb-only guard would latch
+        # early and report lora=False for the whole run.
+        if not (grad_seen["pos_emb"] and grad_seen["lora"]):
             for name, p in model.named_parameters():
                 if p.grad is None or p.grad.abs().sum() == 0:
                     continue
@@ -1164,7 +1189,8 @@ def main():
                 elif "lora_" in name:
                     grad_seen["lora"] = True
 
-        torch.nn.utils.clip_grad_norm_(trainable, args.max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(
+            [t for t in trainable if t.grad is not None], args.max_grad_norm)
         opt.step()
         sched.step()
 
