@@ -219,14 +219,31 @@ def enable_cope_serving(pos_emb_path: str) -> None:
     # that nothing calls -- RoPE would stay live and the model would run as
     # "RoPE + an untrained CoPE bias" with no error anywhere. Same for the two backend
     # methods. Fail loudly on upstream drift instead.
-    for cls, name in ((LlamaAttention, "forward_prepare_native"),
-                      (TorchNativeAttnBackend, "forward_extend"),
-                      (TorchNativeAttnBackend, "forward_decode")):
+    import inspect
+
+    for cls, name, repl in ((LlamaAttention, "forward_prepare_native",
+                             _cope_forward_prepare_native),
+                            (TorchNativeAttnBackend, "forward_extend",
+                             _make_forward_extend(cope_layers)),
+                            (TorchNativeAttnBackend, "forward_decode",
+                             _make_forward_decode(cope_layers))):
         if not hasattr(cls, name):
             raise RuntimeError(
                 f"[CoPE] {cls.__name__}.{name} does not exist in this SGLang build, so "
                 f"patching it would be a silent no-op (RoPE would stay active). The "
                 f"serving patch needs updating for this version."
+            )
+        # hasattr is not enough. Qwen3MoeAttention.forward_prepare_native takes an extra
+        # forward_batch and returns (None, forward_batch, inner_state) rather than
+        # (q, k, v), so a patch written against Llama installs cleanly and then dies at
+        # the first token. Compare parameter names before replacing anything.
+        want = list(inspect.signature(getattr(cls, name)).parameters)
+        got = list(inspect.signature(repl).parameters)
+        if want != got:
+            raise RuntimeError(
+                f"[CoPE] {cls.__name__}.{name} takes {want} but the CoPE replacement "
+                f"takes {got}. This model's attention is not the one the patch was "
+                f"written for -- port _cope_forward_prepare_native before serving it."
             )
 
     LlamaAttention.forward_prepare_native = _cope_forward_prepare_native
