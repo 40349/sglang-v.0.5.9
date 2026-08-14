@@ -315,9 +315,13 @@ def add_lora(model, r: int, alpha: int, targets=("q_proj", "k_proj", "v_proj", "
 
     Requires plain nn.Linear projections: LoRALinear reads base.in_features and
     base.weight, which a 4-bit packed (AWQ / compressed-tensors) module does not have.
+
+    Keyed on the attention CLASS, not on "has a .cope attached": the --keep_rope control
+    run never calls inject_cope, and keying on CoPE would silently give it zero adapters.
     """
+    attn_cls = attention_class(model)
     for module in model.modules():
-        if is_cope_attention(module):
+        if isinstance(module, attn_cls):
             for name in targets:
                 base = getattr(module, name)
                 setattr(module, name, LoRALinear(base, r=r, alpha=alpha))
@@ -906,6 +910,13 @@ def main():
     ap.add_argument("--resume", default=None,
                     help="path to a cope_adapter_last.pt written by this script; "
                          "restores weights, optimizer, scheduler and step counter")
+    ap.add_argument("--keep_rope", action="store_true",
+                    help="CONTROL RUN: train the identical LoRA setup but leave RoPE in "
+                         "place and attach no CoPE. Without this the CoPE numbers are "
+                         "uninterpretable -- the 'RoPE baseline' is the STOCK model, so a "
+                         "finetuned CoPE model beating it says nothing about position. "
+                         "Compare this run's ppl against the CoPE run's to find out "
+                         "whether position matters on this corpus at all.")
     ap.add_argument("--skip_baseline", action="store_true",
                     help="skip the pre-injection RoPE perplexity measurement")
     ap.add_argument("--tile_q", type=int, default=0,
@@ -1007,8 +1018,11 @@ def main():
     typical_len = int(_stats.median(_sample)) if _sample else args.max_seq_len
     print(f"sample length: median {typical_len}  mean {int(_stats.mean(_sample))}  "
           f"max {max(_sample)}  (cap {args.max_seq_len})")
-    inject_cope(model, npos_max=npos_max, gate_bias_span=args.gate_bias_span,
-                seq_len=typical_len)
+    if args.keep_rope:
+        print("CONTROL RUN (--keep_rope): RoPE kept, no CoPE attached; LoRA only")
+    else:
+        inject_cope(model, npos_max=npos_max, gate_bias_span=args.gate_bias_span,
+                    seq_len=typical_len)
     add_lora(model, r=args.lora_rank, alpha=args.lora_alpha)
     # Re-home CoPE modules onto the model device/after any wrapping.
     model.to(args.device)
@@ -1023,12 +1037,13 @@ def main():
     # Contextual span grows with sequence length (~0.5*L unbiased), so a table sized to
     # max_seq_len has an upper half no sample can ever reach: those slots stay at their
     # zero init and contribute no position signal when a longer prompt lands on them.
-    if npos_max > args.max_seq_len // 2:
+    if not args.keep_rope and npos_max > args.max_seq_len // 2:
         print(f"  NOTE: npos_max={npos_max} vs max_seq_len={args.max_seq_len}: expect "
               f"only slots [0, ~{args.max_seq_len // 2}] to receive gradient. The "
               f"pos_emb coverage report at the end of the run shows what actually "
               f"trained -- serving prompts longer than --max_seq_len will index past it.")
-    if not args.gate_bias_span and npos_max < args.max_seq_len // 2:
+    if not args.keep_rope and not args.gate_bias_span \
+            and npos_max < args.max_seq_len // 2:
         print(f"  NOTE: unbiased gates start at a span of ~{args.max_seq_len // 2} but "
               f"npos_max={npos_max}, so most positions clamp at init and clamped keys "
               f"get NO gradient. Consider --gate_bias_span {npos_max // 4}.")
@@ -1046,8 +1061,9 @@ def main():
     lora_params = [p for n, p in model.named_parameters()
                    if p.requires_grad and "lora_" in n]
     pos_emb_lr = args.pos_emb_lr if args.pos_emb_lr is not None else args.lr
-    groups = [{"params": lora_params, "lr": args.lr},
-              {"params": pos_emb_params, "lr": pos_emb_lr}]
+    groups = [{"params": lora_params, "lr": args.lr}]
+    if pos_emb_params:  # empty under --keep_rope
+        groups.append({"params": pos_emb_params, "lr": pos_emb_lr})
     if gate_bias_params:
         groups.append({"params": gate_bias_params, "lr": args.gate_bias_lr})
     opt = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
@@ -1175,13 +1191,16 @@ def main():
                 best_ppl = ppl
                 save_adapter(model, out_dir / "cope_adapter_best.pt", meta)
                 tag = "  <- best (saved)"
-            gap = f" vs RoPE {baseline_ppl:.2f} ({ppl / baseline_ppl:.2f}x)" \
+            gap = f" vs stock {baseline_ppl:.2f} ({ppl / baseline_ppl:.2f}x)" \
                 if baseline_ppl else ""
             # pos/attn < ~0.05 means the position term cannot shift any attention weight:
             # the LoRA is absorbing the loss and CoPE is along for the ride.
-            flag = "  <- CoPE INERT, raise --pos_emb_lr" if ratio < 0.05 else ""
-            print(f"  [eval] step {step:5d}  ppl {ppl:.2f}{gap}  "
-                  f"pos/attn {ratio:.3f}{flag}{tag}")
+            if args.keep_rope:
+                print(f"  [eval] step {step:5d}  ppl {ppl:.2f}{gap}{tag}")
+            else:
+                flag = "  <- CoPE INERT, raise --pos_emb_lr" if ratio < 0.05 else ""
+                print(f"  [eval] step {step:5d}  ppl {ppl:.2f}{gap}  "
+                      f"pos/attn {ratio:.3f}{flag}{tag}")
         if (step + 1) % args.save_every == 0 or is_last:
             save_adapter(model, out_dir / "cope_adapter_last.pt", meta,
                          opt=opt, sched=sched, step=step, best_ppl=best_ppl)
@@ -1191,7 +1210,8 @@ def main():
           + (f"  (RoPE baseline {baseline_ppl:.2f}, ratio "
              f"{best_ppl / baseline_ppl:.2f}x)" if baseline_ppl else ""))
     print(f"gradients reached: pos_emb={grad_seen['pos_emb']} lora={grad_seen['lora']}")
-    print(f"pos_emb coverage: {pos_emb_coverage(model)}")
+    if not args.keep_rope:
+        print(f"pos_emb coverage: {pos_emb_coverage(model)}")
 
     # CKSim sanity (drift): should print numbers in [-1, 1], ideally high & flat.
     if args.smoke:
