@@ -125,10 +125,46 @@ def _run_cope_decode(query, output, k_cache, v_cache, req_to_token,
 # Monkey-patches (built as closures over the loaded per-layer CoPE modules)
 # ---------------------------------------------------------------------------
 def _cope_forward_prepare_native(self, positions, hidden_states):
-    """LlamaAttention prepare WITHOUT RoPE (CoPE keys/queries stay un-rotated)."""
+    """Attention prepare WITHOUT RoPE (CoPE keys/queries stay un-rotated).
+
+    Covers Llama and dense Qwen3, whose stock prepares are identical apart from Qwen3's
+    QK-Norm. Only the ``self.rotary_emb(...)`` call is dropped: QK-Norm is part of the
+    trained model and removing it would serve weights the training never produced.
+    """
     qkv, _ = self.qkv_proj(hidden_states)
     q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+    if getattr(self, "q_norm", None) is not None:
+        from sglang.srt.models.utils import apply_qk_norm
+
+        q, k = apply_qk_norm(
+            q=q,
+            k=k,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            head_dim=self.head_dim,
+            alt_stream=getattr(self, "alt_stream", None),
+        )
     return q, k, v
+
+
+def _supported_attention_classes():
+    """Attention classes whose prepare matches _cope_forward_prepare_native.
+
+    Qwen3-MoE is deliberately absent: its forward_prepare_native takes an extra
+    forward_batch and returns (None, forward_batch, inner_state), and it fuses QK-Norm
+    with RoPE, so it needs its own replacement rather than this one.
+    """
+    out = []
+    from sglang.srt.models.llama import LlamaAttention
+
+    out.append(LlamaAttention)
+    try:
+        from sglang.srt.models.qwen3 import Qwen3Attention
+
+        out.append(Qwen3Attention)
+    except ImportError:  # older builds without dense Qwen3
+        pass
+    return out
 
 
 def _make_forward_extend(cope_layers):
@@ -212,7 +248,6 @@ def enable_cope_serving(pos_emb_path: str) -> None:
     """
     cope_layers = load_cope_layers(pos_emb_path)
 
-    from sglang.srt.models.llama import LlamaAttention
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 
     # Assigning to a name the class does not define would silently create a NEW method
@@ -221,12 +256,15 @@ def enable_cope_serving(pos_emb_path: str) -> None:
     # methods. Fail loudly on upstream drift instead.
     import inspect
 
-    for cls, name, repl in ((LlamaAttention, "forward_prepare_native",
-                             _cope_forward_prepare_native),
-                            (TorchNativeAttnBackend, "forward_extend",
-                             _make_forward_extend(cope_layers)),
-                            (TorchNativeAttnBackend, "forward_decode",
-                             _make_forward_decode(cope_layers))):
+    attn_classes = _supported_attention_classes()
+    targets = [(cls, "forward_prepare_native", _cope_forward_prepare_native)
+               for cls in attn_classes]
+    targets += [(TorchNativeAttnBackend, "forward_extend",
+                 _make_forward_extend(cope_layers)),
+                (TorchNativeAttnBackend, "forward_decode",
+                 _make_forward_decode(cope_layers))]
+
+    for cls, name, repl in targets:
         if not hasattr(cls, name):
             raise RuntimeError(
                 f"[CoPE] {cls.__name__}.{name} does not exist in this SGLang build, so "
@@ -246,14 +284,16 @@ def enable_cope_serving(pos_emb_path: str) -> None:
                 f"written for -- port _cope_forward_prepare_native before serving it."
             )
 
-    LlamaAttention.forward_prepare_native = _cope_forward_prepare_native
+    for cls in attn_classes:
+        cls.forward_prepare_native = _cope_forward_prepare_native
     TorchNativeAttnBackend.forward_extend = _make_forward_extend(cope_layers)
     TorchNativeAttnBackend.forward_decode = _make_forward_decode(cope_layers)
 
     n_biased = sum(1 for m in cope_layers if m is not None and m.gate_bias.abs().max() > 0)
     print(f"[CoPE] enabled: {len(cope_layers)} layers, "
           f"npos_max={cope_layers[0].npos_max}, gate_bias on {n_biased} layers; "
-          f"RoPE disabled, torch_native patched.")
+          f"RoPE disabled on {[c.__name__ for c in attn_classes]}, "
+          f"torch_native patched.")
 
 
 # ---------------------------------------------------------------------------
