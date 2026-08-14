@@ -270,13 +270,18 @@ def add_lora(model, r: int, alpha: int, targets=("q_proj", "k_proj", "v_proj", "
                 setattr(module, name, LoRALinear(base, r=r, alpha=alpha))
 
 
-def mark_trainable(model) -> List[nn.Parameter]:
-    """Freeze everything, then unfreeze CoPE ``pos_emb`` + LoRA. Returns trainables."""
+def mark_trainable(model, train_gate_bias: bool = True) -> List[nn.Parameter]:
+    """Freeze everything, then unfreeze CoPE ``pos_emb`` + LoRA. Returns trainables.
+
+    ``train_gate_bias=False`` leaves the gate bias at its initialisation value. It is
+    still saved by :func:`save_adapter` -- serving must reproduce it either way.
+    """
     for p in model.parameters():
         p.requires_grad_(False)
     trainable: List[nn.Parameter] = []
     for name, p in model.named_parameters():
-        if ("cope.pos_emb" in name or "cope.gate_bias" in name
+        if ("cope.pos_emb" in name
+                or ("cope.gate_bias" in name and train_gate_bias)
                 or "lora_A" in name or "lora_B" in name):
             p.requires_grad_(True)
             trainable.append(p)
@@ -689,7 +694,11 @@ def save_adapter(model, path, meta: dict, opt=None, sched=None, step=None,
     counter go in too, which is what makes ``--resume`` able to continue a killed job
     rather than restart it. Returns the tensor count.
     """
-    adapter = {n: p.detach().cpu() for n, p in model.named_parameters() if p.requires_grad}
+    # Every cope.* parameter goes in whether or not it trains: a frozen gate_bias is
+    # still part of the model serving has to reproduce, and dropping it would shift
+    # every contextual position at inference.
+    adapter = {n: p.detach().cpu() for n, p in model.named_parameters()
+               if p.requires_grad or ".cope." in n}
     blob = {**meta, "state": adapter}
     if opt is not None:
         blob.update({"optimizer": opt.state_dict(), "scheduler": sched.state_dict(),
@@ -817,6 +826,12 @@ def main():
                          "npos_max and clamps -- and clamp has zero gradient, so every "
                          "clamped key is frozen out of training. Set it below --npos_max, "
                          "e.g. 256 for npos_max=1024.")
+    ap.add_argument("--gate_bias_lr", type=float, default=0.0,
+                    help="LR for the gate bias; 0 (default) FREEZES it at its init "
+                         "value. It is an initialisation device -- letting it train at "
+                         "the pos_emb rate moves where tokens land in the table while "
+                         "the table is being rewritten, and the two chase each other "
+                         "instead of converging. Frozen or <=pos_emb_lr/100.")
     ap.add_argument("--seed", type=int, default=0,
                     help="seeds torch/data shuffling so a 24h job is reproducible")
     ap.add_argument("--resume", default=None,
@@ -918,7 +933,7 @@ def main():
     add_lora(model, r=args.lora_rank, alpha=args.lora_alpha)
     # Re-home CoPE modules onto the model device/after any wrapping.
     model.to(args.device)
-    trainable = mark_trainable(model)
+    trainable = mark_trainable(model, train_gate_bias=args.gate_bias_lr > 0)
 
     n_train = sum(p.numel() for p in trainable)
     n_total = sum(p.numel() for p in model.parameters())
@@ -939,21 +954,30 @@ def main():
               f"npos_max={npos_max}, so most positions clamp at init and clamped keys "
               f"get NO gradient. Consider --gate_bias_span {npos_max // 4}.")
 
-    # Two param groups. pos_emb gates the whole gradient chain: while the table is flat
+    # Three param groups. pos_emb gates the whole gradient chain: while the table is flat
     # the position term is 0 and so is its derivative w.r.t. the gates, so nothing else
-    # can learn until it grows. It wants an LR >= the LoRA one, not lower.
+    # can learn until it grows. It wants an LR >= the LoRA one, not lower. gate_bias gets
+    # its OWN group because it decides where tokens land in the table -- at the pos_emb
+    # rate it moves the target while the table is being rewritten and the two chase each
+    # other instead of converging.
     pos_emb_params = [p for n, p in model.named_parameters()
-                      if p.requires_grad and ("cope.pos_emb" in n or "cope.gate_bias" in n)]
+                      if p.requires_grad and "cope.pos_emb" in n]
+    gate_bias_params = [p for n, p in model.named_parameters()
+                        if p.requires_grad and "cope.gate_bias" in n]
     lora_params = [p for n, p in model.named_parameters()
                    if p.requires_grad and "lora_" in n]
     pos_emb_lr = args.pos_emb_lr if args.pos_emb_lr is not None else args.lr
-    opt = torch.optim.AdamW(
-        [{"params": lora_params, "lr": args.lr},
-         {"params": pos_emb_params, "lr": pos_emb_lr}],
-        weight_decay=args.weight_decay,
-    )
+    groups = [{"params": lora_params, "lr": args.lr},
+              {"params": pos_emb_params, "lr": pos_emb_lr}]
+    if gate_bias_params:
+        groups.append({"params": gate_bias_params, "lr": args.gate_bias_lr})
+    opt = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
+    group_lrs = [g["lr"] for g in groups]
+    gb_note = (f"{args.gate_bias_lr:.2e} ({len(gate_bias_params)} tensors)"
+               if gate_bias_params else "FROZEN at init")
     print(f"optimizer: lora_lr={args.lr:.2e} ({len(lora_params)} tensors)  "
           f"pos_emb_lr={pos_emb_lr:.2e} ({len(pos_emb_params)} tensors)  "
+          f"gate_bias_lr={gb_note}  "
           f"warmup={int(args.warmup_ratio * args.steps)} steps  clip={args.max_grad_norm}")
     if _GATE_REG["on"]:
         print(f"gate reg: ON  lam_span={args.gate_reg:.3g} span_target={args.gate_span_target} "
@@ -980,10 +1004,27 @@ def main():
         ck = torch.load(args.resume, map_location=args.device, weights_only=False)
         missing, unexpected = model.load_state_dict(ck["state"], strict=False)
         if "optimizer" in ck:
-            opt.load_state_dict(ck["optimizer"])
-            sched.load_state_dict(ck["scheduler"])
+            # Optimizer state only loads if the param groups still line up. Changing
+            # --gate_bias_lr across a resume moves gate_bias between groups, so tolerate
+            # the mismatch: the weights and the step counter are the valuable part, and
+            # Adam's moments rebuild within a few dozen steps.
+            try:
+                opt.load_state_dict(ck["optimizer"])
+                sched.load_state_dict(ck["scheduler"])
+            except ValueError as e:
+                print(f"  optimizer state not reusable ({e}); keeping weights and step, "
+                      f"restarting Adam moments")
             start_step = ck.get("step", 0) + 1
             best_ppl = ck.get("best_ppl", float("inf"))
+            # Command-line LRs override the checkpoint's. Resuming specifically to lower a
+            # learning rate is the main reason to resume a run that trained but did not
+            # converge, and loading the optimizer state would otherwise restore the exact
+            # LR you are trying to change. base_lrs is what the cosine lambda multiplies.
+            for g, lr in zip(opt.param_groups, group_lrs):
+                g["lr"] = g["initial_lr"] = lr
+            sched.base_lrs = list(group_lrs)
+            print(f"  LRs set from the command line: "
+                  f"{', '.join(f'{lr:.2e}' for lr in group_lrs)}")
         else:
             print("  (checkpoint predates resume support: weights only, restarting at 0)")
         print(f"resumed from {args.resume}: step {start_step}, best_ppl {best_ppl:.3f}, "
