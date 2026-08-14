@@ -51,13 +51,34 @@ class ContextualPositionEmbedding(nn.Module):
             keys beyond this share the top slot (the coarse-order cap CoPE relies on).
     """
 
-    def __init__(self, head_dim: int, npos_max: int):
+    def __init__(self, head_dim: int, npos_max: int, n_heads: Optional[int] = None):
         super().__init__()
         self.head_dim = head_dim
         self.npos_max = npos_max
         # One learnable key-space vector per integer position. Zero-init => untrained
         # module contributes no position bias (reduces to plain causal attention).
         self.pos_emb = nn.Parameter(torch.zeros(head_dim, npos_max))
+        # Learnable gate bias, added inside the sigmoid. At init q.k ~ 0 => every gate is
+        # ~0.5, so a length-L row accumulates a contextual span of ~L/2. Once that exceeds
+        # npos_max the positions clamp, and clamp has ZERO gradient -- the gates of every
+        # clamped key are frozen out of training. Biasing the gates down at init keeps the
+        # span inside the table so those gradients survive. Zero here = exactly the old
+        # behaviour; set it with :meth:`init_gate_bias`.
+        shape = (n_heads, 1, 1) if n_heads else (1,)
+        self.gate_bias = nn.Parameter(torch.zeros(*shape))
+
+    @torch.no_grad()
+    def init_gate_bias(self, target_span: float, seq_len: int) -> float:
+        """Bias the gates so a full-length row starts at ~``target_span`` positions.
+
+        Each of the ``seq_len`` keys contributes ``sigmoid(bias)`` on average, so the
+        initial span is ``seq_len * sigmoid(bias)``; inverting gives the logit below.
+        Returns the value used.
+        """
+        p = min(max(target_span / max(seq_len, 1), 1e-4), 1 - 1e-4)
+        b = math.log(p / (1.0 - p))
+        self.gate_bias.fill_(b)
+        return b
 
     def positions_from_gates(
         self, attn_logits: torch.Tensor, causal_mask: torch.Tensor
@@ -75,7 +96,7 @@ class ContextualPositionEmbedding(nn.Module):
         # the running total's rounding error (order the total magnitude) can be many
         # whole position slots -- so bf16 inputs would place tokens in the wrong slot.
         pdtype = torch.float64 if attn_logits.dtype == torch.float64 else torch.float32
-        gates = torch.sigmoid(attn_logits.to(pdtype))
+        gates = torch.sigmoid(attn_logits.to(pdtype) + self.gate_bias.to(pdtype))
         # Keys above the diagonal must not be counted toward any position.
         gates = gates.masked_fill(~causal_mask, 0.0)
         # p_ij = sum_{l=j}^{i} gates_il  ->  reverse cumulative sum along the key axis.

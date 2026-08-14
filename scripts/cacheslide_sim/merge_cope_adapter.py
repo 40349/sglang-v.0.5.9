@@ -61,12 +61,12 @@ def merge_lora_into_model(model, state: dict, rank: int, alpha: float) -> int:
     return merged
 
 
-def extract_pos_emb(state: dict) -> dict:
-    """Pull per-layer ``cope.pos_emb`` tensors out of the adapter state."""
+def extract_pos_emb(state: dict, suffix: str = "self_attn.cope.pos_emb") -> dict:
+    """Pull the per-layer ``cope.<suffix>`` tensors out of the adapter state."""
     out = {}
     for k, v in state.items():
-        if k.endswith("self_attn.cope.pos_emb"):
-            # ...model.layers.{i}.self_attn.cope.pos_emb
+        if k.endswith(suffix):
+            # ...model.layers.{i}.self_attn.cope.<suffix>
             i = int(k.split("model.layers.")[1].split(".")[0])
             out[i] = v
     return out
@@ -128,15 +128,22 @@ def main():
 
     pos = extract_pos_emb(state)
     assert len(pos) == n_layers, f"pos_emb count {len(pos)} != layers {n_layers}"
+    # gate_bias must travel with pos_emb: it shifts every contextual position, so serving
+    # without it would index the trained table at the wrong slots. Empty for runs that
+    # did not use --gate_bias_span.
+    gate = extract_pos_emb(state, suffix="self_attn.cope.gate_bias")
+    if gate:
+        assert len(gate) == n_layers, f"gate_bias count {len(gate)} != layers {n_layers}"
 
     out_dir = pathlib.Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(out_dir)  # HF checkpoint SGLang can load
     # Save the tokenizer too so the merged dir is self-contained for serving.
     AutoTokenizer.from_pretrained(args.tokenizer or args.model).save_pretrained(out_dir)
-    torch.save({"npos_max": npos_max, "pos_emb": pos}, out_dir / "cope_pos_emb.pt")
-    print(f"saved merged model + cope_pos_emb.pt ({len(pos)} tables, npos_max={npos_max}) "
-          f"-> {out_dir}")
+    torch.save({"npos_max": npos_max, "pos_emb": pos, "gate_bias": gate},
+               out_dir / "cope_pos_emb.pt")
+    print(f"saved merged model + cope_pos_emb.pt ({len(pos)} tables, npos_max={npos_max}, "
+          f"gate_bias on {len(gate)} layers) -> {out_dir}")
     print("NOTE: the merged checkpoint is a full-size copy of the backbone weights.")
 
 

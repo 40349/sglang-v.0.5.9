@@ -20,6 +20,11 @@ Real run (example):
         --model meta-llama/Llama-3.1-8B --data_file corpus.txt \
         --max_seq_len 2048 --steps 2000 --batch_size 1 --lora_rank 16 \
         --output_dir ./cope_adapter
+
+At --max_seq_len >= 4096 add ``--tile_q 1024`` (exact; bounds the attention activation
+memory that the eager [B,H,T,T] forward would otherwise blow up). The run ends with a
+pos_emb coverage report: slots still at their zero init never received a gradient, so
+prompts long enough to reach them are served with no position signal there.
 """
 
 from __future__ import annotations
@@ -53,12 +58,14 @@ _cope_mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_cope_mod)
 ContextualPositionEmbedding = _cope_mod.ContextualPositionEmbedding
 
-# Query-block size for the training CoPE forward. The non-tiled forward materialises
-# [B,H,T,T] tensors (int64 gather indices are 8 bytes each) -- ~137GB just for the two
-# index tensors at T=16384, OOM even on an H200. Query rows are independent, so tiling
-# is exact and bounds peak memory to O(H*block*kv_len). seq_len <= block => one block
-# (no tiling). Set from --tile_q.
-_TRAIN_Q_BLOCK = 2048
+# Query-block size for the training CoPE forward; 0 = off (single shot). The non-tiled
+# forward materialises [B,H,T,T] tensors (int64 gather indices are 8 bytes each) --
+# ~137GB just for the two index tensors at T=16384, OOM even on an H200. Query rows are
+# independent, so tiling is numerically exact. Each block additionally runs under its
+# OWN checkpoint: plain tiling would still keep every block's [B,H,block,T] intermediates
+# alive for autograd, so only re-materialising them in backward actually bounds peak
+# memory to O(H*block*kv_len). Set from --tile_q.
+_TRAIN_Q_BLOCK = 0
 
 # Gate-selectivity regularizer config (set in main). OFF by default -> no stash, no
 # overhead, existing runs unchanged. When on, cope_attention_forward stashes the
@@ -67,10 +74,67 @@ _TRAIN_Q_BLOCK = 2048
 # would otherwise be severed by checkpointing). See accumulate_gate_reg_grads.
 _GATE_REG = {"on": False, "span_target": 512, "lam_span": 0.0, "lam_bimod": 0.0}
 
+# Running "is CoPE actually load-bearing?" meter, filled by _cope_attend_block.
+# Both terms go into the same softmax: content = q.(k*scaling), position = q.pos_emb[:,p].
+# If |pos| / |attn| stays near 0 the position table is too weak to change any attention
+# weight, the LoRA is doing all the work, and the run is not testing CoPE at all. This is
+# the single number that says whether the training is doing what it claims.
+_DIAG = {"pos": 0.0, "attn": 0.0, "n": 0}
+
 
 # ---------------------------------------------------------------------------
 # 1. CoPE attention -- monkey-patch LlamaAttention.forward (RoPE removed)
 # ---------------------------------------------------------------------------
+def _cope_attend_block(cope, scaling, query, key, value, valid, start: int, end: int):
+    """CoPE attention for query rows ``[start, end)`` against keys ``[0, end)``.
+
+    Exact for any block boundary: row ``i`` only ever attends to keys ``j <= i``, all of
+    which lie inside ``[0, end)``, and the CoPE reverse-cumsum runs over that same key
+    range -- so a block sees byte-identical gates/positions to the full forward.
+    """
+    q = query[:, :, start:end, :]
+    k = key[:, :, :end, :]
+    v = value[:, :, :end, :]
+    vb = valid[..., start:end, :end]
+
+    logits = torch.matmul(q, k.transpose(-1, -2)) * scaling  # [B,H,blk,end]
+    pos_bias = cope(q, logits, vb)
+
+    if _DIAG["n"] >= 0:  # cheap: two reductions per block, no graph retained
+        with torch.no_grad():
+            _DIAG["pos"] += pos_bias.detach().abs().mean().item()
+            _DIAG["attn"] += logits.detach().abs().mean().item()
+            _DIAG["n"] += 1
+
+    neg_inf = torch.finfo(logits.dtype).min
+    masked = logits + pos_bias.masked_fill(~vb, 0.0)
+    masked = masked.masked_fill(~vb, neg_inf)
+    attn = torch.softmax(masked, dim=-1, dtype=torch.float32).to(q.dtype)
+    return torch.matmul(attn, v)  # [B,H,blk,d]
+
+
+def _cope_attend_tiled(cope, scaling, query, key, value, valid, seq_len, block: int):
+    """Query-block-tiled CoPE attention. Exact; bounds attention activation memory.
+
+    Each block runs under its own non-reentrant checkpoint so its [B,H,block,end]
+    intermediates are freed after the forward and re-materialised in backward -- without
+    that, tiling alone would leave every block's tensors alive and save nothing.
+    """
+    from torch.utils.checkpoint import checkpoint
+
+    recompute = torch.is_grad_enabled() and query.requires_grad
+    outs = []
+    for start in range(0, seq_len, block):
+        end = min(start + block, seq_len)
+        args = (cope, scaling, query, key, value, valid, start, end)
+        outs.append(
+            checkpoint(_cope_attend_block, *args, use_reentrant=False)
+            if recompute
+            else _cope_attend_block(*args)
+        )
+    return torch.cat(outs, dim=-2)
+
+
 def cope_attention_forward(
     self,
     hidden_states: torch.Tensor,
@@ -98,10 +162,10 @@ def cope_attention_forward(
     value = repeat_kv(value, self.num_key_value_groups)
 
     seq_len = query.shape[-2]
-    logits = torch.matmul(query, key.transpose(-1, -2)) * self.scaling  # [B,H,T,T]
 
     # Validity = causal AND (HF additive mask says "keep"). Used both to gate CoPE
-    # positions and to mask the softmax.
+    # positions and to mask the softmax. Built BEFORE the logits (it does not depend on
+    # them) so the tiled path never materialises a full [B,H,T,T] logit tensor.
     causal = torch.ones(seq_len, seq_len, dtype=torch.bool, device=query.device).tril()
     if attention_mask is not None:
         m = attention_mask[..., :seq_len]
@@ -115,32 +179,53 @@ def cope_attention_forward(
     # checkpoint graph and backprop the reg into this layer's q/k LoRA. Detach is what
     # makes it checkpoint-safe (constant tensor, not freed) and scopes the reg to each
     # layer's own q/k projections. No-op / no memory when the reg is off.
-    if _GATE_REG["on"]:
+    # Guarded on grad being enabled: under @torch.no_grad() eval there is nothing to
+    # backprop, and stashing there would pin a [B,T,hidden] tensor per layer (~1GB over
+    # 32 layers at T=4096) that the next training forward would only overwrite.
+    if _GATE_REG["on"] and torch.is_grad_enabled():
         self._cope_hs = hidden_states.detach()
         self._cope_valid = valid
 
-    pos_bias = self.cope(query, logits, valid)  # [B,H,T,T]
+    block = _TRAIN_Q_BLOCK
+    if block and seq_len > block:
+        out = _cope_attend_tiled(
+            self.cope, self.scaling, query, key, value, valid, seq_len, block
+        )
+    else:
+        out = _cope_attend_block(
+            self.cope, self.scaling, query, key, value, valid, 0, seq_len
+        )
 
-    neg_inf = torch.finfo(logits.dtype).min
-    masked = logits + pos_bias.masked_fill(~valid, 0.0)
-    masked = masked.masked_fill(~valid, neg_inf)
-    attn = torch.softmax(masked, dim=-1, dtype=torch.float32).to(query.dtype)
-
-    out = torch.matmul(attn, value)  # [B,H,T,d]
     out = out.transpose(1, 2).reshape(*input_shape, -1).contiguous()
     out = self.o_proj(out)
     return out, None
 
 
-def inject_cope(model, npos_max: int) -> None:
-    """Attach a per-layer CoPE module and switch LlamaAttention to the CoPE forward."""
-    head_dim = model.config.hidden_size // model.config.num_attention_heads
-    param_dtype = next(model.parameters()).dtype
+def inject_cope(model, npos_max: int, gate_bias_span: float = 0.0,
+                seq_len: int = 0) -> None:
+    """Attach a per-layer CoPE module and switch LlamaAttention to the CoPE forward.
+
+    ``gate_bias_span > 0`` biases the gates so a full-length row starts at roughly that
+    many contextual positions instead of the ~seq_len/2 an unbiased sigmoid gives -- see
+    ContextualPositionEmbedding.init_gate_bias. 0 keeps the original behaviour exactly.
+    """
+    device = next(model.parameters()).device
     for module in model.modules():
         if isinstance(module, LlamaAttention):
-            cope = ContextualPositionEmbedding(head_dim=head_dim, npos_max=npos_max)
+            # Read head_dim off the module, not hidden_size // num_heads: they coincide
+            # on Llama-3.1 but not on models with an explicit head_dim (Qwen3), where the
+            # derived value would be wrong and the pos_emb table the wrong shape.
+            head_dim = getattr(module, "head_dim", None) or (
+                model.config.hidden_size // model.config.num_attention_heads
+            )
+            n_heads = getattr(module, "config", model.config).num_attention_heads
+            cope = ContextualPositionEmbedding(
+                head_dim=head_dim, npos_max=npos_max, n_heads=n_heads
+            )
+            if gate_bias_span > 0 and seq_len > 0:
+                cope.init_gate_bias(gate_bias_span, seq_len)
             # pos_emb trains in fp32 for stability even under a bf16 backbone.
-            module.cope = cope.to(device=next(model.parameters()).device)
+            module.cope = cope.to(device=device)
     # Class-level patch: every LlamaAttention instance now runs CoPE.
     LlamaAttention.forward = cope_attention_forward
 
@@ -191,7 +276,8 @@ def mark_trainable(model) -> List[nn.Parameter]:
         p.requires_grad_(False)
     trainable: List[nn.Parameter] = []
     for name, p in model.named_parameters():
-        if "cope.pos_emb" in name or "lora_A" in name or "lora_B" in name:
+        if ("cope.pos_emb" in name or "cope.gate_bias" in name
+                or "lora_A" in name or "lora_B" in name):
             p.requires_grad_(True)
             trainable.append(p)
     return trainable
@@ -214,12 +300,19 @@ def accumulate_gate_reg_grads(model, scale: float) -> Dict[str, float]:
       * bimodality ``g(1-g)`` -- pushes gates toward 0/1 so ``span`` counts a FEW
         decisive boundaries (selective, the paper's mechanism) not a soft ~0.27 drift.
 
+    Both terms are averaged over REAL query rows only. HF's 4D mask masks pad *keys*,
+    not pad *rows*, so a padding row still attends causally to every real token before
+    it and would otherwise be scored (and penalised) like a real one. A row is a pad row
+    iff its own diagonal key is masked, which is what ``row_ok`` reads off.
+
     Backprops per layer (one gate tensor live at a time -> bounded peak memory) and
-    accumulates into ``.grad`` alongside the main loss. Returns mean diagnostics.
+    accumulates into ``.grad`` alongside the main loss. Returns diagnostics: ``span`` is
+    the mean over real rows and ``span_max`` the largest single row -- the cap binds on
+    the tail, so the mean alone hides it (early rows can never exceed S).
     """
     S = float(_GATE_REG["span_target"])
     lam_s, lam_b = _GATE_REG["lam_span"], _GATE_REG["lam_bimod"]
-    tot = {"span": 0.0, "L_span": 0.0, "L_bimod": 0.0}
+    tot = {"span": 0.0, "span_max": 0.0, "L_span": 0.0, "L_bimod": 0.0}
     nl = 0
     for m in model.modules():
         if not (isinstance(m, LlamaAttention) and getattr(m, "_cope_hs", None) is not None):
@@ -232,16 +325,25 @@ def accumulate_gate_reg_grads(model, scale: float) -> Dict[str, float]:
         k = repeat_kv(k, m.num_key_value_groups)
         logits = torch.matmul(q, k.transpose(-1, -2)) * m.scaling  # [B,Hq,T,T]
         vb = valid.view(1, 1, T, T) if valid.dim() == 2 else valid  # [B/1,1,T,T]
-        gates = torch.sigmoid(logits.float()) * vb  # zero on non-causal/pad keys
-        span = gates.sum(-1)  # [B,Hq,T]; pad query rows -> 0 -> relu 0 (self-masking)
-        L_span = torch.relu(span - S).div(S).mean()
-        n_valid = vb.sum().clamp(min=1).float() * gates.shape[1]  # entries * heads
-        L_bimod = (gates * (1.0 - gates)).sum() / n_valid
+        row_ok = vb.diagonal(dim1=-2, dim2=-1).unsqueeze(-1)  # [B/1,1,T,1] real rows
+        keep = vb & row_ok  # drop pad keys AND pad rows
+        gates = torch.sigmoid(logits.float()) * keep
+        span = gates.sum(-1)  # [B,Hq,T]; pad rows are exactly 0 -> relu 0
+        n_heads = gates.shape[1]
+        n_rows = (row_ok.sum() * n_heads).clamp(min=1).float()
+        n_pairs = (keep.sum() * n_heads).clamp(min=1).float()
+        L_span = torch.relu(span - S).div(S).sum() / n_rows
+        L_bimod = (gates * (1.0 - gates)).sum() / n_pairs
         reg = lam_s * L_span + lam_b * L_bimod
         (scale * reg).backward()
-        tot["span"] += span.mean().item()
+        tot["span"] += (span.detach().sum() / n_rows).item()
+        tot["span_max"] += span.detach().max().item()
         tot["L_span"] += L_span.item()
         tot["L_bimod"] += L_bimod.item()
+        # Release the stash: it is consumed, and holding it keeps a [B,T,hidden] tensor
+        # per layer alive across the optimizer step for nothing.
+        m._cope_hs = None
+        m._cope_valid = None
         nl += 1
     if nl:
         for kk in tot:
@@ -265,10 +367,15 @@ class ShareGPTDataset(Dataset):
     pass an instruct tokenizer via ``--tokenizer ...-Instruct`` (or use the instruct
     model). One conversation per sample, truncated to ``seq_len`` (padding happens in
     the collate).
+
+    ``offset`` skips the first N rows before taking ``max_samples``. Training reads rows
+    ``[0, max_samples)``, so an evaluation that wants genuinely unseen data must pass
+    ``offset >= the training run's --max_samples`` -- otherwise it scores the model on
+    its own training set.
     """
 
     def __init__(self, hf_name, split, tokenizer, seq_len, max_samples=None,
-                 messages_field="messages"):
+                 messages_field="messages", offset: int = 0):
         from datasets import load_dataset
 
         if tokenizer.chat_template is None:
@@ -278,6 +385,13 @@ class ShareGPTDataset(Dataset):
                 "render in the served chat format."
             )
         ds = load_dataset(hf_name, split=split)
+        if offset:
+            if offset >= len(ds):
+                raise SystemExit(
+                    f"offset {offset} >= dataset size {len(ds)}: no rows left. Use a "
+                    f"smaller --skip_samples or a bigger split."
+                )
+            ds = ds.select(range(offset, len(ds)))
         if max_samples:
             ds = ds.select(range(min(max_samples, len(ds))))
 
@@ -308,12 +422,24 @@ def render_sharegpt_row(messages, tokenizer, seq_len, min_len: int = 8):
 
     Maps roles to chat-template roles and renders with ``apply_chat_template`` so the
     result matches the served prompt format. Returns None on empty/too-short/bad rows.
+
+    Tolerates the three field schemas in the wild -- ``{from, value}`` (classic
+    ShareGPT), ``{role, content}`` (HF chat format), ``{role, value}`` (the hybrid the
+    "-renamed" mirrors use). Row parsing is INSIDE the try: a schema mismatch must skip
+    the row, not abort the whole dataset build.
     """
-    conv = [
-        {"role": _SHAREGPT_ROLE_MAP.get(m["role"], m["role"]), "content": m["value"]}
-        for m in messages
-    ]
     try:
+        conv = []
+        for m in messages:
+            role = m.get("role", m.get("from"))
+            content = m.get("content", m.get("value"))
+            if role is None or content is None:
+                return None
+            conv.append(
+                {"role": _SHAREGPT_ROLE_MAP.get(role, role), "content": content}
+            )
+        if not conv:
+            return None
         ids = tokenizer.apply_chat_template(
             conv, tokenize=True, add_generation_prompt=False
         )
@@ -382,7 +508,8 @@ def collate_pad(batch: List[torch.Tensor], pad_id: int):
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def cksim_vs_shift(
-    model, segment_ids: torch.Tensor, shifts: List[int], layer_idx: int = -1
+    model, segment_ids: torch.Tensor, shifts: List[int], layer_idx: int = -1,
+    seed: int = 0,
 ) -> Dict[int, float]:
     """Mean per-head cosine similarity of a segment's layer-``layer_idx`` keys when
     the segment sits at position 0 vs shifted right by a prefix of length ``shift``.
@@ -391,6 +518,13 @@ def cksim_vs_shift(
     smoke path can pass random ids). Low drift (CKSim staying near 1 as shift grows)
     is exactly the CoPE property that makes shifted KV reuse near-lossless; run on
     the base (unpatched) model to get the RoPE curve for comparison.
+
+    Two things this has to get right to mean anything:
+      * hook the FULL ``k_proj`` (base + LoRA). The served keys include the trained LoRA
+        delta, so hooking ``.base`` would measure a model that is never served.
+      * shifts must be NESTED prefixes of one seeded pool, not a fresh random prefix per
+        shift -- otherwise the curve mostly measures prefix *content* and comes out
+        non-monotonic in the shift.
     """
     model.eval()
     device = next(model.parameters()).device
@@ -404,25 +538,24 @@ def cksim_vs_shift(
         # k_proj output: [B, T, Hkv*d]; keep as-is, we slice/normalise later.
         captured["k"] = out.detach()
 
-    k_proj = attn.k_proj.base if isinstance(attn.k_proj, LoRALinear) else attn.k_proj
-    handle = k_proj.register_forward_hook(hook)
+    handle = attn.k_proj.register_forward_hook(hook)
 
     seg = segment_ids.to(device)
     seg_len = seg.shape[1]
+    n_kv = getattr(model.config, "num_key_value_heads", model.config.num_attention_heads)
+
+    # One fixed pool; shift s uses its first s tokens, so every shift is a prefix of the
+    # next and the only thing varying across the curve is where the segment sits.
+    gen = torch.Generator().manual_seed(seed)
+    pool = torch.randint(
+        0, model.config.vocab_size, (1, max(max(shifts), 1)), generator=gen
+    ).to(device)
 
     def seg_keys(prefix_len: int) -> torch.Tensor:
-        if prefix_len == 0:
-            ids = seg
-            start = 0
-        else:
-            prefix = torch.randint(
-                0, model.config.vocab_size, (1, prefix_len), device=device
-            )
-            ids = torch.cat([prefix, seg], dim=1)
-            start = prefix_len
+        ids = seg if prefix_len == 0 else torch.cat([pool[:, :prefix_len], seg], dim=1)
         model(input_ids=ids)
-        k = captured["k"][0, start : start + seg_len]  # [seg_len, Hkv*d]
-        return k
+        k = captured["k"][0, prefix_len : prefix_len + seg_len]  # [seg_len, Hkv*d]
+        return k.reshape(seg_len, n_kv, -1)  # [seg_len, Hkv, d] -> per-head cosine
 
     base = seg_keys(0)
     out: Dict[int, float] = {}
@@ -430,10 +563,95 @@ def cksim_vs_shift(
         shifted = seg_keys(s)
         cos = torch.nn.functional.cosine_similarity(
             base.float(), shifted.float(), dim=-1
-        )
+        )  # [seg_len, Hkv]
         out[s] = cos.mean().item()
     handle.remove()
     return out
+
+
+@torch.no_grad()
+def cksim_by_layer(model, segment_ids: torch.Tensor, shift: int, seed: int = 0) -> str:
+    """Per-layer key drift for one shift -- where CoPE stops buying you anything.
+
+    CoPE never writes position into k, so layer 0's keys are a pure function of the token
+    ids: shifting the segment must leave them BIT-identical (a 1.000 that is not a
+    measurement but a structural guarantee -- if it is not 1.000, RoPE is still active).
+    Deeper layers drift only because their input hidden states saw a different prefix
+    through attention. The layer at which this curve falls away is the honest answer to
+    "how far up does position-free KV reuse survive", which a single last-layer number
+    cannot tell you.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    n_kv = getattr(model.config, "num_key_value_heads", model.config.num_attention_heads)
+    caps: Dict[int, torch.Tensor] = {}
+    handles = []
+    for i, layer in enumerate(model.model.layers):
+        handles.append(layer.self_attn.k_proj.register_forward_hook(
+            lambda _m, _i, out, idx=i: caps.__setitem__(idx, out.detach())))
+
+    seg = segment_ids.to(device)
+    seg_len = seg.shape[1]
+    gen = torch.Generator().manual_seed(seed)
+    pool = torch.randint(0, model.config.vocab_size, (1, max(shift, 1)), generator=gen)
+
+    def keys(prefix_len):
+        ids = seg if prefix_len == 0 else torch.cat([pool[:, :prefix_len].to(device), seg], 1)
+        model(input_ids=ids)
+        return {i: v[0, prefix_len:prefix_len + seg_len].reshape(seg_len, n_kv, -1)
+                for i, v in caps.items()}
+
+    base, shifted = keys(0), keys(shift)
+    for h in handles:
+        h.remove()
+    per = [torch.nn.functional.cosine_similarity(
+        base[i].float(), shifted[i].float(), dim=-1).mean().item() for i in sorted(base)]
+    n = len(per)
+    # sorted(set(...)): on a shallow model these quarter-points collide, and printing
+    # "L0 L0 L1 L1 L1" makes the report look broken.
+    show = sorted({0, n // 4, n // 2, 3 * n // 4, n - 1})
+    return (f"shift={shift}: " + " ".join(f"L{i}={per[i]:.4f}" for i in show)
+            + f"  (layer0 must be 1.0000: CoPE writes no position into k)")
+
+
+def pos_ratio_and_reset() -> float:
+    """Mean |CoPE position bias| / mean |content logit| since the last call.
+
+    Near 0 => the position table cannot move any attention weight, so whatever the loss
+    is doing it is not using CoPE. Raise --pos_emb_lr until this climbs.
+    """
+    n, attn = _DIAG["n"], _DIAG["attn"]
+    r = (_DIAG["pos"] / attn) if (n and attn > 0) else 0.0
+    _DIAG.update({"pos": 0.0, "attn": 0.0, "n": 0})
+    return r
+
+
+@torch.no_grad()
+def pos_emb_coverage(model, bins: int = 8) -> str:
+    """Per-slot report of the CoPE tables: how much of the position budget got trained.
+
+    ``pos_emb`` is zero-initialised, so a column still exactly 0 never received a
+    gradient -- no training sample ever placed a token at that contextual position. Any
+    prompt long enough to reach those slots is served with NO position signal there,
+    which is what a length cliff looks like from the inside. Columns whose norm is far
+    below the low slots are the soft version of the same problem.
+    """
+    tables = [m.cope.pos_emb.detach().float() for m in model.modules()
+              if isinstance(m, LlamaAttention) and hasattr(m, "cope")]
+    if not tables:
+        return "(no CoPE tables found)"
+    coln = torch.stack(tables).norm(dim=1)  # [n_layers, npos_max] per-slot column norm
+    npos = coln.shape[1]
+    live = (coln > 0).any(0)
+    highest = int(live.nonzero().max()) if bool(live.any()) else -1
+    mean_col = coln.mean(0)
+    step = max(1, npos // bins)
+    ranges = " ".join(
+        f"[{lo}:{min(lo + step, npos)})={mean_col[lo:min(lo + step, npos)].mean():.4f}"
+        for lo in range(0, npos, step)
+    )
+    return (f"slots ever trained: {int(live.sum())}/{npos} (highest={highest})\n"
+            f"  mean |column| by slot range: {ranges}")
 
 
 # ---------------------------------------------------------------------------
@@ -447,13 +665,13 @@ def infinite(loader):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, max_batches: int = 50) -> float:
-    """Mean held-out perplexity over up to ``max_batches`` batches."""
+def evaluate(model, loader, device, max_batches: Optional[int] = None) -> float:
+    """Mean held-out perplexity over up to ``max_batches`` batches (None = the lot)."""
     was_training = model.training
     model.eval()
     total, n = 0.0, 0
     for i, batch in enumerate(loader):
-        if i >= max_batches:
+        if max_batches is not None and i >= max_batches:
             break
         input_ids, attn, labels = (t.to(device) for t in batch)
         total += model(input_ids=input_ids, attention_mask=attn, labels=labels).loss.item()
@@ -463,16 +681,52 @@ def evaluate(model, loader, device, max_batches: int = 50) -> float:
     return math.exp(total / max(n, 1))
 
 
-def save_adapter(model, path, meta: dict) -> int:
-    """Save only the trained tensors (pos_emb + LoRA) plus meta. Returns tensor count."""
+def save_adapter(model, path, meta: dict, opt=None, sched=None, step=None,
+                 best_ppl=None) -> int:
+    """Save only the trained tensors (pos_emb + gate_bias + LoRA) plus meta.
+
+    When ``opt``/``sched`` are given the optimizer and scheduler state and the step
+    counter go in too, which is what makes ``--resume`` able to continue a killed job
+    rather than restart it. Returns the tensor count.
+    """
     adapter = {n: p.detach().cpu() for n, p in model.named_parameters() if p.requires_grad}
-    torch.save({**meta, "state": adapter}, path)
+    blob = {**meta, "state": adapter}
+    if opt is not None:
+        blob.update({"optimizer": opt.state_dict(), "scheduler": sched.state_dict(),
+                     "step": step, "best_ppl": best_ppl})
+    torch.save(blob, path)
     return len(adapter)
 
 
 # ---------------------------------------------------------------------------
 # 6. Main
 # ---------------------------------------------------------------------------
+@torch.no_grad()
+def _check_tiling_exact(model, device, seq_len: int = 24) -> None:
+    """Assert --tile_q changes nothing numerically (--smoke self-test).
+
+    Query-block tiling is only safe if every block reproduces the full forward exactly;
+    this runs the same input at several block sizes, including boundaries that do not
+    divide the sequence, and compares against the untiled result.
+    """
+    global _TRAIN_Q_BLOCK
+    saved = _TRAIN_Q_BLOCK
+    ids = torch.randint(0, model.config.vocab_size, (1, seq_len), device=device)
+    attn = torch.ones(1, seq_len, dtype=torch.long, device=device)
+    try:
+        _TRAIN_Q_BLOCK = 0
+        ref = model(input_ids=ids, attention_mask=attn).logits.float()
+        worst = 0.0
+        for blk in (1, 5, 7, seq_len - 1):
+            _TRAIN_Q_BLOCK = blk
+            got = model(input_ids=ids, attention_mask=attn).logits.float()
+            worst = max(worst, (ref - got).abs().max().item())
+    finally:
+        _TRAIN_Q_BLOCK = saved
+    print(f"[tiling] max |untiled - tiled| over blocks (1,5,7,{seq_len - 1}) = {worst:.3e}"
+          f"  {'OK (exact)' if worst < 1e-5 else 'MISMATCH -- do not use --tile_q'}")
+
+
 def build_model(args):
     if args.smoke:
         cfg = LlamaConfig(
@@ -520,9 +774,14 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--pos_emb_lr", type=float, default=None,
                     help="separate LR for the CoPE pos_emb (default: same as --lr). "
-                         "The gate reverse-cumsum makes pos_emb gradients scale ~O(seq_len), "
-                         "so long-seq runs (>=4096) are more stable with pos_emb_lr < lr, "
-                         "e.g. lr/5 .. lr/10.")
+                         "Set it HIGHER than --lr, not lower. pos_emb is zero-init, and "
+                         "while the table is flat the position term is identically 0 and "
+                         "the gates get no gradient at all -- the table has to grow first "
+                         "or nothing else can learn. (The old advice to use lr/5..lr/10 "
+                         "because the reverse-cumsum scales gradients by O(seq_len) is a "
+                         "plain-SGD argument; AdamW normalises gradient magnitude away.) "
+                         "Watch the pos/attn ratio printed at each eval: if it stays "
+                         "<0.05 the model is ignoring CoPE and only the LoRA is training.")
     ap.add_argument("--steps", type=int, default=2000, help="optimizer steps")
     ap.add_argument("--batch_size", type=int, default=1, help="micro-batch size")
     ap.add_argument("--grad_accum", type=int, default=8,
@@ -546,7 +805,30 @@ def main():
                          "gates toward 0/1 (selective/decisive, the paper's mechanism). "
                          "0 = span-cap only (gates shrink uniformly = length-normalized).")
     ap.add_argument("--eval_samples", type=int, default=200,
-                    help="held-out conversations for perplexity eval")
+                    help="held-out conversations reserved for perplexity eval")
+    ap.add_argument("--eval_batches", type=int, default=50,
+                    help="batches actually scored per eval (0 = the whole held-out "
+                         "split). Kept below --eval_samples by default so eval stays "
+                         "cheap; raise it if the ppl curve looks noisy.")
+    ap.add_argument("--gate_bias_span", type=float, default=0.0,
+                    help="bias the gates at init so a full-length row starts at ~this "
+                         "many contextual positions (0 = off, the old behaviour). At init "
+                         "sigmoid(q.k)~0.5 gives a span of seq_len/2, which overruns "
+                         "npos_max and clamps -- and clamp has zero gradient, so every "
+                         "clamped key is frozen out of training. Set it below --npos_max, "
+                         "e.g. 256 for npos_max=1024.")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="seeds torch/data shuffling so a 24h job is reproducible")
+    ap.add_argument("--resume", default=None,
+                    help="path to a cope_adapter_last.pt written by this script; "
+                         "restores weights, optimizer, scheduler and step counter")
+    ap.add_argument("--skip_baseline", action="store_true",
+                    help="skip the pre-injection RoPE perplexity measurement")
+    ap.add_argument("--tile_q", type=int, default=0,
+                    help="query-block size for the CoPE attention (0 = off). Bounds "
+                         "attention activation memory to O(H*tile_q*seq_len) by running "
+                         "each query block under its own checkpoint. Numerically exact, "
+                         "costs ~1 extra attention forward. Use at --max_seq_len >= 4096.")
     ap.add_argument("--eval_every", type=int, default=100, help="optimizer steps")
     ap.add_argument("--save_every", type=int, default=200, help="optimizer steps")
     ap.add_argument("--bf16", action="store_true")
@@ -559,7 +841,11 @@ def main():
 
     if args.smoke:
         import tempfile
-        args.max_seq_len, args.steps, args.device = 32, 20, "cpu"
+        args.max_seq_len, args.device = 32, "cpu"
+        # Keep an explicitly-passed --steps so `--smoke --resume ... --steps N` can
+        # actually test continuing a run; only override the untouched default.
+        if args.steps == ap.get_default("steps"):
+            args.steps = 20
         args.grad_accum, args.eval_every, args.save_every = 2, 10, 10
         args.eval_samples = 8
         # Never write smoke output into a real --output_dir (it may hold a trained
@@ -568,10 +854,15 @@ def main():
 
     npos_max = args.npos_max or args.max_seq_len
 
+    global _TRAIN_Q_BLOCK
+    _TRAIN_Q_BLOCK = args.tile_q
+
     _GATE_REG["on"] = args.gate_reg > 0 or args.gate_bimod > 0
     _GATE_REG["span_target"] = args.gate_span_target
     _GATE_REG["lam_span"] = args.gate_reg
     _GATE_REG["lam_bimod"] = args.gate_bimod
+
+    torch.manual_seed(args.seed)
 
     model, tok = build_model(args)
     model.to(args.device)
@@ -585,18 +876,8 @@ def main():
         # so gradients reach pos_emb/LoRA -- exactly what PEFT does under the hood.
         model.enable_input_require_grads()
 
-    inject_cope(model, npos_max=npos_max)
-    add_lora(model, r=args.lora_rank, alpha=args.lora_alpha)
-    # Re-home CoPE modules onto the model device/after any wrapping.
-    model.to(args.device)
-    trainable = mark_trainable(model)
-
-    n_train = sum(p.numel() for p in trainable)
-    n_total = sum(p.numel() for p in model.parameters())
-    print(f"trainable params: {n_train:,} / {n_total:,} "
-          f"({100 * n_train / n_total:.3f}%)  npos_max={npos_max}")
-
-    # Data
+    # Data comes first: the RoPE baseline below has to be measured on the SAME eval set
+    # the CoPE run is scored against, and it has to happen before inject_cope().
     if args.smoke:
         ds = SyntheticVarLen(vocab=model.config.vocab_size, seq_len=args.max_seq_len)
     elif args.hf_dataset:
@@ -611,20 +892,58 @@ def main():
 
     n_eval = min(args.eval_samples, max(1, len(ds) // 5))
     train_ds, eval_ds = torch.utils.data.random_split(
-        ds, [len(ds) - n_eval, n_eval], generator=torch.Generator().manual_seed(0)
+        ds, [len(ds) - n_eval, n_eval],
+        generator=torch.Generator().manual_seed(args.seed),
     )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              drop_last=True, collate_fn=collate)
+                              drop_last=True, collate_fn=collate,
+                              generator=torch.Generator().manual_seed(args.seed))
     eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False,
                              collate_fn=collate)
     print(f"train={len(train_ds)} eval={len(eval_ds)}  "
           f"effective_batch={args.batch_size * args.grad_accum}")
 
-    # Two param groups: pos_emb (the global positional backbone -- its reverse-cumsum
-    # gradient scales with seq_len) can take a lower LR than the LoRA deltas. The cosine
-    # scheduler scales every group by the same factor, so the ratio holds throughout.
+    # ---- RoPE baseline: the pass mark. Convergence is defined as "perplexity recovers
+    # ---- toward the RoPE model", so measure that number on this exact eval set BEFORE
+    # ---- RoPE is torn out. Without it a final ppl is unreadable: 2.8 could be a triumph
+    # ---- or a disaster depending on where the stock model sits.
+    baseline_ppl = None
+    if not args.skip_baseline:
+        baseline_ppl = evaluate(model, eval_loader, args.device,
+                                max_batches=args.eval_batches or None)
+        print(f"RoPE baseline ppl (stock model, same eval set): {baseline_ppl:.3f}")
+
+    inject_cope(model, npos_max=npos_max, gate_bias_span=args.gate_bias_span,
+                seq_len=args.max_seq_len)
+    add_lora(model, r=args.lora_rank, alpha=args.lora_alpha)
+    # Re-home CoPE modules onto the model device/after any wrapping.
+    model.to(args.device)
+    trainable = mark_trainable(model)
+
+    n_train = sum(p.numel() for p in trainable)
+    n_total = sum(p.numel() for p in model.parameters())
+    print(f"trainable params: {n_train:,} / {n_total:,} "
+          f"({100 * n_train / n_total:.3f}%)  npos_max={npos_max}"
+          f"{f'  tile_q={args.tile_q}' if args.tile_q else ''}"
+          f"{f'  gate_bias_span={args.gate_bias_span:g}' if args.gate_bias_span else ''}")
+    # Contextual span grows with sequence length (~0.5*L unbiased), so a table sized to
+    # max_seq_len has an upper half no sample can ever reach: those slots stay at their
+    # zero init and contribute no position signal when a longer prompt lands on them.
+    if npos_max > args.max_seq_len // 2:
+        print(f"  NOTE: npos_max={npos_max} vs max_seq_len={args.max_seq_len}: expect "
+              f"only slots [0, ~{args.max_seq_len // 2}] to receive gradient. The "
+              f"pos_emb coverage report at the end of the run shows what actually "
+              f"trained -- serving prompts longer than --max_seq_len will index past it.")
+    if not args.gate_bias_span and npos_max < args.max_seq_len // 2:
+        print(f"  NOTE: unbiased gates start at a span of ~{args.max_seq_len // 2} but "
+              f"npos_max={npos_max}, so most positions clamp at init and clamped keys "
+              f"get NO gradient. Consider --gate_bias_span {npos_max // 4}.")
+
+    # Two param groups. pos_emb gates the whole gradient chain: while the table is flat
+    # the position term is 0 and so is its derivative w.r.t. the gates, so nothing else
+    # can learn until it grows. It wants an LR >= the LoRA one, not lower.
     pos_emb_params = [p for n, p in model.named_parameters()
-                      if p.requires_grad and "cope.pos_emb" in n]
+                      if p.requires_grad and ("cope.pos_emb" in n or "cope.gate_bias" in n)]
     lora_params = [p for n, p in model.named_parameters()
                    if p.requires_grad and "lora_" in n]
     pos_emb_lr = args.pos_emb_lr if args.pos_emb_lr is not None else args.lr
@@ -653,9 +972,32 @@ def main():
     grad_seen = {"pos_emb": False, "lora": False}
     best_ppl = float("inf")
     first_loss = None
+    start_step = 0
 
-    reg_diag = {"span": 0.0, "L_span": 0.0, "L_bimod": 0.0}
-    for step in range(args.steps):
+    if args.resume:
+        # A 24h SLURM job that dies at hour 23 should not start over. cope_adapter_last.pt
+        # carries the optimizer/scheduler/step alongside the weights for exactly this.
+        ck = torch.load(args.resume, map_location=args.device, weights_only=False)
+        missing, unexpected = model.load_state_dict(ck["state"], strict=False)
+        if "optimizer" in ck:
+            opt.load_state_dict(ck["optimizer"])
+            sched.load_state_dict(ck["scheduler"])
+            start_step = ck.get("step", 0) + 1
+            best_ppl = ck.get("best_ppl", float("inf"))
+        else:
+            print("  (checkpoint predates resume support: weights only, restarting at 0)")
+        print(f"resumed from {args.resume}: step {start_step}, best_ppl {best_ppl:.3f}, "
+              f"{len(ck['state'])} tensors loaded ({len(unexpected)} unexpected)")
+        if start_step >= args.steps:
+            raise SystemExit(
+                f"checkpoint is already at step {start_step} of --steps {args.steps}: "
+                f"nothing left to run. Raise --steps to continue training it."
+            )
+
+    reg_diag = {"span": 0.0, "span_max": 0.0, "L_span": 0.0, "L_bimod": 0.0}
+    eval_batches = args.eval_batches or None
+    pos_ratio_and_reset()  # discard whatever the baseline pass accumulated
+    for step in range(start_step, args.steps):
         opt.zero_grad()
         micro_loss = 0.0
         for _ in range(args.grad_accum):
@@ -689,7 +1031,10 @@ def main():
         if step % max(1, args.steps // 20) == 0:
             reg_str = ""
             if _GATE_REG["on"]:
-                reg_str = (f"  span {reg_diag['span']:.1f}(->{_GATE_REG['span_target']}) "
+                # span_max is the number that says whether the cap is binding; the mean
+                # is dragged down by early rows that can never exceed the target.
+                reg_str = (f"  span mean {reg_diag['span']:.1f} max "
+                           f"{reg_diag['span_max']:.1f} (->{_GATE_REG['span_target']}) "
                            f"L_span {reg_diag['L_span']:.3f} L_bimod {reg_diag['L_bimod']:.3f}")
             print(f"step {step:5d}  loss {micro_loss:.4f}  "
                   f"ppl {math.exp(min(micro_loss, 20)):.1f}  lr {sched.get_last_lr()[0]:.2e}"
@@ -697,21 +1042,34 @@ def main():
 
         is_last = step == args.steps - 1
         if (step + 1) % args.eval_every == 0 or is_last:
-            ppl = evaluate(model, eval_loader, args.device)
+            ratio = pos_ratio_and_reset()
+            ppl = evaluate(model, eval_loader, args.device, max_batches=eval_batches)
             tag = ""
             if ppl < best_ppl:
                 best_ppl = ppl
                 save_adapter(model, out_dir / "cope_adapter_best.pt", meta)
                 tag = "  <- best (saved)"
-            print(f"  [eval] step {step:5d}  ppl {ppl:.2f}{tag}")
+            gap = f" vs RoPE {baseline_ppl:.2f} ({ppl / baseline_ppl:.2f}x)" \
+                if baseline_ppl else ""
+            # pos/attn < ~0.05 means the position term cannot shift any attention weight:
+            # the LoRA is absorbing the loss and CoPE is along for the ride.
+            flag = "  <- CoPE INERT, raise --pos_emb_lr" if ratio < 0.05 else ""
+            print(f"  [eval] step {step:5d}  ppl {ppl:.2f}{gap}  "
+                  f"pos/attn {ratio:.3f}{flag}{tag}")
         if (step + 1) % args.save_every == 0 or is_last:
-            save_adapter(model, out_dir / "cope_adapter_last.pt", meta)
+            save_adapter(model, out_dir / "cope_adapter_last.pt", meta,
+                         opt=opt, sched=sched, step=step, best_ppl=best_ppl)
 
-    print(f"done. first_loss={first_loss:.4f}  best_eval_ppl={best_ppl:.2f}")
+    fl = f"{first_loss:.4f}" if first_loss is not None else "n/a (resumed)"
+    print(f"done. first_loss={fl}  best_eval_ppl={best_ppl:.2f}"
+          + (f"  (RoPE baseline {baseline_ppl:.2f}, ratio "
+             f"{best_ppl / baseline_ppl:.2f}x)" if baseline_ppl else ""))
     print(f"gradients reached: pos_emb={grad_seen['pos_emb']} lora={grad_seen['lora']}")
+    print(f"pos_emb coverage: {pos_emb_coverage(model)}")
 
     # CKSim sanity (drift): should print numbers in [-1, 1], ideally high & flat.
     if args.smoke:
+        _check_tiling_exact(model, args.device)
         seg_ids = torch.randint(0, model.config.vocab_size, (1, 12))
         shifts = [0, 8, 16]
     else:
@@ -722,6 +1080,7 @@ def main():
         shifts = [0, 100, 300, 600, 900]
     cks = cksim_vs_shift(model, seg_ids, shifts=shifts)
     print("CKSim vs shift (CoPE):", {k: round(v, 4) for k, v in cks.items()})
+    print("CKSim by layer:", cksim_by_layer(model, seg_ids, shift=max(shifts)))
     print(f"adapters in {out_dir}: cope_adapter_best.pt (lowest eval ppl), "
           f"cope_adapter_last.pt")
 

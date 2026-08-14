@@ -183,12 +183,23 @@ def load_cope_layers(pos_emb_path: str) -> List[Optional[ContextualPositionEmbed
     """Rebuild per-layer CoPE modules from a cope_pos_emb.pt produced by the merge tool."""
     ckpt = torch.load(pos_emb_path, map_location="cpu")
     npos_max, pos = ckpt["npos_max"], ckpt["pos_emb"]
+    # Trained gate bias, if the run used one. Absent for older adapters -> stays 0, the
+    # unbiased sigmoid the module defaults to. Serving MUST reproduce whatever bias the
+    # training used: dropping it shifts every contextual position and silently
+    # invalidates the pos_emb table it was trained against.
+    gate = ckpt.get("gate_bias", {})
     n_layers = max(pos) + 1
     layers: List[Optional[ContextualPositionEmbedding]] = [None] * n_layers
     for i, tensor in pos.items():
         head_dim = tensor.shape[0]
-        module = ContextualPositionEmbedding(head_dim=head_dim, npos_max=npos_max)
+        gb = gate.get(i)
+        module = ContextualPositionEmbedding(
+            head_dim=head_dim, npos_max=npos_max,
+            n_heads=gb.shape[0] if gb is not None and gb.dim() == 3 else None,
+        )
         module.pos_emb.data.copy_(tensor)
+        if gb is not None:
+            module.gate_bias.data.copy_(gb)
         layers[i] = module
     return layers
 
@@ -204,12 +215,28 @@ def enable_cope_serving(pos_emb_path: str) -> None:
     from sglang.srt.models.llama import LlamaAttention
     from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 
+    # Assigning to a name the class does not define would silently create a NEW method
+    # that nothing calls -- RoPE would stay live and the model would run as
+    # "RoPE + an untrained CoPE bias" with no error anywhere. Same for the two backend
+    # methods. Fail loudly on upstream drift instead.
+    for cls, name in ((LlamaAttention, "forward_prepare_native"),
+                      (TorchNativeAttnBackend, "forward_extend"),
+                      (TorchNativeAttnBackend, "forward_decode")):
+        if not hasattr(cls, name):
+            raise RuntimeError(
+                f"[CoPE] {cls.__name__}.{name} does not exist in this SGLang build, so "
+                f"patching it would be a silent no-op (RoPE would stay active). The "
+                f"serving patch needs updating for this version."
+            )
+
     LlamaAttention.forward_prepare_native = _cope_forward_prepare_native
     TorchNativeAttnBackend.forward_extend = _make_forward_extend(cope_layers)
     TorchNativeAttnBackend.forward_decode = _make_forward_decode(cope_layers)
 
+    n_biased = sum(1 for m in cope_layers if m is not None and m.gate_bias.abs().max() > 0)
     print(f"[CoPE] enabled: {len(cope_layers)} layers, "
-          f"npos_max={cope_layers[0].npos_max}; RoPE disabled, torch_native patched.")
+          f"npos_max={cope_layers[0].npos_max}, gate_bias on {n_biased} layers; "
+          f"RoPE disabled, torch_native patched.")
 
 
 # ---------------------------------------------------------------------------

@@ -59,6 +59,11 @@ def main():
     ap.add_argument("--hf_split", default="train")
     ap.add_argument("--max_seq_len", type=int, default=1024)
     ap.add_argument("--eval_samples", type=int, default=100)
+    ap.add_argument("--skip_samples", type=int, required=False, default=None,
+                    help="REQUIRED for a meaningful number: skip this many rows before "
+                         "taking --eval_samples. Training reads rows [0, --max_samples), "
+                         "so pass the training run's --max_samples here or you are "
+                         "scoring the model on its own training data.")
     ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -87,13 +92,35 @@ def main():
         rank, alpha = ckpt["lora_rank"], ckpt["lora_alpha"]
 
     model.to(args.device)
-    T.inject_cope(model, npos_max=npos_max)
-    T.add_lora(model, r=rank, alpha=alpha)
+    orig_forward = LlamaAttention.forward  # capture BEFORE the patch, or the check is
+    T.inject_cope(model, npos_max=npos_max)  # a tautology: inject_cope sets it two
+    T.add_lora(model, r=rank, alpha=alpha)  # lines above what we would assert on.
     model.to(args.device)
 
     # ---- Check 1: RoPE really replaced by CoPE ----
-    is_cope = LlamaAttention.forward is T.cope_attention_forward
-    print(f"[1] wiring: LlamaAttention.forward is CoPE (RoPE removed): {is_cope}")
+    # Identity alone proves nothing (inject_cope just assigned it). The load-bearing
+    # test is functional: corrupt the rotary embeddings and confirm the logits do not
+    # move. Under RoPE that changes every score; under CoPE the (cos, sin) argument is
+    # ignored outright, so identical logits == RoPE is genuinely out of the path.
+    patched = LlamaAttention.forward is T.cope_attention_forward and \
+        orig_forward is not T.cope_attention_forward
+    probe = torch.randint(0, model.config.vocab_size, (1, 16), device=args.device)
+    with torch.no_grad():
+        before = model(input_ids=probe).logits.float().clone()
+        rotary = model.model.rotary_emb
+        orig_rotary_forward = rotary.forward
+
+        def scrambled(x, position_ids, _f=orig_rotary_forward):
+            cos, sin = _f(x, position_ids)
+            return -cos, sin.flip(-1)  # a rotation no RoPE model could ignore
+
+        rotary.forward = scrambled
+        after = model(input_ids=probe).logits.float()
+        rotary.forward = orig_rotary_forward
+    rope_delta = (before - after).abs().max().item()
+    print(f"[1] wiring: forward replaced={patched}; logits change when RoPE is "
+          f"scrambled = {rope_delta:.3e} -> RoPE is "
+          f"{'OUT of the path (CoPE confirmed)' if rope_delta == 0.0 else 'STILL ACTIVE'}")
 
     # ---- Load adapter (real run) or fake a 'trained' pos_emb (smoke) ----
     if args.smoke:
@@ -114,13 +141,19 @@ def main():
     nonzero = sum(n > 0 for n in norms)
     print(f"[2] learned: {nonzero}/{len(norms)} pos_emb tables non-zero "
           f"(mean L2 {sum(norms)/len(norms):.4f})")
+    print(f"[2b] {T.pos_emb_coverage(model)}")
 
     # ---- Eval data ----
     if args.smoke:
         ds = T.SyntheticVarLen(model.config.vocab_size, args.max_seq_len, n=args.eval_samples)
     else:
+        if args.skip_samples is None:
+            print("[!] --skip_samples not given: rows [0, --eval_samples) overlap the "
+                  "rows train_cope.py trained on, so the ppl below is TRAIN perplexity, "
+                  "not held-out. Pass the training run's --max_samples to fix this.")
         ds = T.ShareGPTDataset(args.hf_dataset, args.hf_split, tok, args.max_seq_len,
-                               max_samples=args.eval_samples)
+                               max_samples=args.eval_samples,
+                               offset=args.skip_samples or 0)
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else 0
     loader = DataLoader(ds, batch_size=args.batch_size,
                         collate_fn=lambda b: T.collate_pad(b, pad_id))
