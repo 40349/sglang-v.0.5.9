@@ -1026,7 +1026,13 @@ def main():
             print(f"  LRs set from the command line: "
                   f"{', '.join(f'{lr:.2e}' for lr in group_lrs)}")
         else:
-            print("  (checkpoint predates resume support: weights only, restarting at 0)")
+            # cope_adapter_best.pt is written without optimizer state on purpose (it is a
+            # weights artifact for serving), so resuming from it silently restarts the
+            # step counter. Point at the file that can actually continue a run.
+            hint = (" -- use cope_adapter_last.pt to continue a run; best.pt never "
+                    "carries optimizer state") if "best" in str(args.resume) else \
+                   " (checkpoint predates resume support)"
+            print(f"  weights loaded but NO optimizer state, restarting at step 0{hint}")
         print(f"resumed from {args.resume}: step {start_step}, best_ppl {best_ppl:.3f}, "
               f"{len(ck['state'])} tensors loaded ({len(unexpected)} unexpected)")
         if start_step >= args.steps:
