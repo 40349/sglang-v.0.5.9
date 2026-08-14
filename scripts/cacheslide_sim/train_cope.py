@@ -1,7 +1,7 @@
-"""CoPE continued-pretraining for Llama (CacheSlide schedule, step 5 -- training).
+"""CoPE continued-pretraining (CacheSlide schedule, step 5 -- training).
 
 Serving frameworks (vLLM/SGLang) cannot train, so this runs in plain HF
-Transformers: it swaps RoPE for CoPE in every LlamaAttention, freezes the
+Transformers: it swaps RoPE for CoPE in every attention module, freezes the
 backbone, and trains only (a) the per-layer CoPE ``pos_emb`` and (b) LoRA adapters
 over q/k/v/o_proj -- exactly the "adapter-based continued pretraining" the paper
 describes. The objective is ordinary causal-LM loss; convergence == perplexity
@@ -47,6 +47,27 @@ from transformers import (
 )
 from transformers.models.llama.modeling_llama import LlamaAttention, repeat_kv
 
+
+def attention_class(model):
+    """The attention module class to patch, discovered from the model itself.
+
+    Hardcoding LlamaAttention silently no-ops on anything else: isinstance() matches
+    nothing, so zero CoPE modules and zero LoRA adapters get attached and the optimizer
+    gets an empty parameter list. Reading the class off layer 0 covers Llama, Qwen3,
+    Qwen3-MoE and anything else with the same decoder-layer shape.
+    """
+    return type(model.model.layers[0].self_attn)
+
+
+def is_cope_attention(module) -> bool:
+    """True for an attention module that inject_cope has already fitted with CoPE.
+
+    Used instead of an isinstance() check against one hardcoded class, so the helpers
+    stay model-agnostic.
+    """
+    return hasattr(module, "cope")
+
+
 # --- Single source of truth for the CoPE math: load cope.py by file path so we do
 # --- NOT import the whole sglang package (keeps the training env light).
 _COPE_PATH = (
@@ -83,7 +104,7 @@ _DIAG = {"pos": 0.0, "attn": 0.0, "n": 0}
 
 
 # ---------------------------------------------------------------------------
-# 1. CoPE attention -- monkey-patch LlamaAttention.forward (RoPE removed)
+# 1. CoPE attention -- monkey-patch <Model>Attention.forward (RoPE removed)
 # ---------------------------------------------------------------------------
 def _cope_attend_block(cope, scaling, query, key, value, valid, start: int, end: int):
     """CoPE attention for query rows ``[start, end)`` against keys ``[0, end)``.
@@ -144,7 +165,7 @@ def cope_attention_forward(
     cache_position=None,
     **kwargs,
 ):
-    """Training-time LlamaAttention.forward with CoPE instead of RoPE.
+    """Training-time attention forward with CoPE instead of RoPE.
 
     Eager (materialised T x T logits) so the CoPE position bias can be added inside
     the softmax. No KV-cache path -- training only. Matches transformers 4.57's
@@ -153,9 +174,27 @@ def cope_attention_forward(
     input_shape = hidden_states.shape[:-1]  # [B, T]
     hidden_shape = (*input_shape, -1, self.head_dim)
 
-    query = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)  # [B,Hq,T,d]
-    key = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)  # [B,Hkv,T,d]
+    # QK-Norm (Qwen3 / Qwen3-MoE): RMSNorm over the head dim, applied to the [B,T,H,d]
+    # view BEFORE the transpose, exactly as the stock forward does. Llama has no q_norm
+    # and skips this. Dropping it would leave q/k unnormalised -- the model still runs
+    # and still trains, it is just no longer the model whose weights we loaded.
+    query = self.q_proj(hidden_states).view(hidden_shape)
+    key = self.k_proj(hidden_states).view(hidden_shape)
+    if getattr(self, "q_norm", None) is not None:
+        query = self.q_norm(query)
+    if getattr(self, "k_norm", None) is not None:
+        key = self.k_norm(key)
+    query = query.transpose(1, 2)  # [B,Hq,T,d]
+    key = key.transpose(1, 2)  # [B,Hkv,T,d]
     value = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    # A sliding-window layer needs HF to supply the windowed mask; without it the CoPE
+    # forward would silently attend to the full history.
+    if getattr(self, "sliding_window", None) and attention_mask is None:
+        raise RuntimeError(
+            f"{type(self).__name__} has sliding_window={self.sliding_window} but no "
+            f"attention_mask was passed, so the window cannot be honoured."
+        )
 
     # Grouped-query attention: expand kv heads to match query heads.
     key = repeat_kv(key, self.num_key_value_groups)
@@ -210,11 +249,14 @@ def inject_cope(model, npos_max: int, gate_bias_span: float = 0.0,
     ContextualPositionEmbedding.init_gate_bias. 0 keeps the original behaviour exactly.
     """
     device = next(model.parameters()).device
+    attn_cls = attention_class(model)
+    n_attached = 0
     for module in model.modules():
-        if isinstance(module, LlamaAttention):
+        if isinstance(module, attn_cls):
             # Read head_dim off the module, not hidden_size // num_heads: they coincide
-            # on Llama-3.1 but not on models with an explicit head_dim (Qwen3), where the
-            # derived value would be wrong and the pos_emb table the wrong shape.
+            # on Llama-3.1 but not on models with an explicit head_dim (Qwen3-Coder-30B
+            # is 2048/32 = 64 derived vs 128 actual), where the derived value would size
+            # the pos_emb table wrong and the query @ pos_emb matmul would not even fit.
             head_dim = getattr(module, "head_dim", None) or (
                 model.config.hidden_size // model.config.num_attention_heads
             )
@@ -226,8 +268,15 @@ def inject_cope(model, npos_max: int, gate_bias_span: float = 0.0,
                 cope.init_gate_bias(gate_bias_span, seq_len)
             # pos_emb trains in fp32 for stability even under a bf16 backbone.
             module.cope = cope.to(device=device)
-    # Class-level patch: every LlamaAttention instance now runs CoPE.
-    LlamaAttention.forward = cope_attention_forward
+            last_attn = module  # model.modules() ends on some other module; keep this one
+            n_attached += 1
+    if n_attached == 0:
+        raise RuntimeError(f"no {attn_cls.__name__} modules found -- nothing to patch")
+    # Class-level patch: every instance of that attention class now runs CoPE.
+    attn_cls.forward = cope_attention_forward
+    print(f"CoPE injected into {n_attached} x {attn_cls.__name__} "
+          f"(head_dim={last_attn.cope.head_dim}, qk_norm="
+          f"{getattr(last_attn, 'q_norm', None) is not None}); RoPE bypassed")
 
 
 # ---------------------------------------------------------------------------
@@ -262,9 +311,13 @@ class LoRALinear(nn.Module):
 
 
 def add_lora(model, r: int, alpha: int, targets=("q_proj", "k_proj", "v_proj", "o_proj")):
-    """Wrap the named attention projections of every LlamaAttention with LoRA."""
+    """Wrap the named attention projections of every attention module with LoRA.
+
+    Requires plain nn.Linear projections: LoRALinear reads base.in_features and
+    base.weight, which a 4-bit packed (AWQ / compressed-tensors) module does not have.
+    """
     for module in model.modules():
-        if isinstance(module, LlamaAttention):
+        if is_cope_attention(module):
             for name in targets:
                 base = getattr(module, name)
                 setattr(module, name, LoRALinear(base, r=r, alpha=alpha))
@@ -320,7 +373,7 @@ def accumulate_gate_reg_grads(model, scale: float) -> Dict[str, float]:
     tot = {"span": 0.0, "span_max": 0.0, "L_span": 0.0, "L_bimod": 0.0}
     nl = 0
     for m in model.modules():
-        if not (isinstance(m, LlamaAttention) and getattr(m, "_cope_hs", None) is not None):
+        if not (is_cope_attention(m) and getattr(m, "_cope_hs", None) is not None):
             continue
         hs = m._cope_hs  # [B, T, hidden], detached (constant)
         valid = m._cope_valid
@@ -642,7 +695,7 @@ def pos_emb_coverage(model, bins: int = 8) -> str:
     below the low slots are the soft version of the same problem.
     """
     tables = [m.cope.pos_emb.detach().float() for m in model.modules()
-              if isinstance(m, LlamaAttention) and hasattr(m, "cope")]
+              if is_cope_attention(m)]
     if not tables:
         return "(no CoPE tables found)"
     coln = torch.stack(tables).norm(dim=1)  # [n_layers, npos_max] per-slot column norm
@@ -754,6 +807,22 @@ def build_model(args):
     tok = AutoTokenizer.from_pretrained(args.tokenizer or args.model)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    # Reject quantized checkpoints up front. LoRALinear needs a real nn.Linear
+    # (base.in_features / base.weight); AWQ and compressed-tensors ship 4-bit packed
+    # weights with neither, and merge_cope_adapter's `proj.weight.data += delta` has
+    # nothing to add into. Failing here beats failing after a 60GB download.
+    from transformers import AutoConfig
+
+    qcfg = getattr(AutoConfig.from_pretrained(args.model), "quantization_config", None)
+    if qcfg:
+        method = (qcfg.get("quant_method") if isinstance(qcfg, dict)
+                  else getattr(qcfg, "quant_method", "?"))
+        raise SystemExit(
+            f"{args.model} is quantized (quant_method={method}). This trainer needs "
+            f"unquantized nn.Linear projections to attach LoRA to and to merge back "
+            f"into. Train the full-precision checkpoint and quantize afterwards if "
+            f"serving needs it."
+        )
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         attn_implementation="eager",
