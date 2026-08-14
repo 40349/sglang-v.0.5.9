@@ -997,8 +997,18 @@ def main():
                                 max_batches=args.eval_batches or None)
         print(f"RoPE baseline ppl (stock model, same eval set): {baseline_ppl:.3f}")
 
+    # Calibrate the gate bias against the length the model will ACTUALLY see, not the
+    # truncation cap. init_gate_bias solves sigmoid(b) = target/seq_len, so feeding it
+    # --max_seq_len when the corpus is shorter starts the span proportionally too low
+    # (Code-Feedback medians ~1150 tokens against a 4096 cap -> 3.5x too low).
+    import statistics as _stats
+
+    _sample = [ds[i].numel() for i in range(0, len(ds), max(1, len(ds) // 512))][:512]
+    typical_len = int(_stats.median(_sample)) if _sample else args.max_seq_len
+    print(f"sample length: median {typical_len}  mean {int(_stats.mean(_sample))}  "
+          f"max {max(_sample)}  (cap {args.max_seq_len})")
     inject_cope(model, npos_max=npos_max, gate_bias_span=args.gate_bias_span,
-                seq_len=args.max_seq_len)
+                seq_len=typical_len)
     add_lora(model, r=args.lora_rank, alpha=args.lora_alpha)
     # Re-home CoPE modules onto the model device/after any wrapping.
     model.to(args.device)
