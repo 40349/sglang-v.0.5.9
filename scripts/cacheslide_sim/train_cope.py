@@ -676,6 +676,19 @@ def cksim_vs_shift(
     return out
 
 
+def _cksim_probe(model, tok, smoke: bool):
+    """The one segment + shift schedule both CKSim passes must share.
+
+    The RoPE and CoPE curves are only comparable if they move the SAME tokens across the
+    SAME offsets, so this is built once and reused before/after the CoPE injection.
+    """
+    if smoke:
+        return torch.randint(0, model.config.vocab_size, (1, 12)), [0, 8, 16]
+    seg = tok("The capital city of France is Paris, which is located in Europe.",
+              return_tensors="pt").input_ids
+    return seg, [0, 100, 300, 600, 900]
+
+
 @torch.no_grad()
 def cksim_by_layer(model, segment_ids: torch.Tensor, shift: int, seed: int = 0) -> str:
     """Per-layer key drift for one shift -- where CoPE stops buying you anything.
@@ -1063,6 +1076,15 @@ def main():
                                 max_batches=args.eval_batches or None)
         print(f"RoPE baseline ppl (stock model, same eval set): {baseline_ppl:.3f}")
 
+    # ---- RoPE CKSim baseline: same idea, and it has to be taken HERE, while the stock
+    # ---- model is still intact. "CoPE keys drift less under a shift" is the entire
+    # ---- CacheSlide premise, and a CoPE-only curve cannot state it -- it needs the RoPE
+    # ---- curve from the same segment and the same seeded prefixes. Measuring it in a
+    # ---- separate --keep_rope run works too but costs a second GPU-day.
+    cksim_seg, cksim_shifts = _cksim_probe(model, tok, args.smoke)
+    rope_cks = cksim_vs_shift(model, cksim_seg, shifts=cksim_shifts)
+    rope_by_layer = cksim_by_layer(model, cksim_seg, shift=max(cksim_shifts))
+
     # Calibrate the gate bias against the length the model will ACTUALLY see, not the
     # truncation cap. init_gate_bias solves sigmoid(b) = target/seq_len, so feeding it
     # --max_seq_len when the corpus is shorter starts the span proportionally too low
@@ -1285,23 +1307,18 @@ def main():
     if not args.keep_rope:
         print(f"pos_emb coverage: {pos_emb_coverage(model)}")
 
-    # CKSim sanity (drift): should print numbers in [-1, 1], ideally high & flat.
+    # CKSim (drift of the CACHED key when a segment slides to a new absolute offset).
+    # The trained curve is meaningless alone -- read it against the stock-RoPE curve
+    # captured before the injection. CoPE only earns its quality cost if it drifts less.
     if args.smoke:
         _check_tiling_exact(model, args.device)
-        seg_ids = torch.randint(0, model.config.vocab_size, (1, 12))
-        shifts = [0, 8, 16]
-    else:
-        seg_ids = tok(
-            "The capital city of France is Paris, which is located in Europe.",
-            return_tensors="pt",
-        ).input_ids
-        shifts = [0, 100, 300, 600, 900]
-    # Measured on the CACHED key, so a --keep_rope run gives the RoPE curve to compare
-    # against: the CoPE claim is only "less drift than RoPE", never a number on its own.
-    tag = "RoPE" if args.keep_rope else "CoPE"
-    cks = cksim_vs_shift(model, seg_ids, shifts=shifts)
-    print(f"CKSim vs shift ({tag}):", {k: round(v, 4) for k, v in cks.items()})
-    print("CKSim by layer:", cksim_by_layer(model, seg_ids, shift=max(shifts)))
+    tag = "RoPE+LoRA" if args.keep_rope else "CoPE"
+    cks = cksim_vs_shift(model, cksim_seg, shifts=cksim_shifts)
+    print("CKSim vs shift (stock RoPE):", {k: round(v, 4) for k, v in rope_cks.items()})
+    print(f"CKSim vs shift ({tag}):    ", {k: round(v, 4) for k, v in cks.items()})
+    print("CKSim by layer (stock RoPE):", rope_by_layer)
+    print(f"CKSim by layer ({tag}):", cksim_by_layer(model, cksim_seg,
+                                                     shift=max(cksim_shifts)))
     print(f"adapters in {out_dir}: cope_adapter_best.pt (lowest eval ppl), "
           f"cope_adapter_last.pt")
 

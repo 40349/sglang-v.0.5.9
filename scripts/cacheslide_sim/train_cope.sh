@@ -30,20 +30,28 @@ TRAIN_LOG="${LOG_DIR}/train_cope_${JOB}.log"
 # and point it at that run's cope_adapter_last.pt -- best.pt carries no optimizer state.
 RESUME_FROM=""
 
-# Back to 1e-3, with gate_bias FROZEN -- a combination that has never actually run.
-# History: 6e-6 gave pos/attn 0.005 (inert, ppl fine); 1e-3 with a TRAINABLE gate_bias
-# gave pos/attn 0.148 (CoPE load-bearing) but oscillating ppl; 2e-4 with gate_bias frozen
-# gave clean convergence (Qwen3-8B, ppl 3.18 = 0.87x the RoPE baseline) but pos/attn stuck
-# at 0.017 -- inert again, the LoRA doing all the work. The oscillation at 1e-3 was
-# attributed to gate_bias chasing pos_emb, but that fix and the LR cut landed together, so
-# this run isolates the one variable that was changed for the wrong reason.
+# Run history on Qwen3-8B (stock ppl 3.67; the real ceiling is the --keep_rope control at
+# 1.95, NOT 3.67 -- comparing a finetuned CoPE model to the zero-shot stock model is what
+# produced the bogus "beats RoPE" reading):
 #
-# Watch pos/attn at the step-149 eval: still under ~0.03 there and the problem is not the
-# learning rate, it is that next-token prediction on this corpus does not need position at
-# all -- a position-free model already beats the RoPE baseline on it. The fallback is then
-# to freeze the LoRA for the first N steps so pos_emb is the only thing that can reduce
-# the loss.
-POS_EMB_LR=1e-3
+#   pos_emb_lr  gate_bias   warmup   best ppl          pos/attn
+#   6e-6        frozen      -        -                 0.005
+#   1e-3        TRAINABLE   -        oscillating       0.148   <- only load-bearing run
+#   2e-4        frozen      -        3.18              0.017
+#   1e-3        frozen      200      7.85 (ends 8.56)  0.033
+#
+# Two things those rows settle. (a) The lever is gate_bias, not pos_emb_lr: at the SAME
+# 1e-3, trainable gives 0.148 and frozen gives 0.033. Freezing it was done to stop the
+# oscillation and was confounded with an LR cut; the warmup run disentangled them.
+# (b) LoRA warmup is dead -- with pos_emb the only trainable parameter it converged to an
+# inert solution (ppl 199.7 -> 105 then flat, pos/attn 0.029 -> 0.033 over 100 steps) and
+# left a worse starting point for the LoRA.
+#
+# So: the one cell never run. 2e-4 (the LR that converged cleanly) with the gate free to
+# move the span. gate_bias is one scalar per head and Adam moves it ~lr/step, so 1e-3 over
+# 2000 steps buys ~2.0 of logit travel -- the span 256 -> 512 move costs about 1.0 of that.
+POS_EMB_LR=2e-4
+GATE_BIAS_LR=1e-3
 
 # Rows [0, TRAIN_ROWS) train; the tail stays unseen for verify_cope --skip_samples.
 TRAIN_ROWS=60000
@@ -84,6 +92,10 @@ fi
 #
 # --gate_reg is OFF: get the position signal converging first, then re-enable the span
 # cap on top of a model that is actually using CoPE.
+#
+# The run now prints TWO CKSim curves -- stock RoPE (captured before the injection) and
+# CoPE -- from the same segment and the same seeded prefixes. That pair, not the ppl, is
+# the answer to whether position-free KV reuse is real: CoPE has to drift visibly less.
 srun python -u scripts/cope/train_cope.py \
   --model "${MODEL}" \
   --tokenizer "${MODEL}" \
@@ -91,7 +103,7 @@ srun python -u scripts/cope/train_cope.py \
   --max_samples ${TRAIN_ROWS} \
   --max_seq_len 4096 --npos_max 1024 --tile_q 1024 \
   --lr 1e-4 --pos_emb_lr "${POS_EMB_LR}" \
-  --gate_bias_span 256 \
+  --gate_bias_span 256 --gate_bias_lr "${GATE_BIAS_LR}" \
   --gate_reg 0 --gate_span_target 512 --gate_bimod 0 \
   --bf16 --grad_ckpt --batch_size 1 --grad_accum 16 \
   --seed 0 --steps 2000 --eval_every 50 --save_every 200 \
