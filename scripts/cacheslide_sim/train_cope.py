@@ -568,6 +568,59 @@ def collate_pad(batch: List[torch.Tensor], pad_id: int):
 # ---------------------------------------------------------------------------
 # 4. CKSim validation -- reproduce Figure 4(a): drift of cached vs recomputed K
 # ---------------------------------------------------------------------------
+def _cached_keys_fn(model):
+    """``(keys_for_ids, close)`` reading the key tensor a KV cache would really store.
+
+    Hooking ``k_proj`` -- the obvious choice, and what this file used to do -- measures
+    the wrong tensor. transformers applies QK-Norm and *then* RoPE to k_proj's output
+    before ``cache.update`` (modeling_qwen3.py:201-210), so a k_proj hook returns a
+    position-free tensor in EVERY model and reports layer-0 CKSim = 1.0000 with RoPE
+    fully active. That made the whole metric vacuous: a ``--keep_rope`` control scored
+    the same curve as CoPE, which is not a result about CoPE at all.
+
+    With CoPE attached the patched forward bypasses RoPE and keeps no cache, so the
+    cached key really is ``k_norm(k_proj(x))`` and a hook there is exact -- layer 0 at
+    1.0000 is then a structural guarantee, not a measurement. Otherwise read the real
+    ``DynamicCache``, whose keys are rotated.
+
+    Every source is normalised to ``{layer_idx: [T, Hkv, d]}``.
+    """
+    layers = model.model.layers
+    cope_path = any(is_cope_attention(l.self_attn) for l in layers)
+    n_kv = getattr(model.config, "num_key_value_heads", model.config.num_attention_heads)
+    caps: Dict[int, torch.Tensor] = {}
+    handles = []
+
+    if cope_path:
+        for i, layer in enumerate(layers):
+            attn = layer.self_attn
+            # k_norm output is [B,T,Hkv,d]; k_proj (no QK-Norm, e.g. Llama) is [B,T,Hkv*d].
+            # Hook the FULL projection, not ``.base``: served keys include the LoRA delta.
+            tgt = getattr(attn, "k_norm", None) or attn.k_proj
+            handles.append(tgt.register_forward_hook(
+                lambda _m, _i, out, idx=i: caps.__setitem__(idx, out.detach())))
+
+    def keys_for(ids: torch.Tensor) -> Dict[int, torch.Tensor]:
+        if cope_path:
+            model(input_ids=ids)
+            raw = dict(caps)
+        else:
+            pkv = model(input_ids=ids, use_cache=True).past_key_values
+            if pkv is None:
+                raise RuntimeError(
+                    "use_cache=True returned no cache, so the post-RoPE keys this "
+                    "metric needs are unreadable (model.eval() not in effect?)"
+                )
+            raw = {i: l.keys.transpose(1, 2) for i, l in enumerate(pkv.layers)}
+        return {i: v[0].reshape(v.shape[1], n_kv, -1) for i, v in raw.items()}
+
+    def close():
+        for h in handles:
+            h.remove()
+
+    return keys_for, close
+
+
 @torch.no_grad()
 def cksim_vs_shift(
     model, segment_ids: torch.Tensor, shifts: List[int], layer_idx: int = -1,
@@ -582,8 +635,8 @@ def cksim_vs_shift(
     the base (unpatched) model to get the RoPE curve for comparison.
 
     Two things this has to get right to mean anything:
-      * hook the FULL ``k_proj`` (base + LoRA). The served keys include the trained LoRA
-        delta, so hooking ``.base`` would measure a model that is never served.
+      * read the tensor the KV cache actually holds -- see :func:`_cached_keys_fn`.
+        Hooking ``k_proj`` scores RoPE and CoPE identically and proves nothing.
       * shifts must be NESTED prefixes of one seeded pool, not a fresh random prefix per
         shift -- otherwise the curve mostly measures prefix *content* and comes out
         non-monotonic in the shift.
@@ -591,20 +644,11 @@ def cksim_vs_shift(
     model.eval()
     device = next(model.parameters()).device
     layers = model.model.layers
-    layer = layers[layer_idx]
-    attn = layer.self_attn
-
-    captured: Dict[str, torch.Tensor] = {}
-
-    def hook(_module, _inp, out):
-        # k_proj output: [B, T, Hkv*d]; keep as-is, we slice/normalise later.
-        captured["k"] = out.detach()
-
-    handle = attn.k_proj.register_forward_hook(hook)
+    li = layer_idx if layer_idx >= 0 else len(layers) + layer_idx
 
     seg = segment_ids.to(device)
     seg_len = seg.shape[1]
-    n_kv = getattr(model.config, "num_key_value_heads", model.config.num_attention_heads)
+    keys_for, close = _cached_keys_fn(model)
 
     # One fixed pool; shift s uses its first s tokens, so every shift is a prefix of the
     # next and the only thing varying across the curve is where the segment sits.
@@ -615,19 +659,20 @@ def cksim_vs_shift(
 
     def seg_keys(prefix_len: int) -> torch.Tensor:
         ids = seg if prefix_len == 0 else torch.cat([pool[:, :prefix_len], seg], dim=1)
-        model(input_ids=ids)
-        k = captured["k"][0, prefix_len : prefix_len + seg_len]  # [seg_len, Hkv*d]
-        return k.reshape(seg_len, n_kv, -1)  # [seg_len, Hkv, d] -> per-head cosine
+        k = keys_for(ids)[li]  # [T, Hkv, d]
+        return k[prefix_len : prefix_len + seg_len]
 
-    base = seg_keys(0)
-    out: Dict[int, float] = {}
-    for s in shifts:
-        shifted = seg_keys(s)
-        cos = torch.nn.functional.cosine_similarity(
-            base.float(), shifted.float(), dim=-1
-        )  # [seg_len, Hkv]
-        out[s] = cos.mean().item()
-    handle.remove()
+    try:
+        base = seg_keys(0)
+        out: Dict[int, float] = {}
+        for s in shifts:
+            shifted = seg_keys(s)
+            cos = torch.nn.functional.cosine_similarity(
+                base.float(), shifted.float(), dim=-1
+            )  # [seg_len, Hkv]
+            out[s] = cos.mean().item()
+    finally:
+        close()
     return out
 
 
@@ -635,22 +680,22 @@ def cksim_vs_shift(
 def cksim_by_layer(model, segment_ids: torch.Tensor, shift: int, seed: int = 0) -> str:
     """Per-layer key drift for one shift -- where CoPE stops buying you anything.
 
-    CoPE never writes position into k, so layer 0's keys are a pure function of the token
-    ids: shifting the segment must leave them BIT-identical (a 1.000 that is not a
-    measurement but a structural guarantee -- if it is not 1.000, RoPE is still active).
-    Deeper layers drift only because their input hidden states saw a different prefix
-    through attention. The layer at which this curve falls away is the honest answer to
-    "how far up does position-free KV reuse survive", which a single last-layer number
-    cannot tell you.
+    Read on the cached (post-RoPE) key -- see :func:`_cached_keys_fn`. With CoPE attached
+    nothing writes position into k, so layer 0's cached keys are a pure function of the
+    token ids and shifting the segment leaves them identical: a 1.0000 that is a
+    structural guarantee, not a measurement. Under RoPE the same layer-0 number is a real
+    measurement and must come out WELL below 1.0000 -- the keys are rotated by absolute
+    position. Deeper layers drift in both cases because their input hidden states saw a
+    different prefix through attention.
+
+    The layer at which this curve falls away is the honest answer to "how far up does
+    position-free KV reuse survive", and it only means something against the RoPE curve
+    from the same segment (run this on the stock model too).
     """
     model.eval()
     device = next(model.parameters()).device
-    n_kv = getattr(model.config, "num_key_value_heads", model.config.num_attention_heads)
-    caps: Dict[int, torch.Tensor] = {}
-    handles = []
-    for i, layer in enumerate(model.model.layers):
-        handles.append(layer.self_attn.k_proj.register_forward_hook(
-            lambda _m, _i, out, idx=i: caps.__setitem__(idx, out.detach())))
+    cope_path = any(is_cope_attention(l.self_attn) for l in model.model.layers)
+    keys_for, close = _cached_keys_fn(model)
 
     seg = segment_ids.to(device)
     seg_len = seg.shape[1]
@@ -659,21 +704,22 @@ def cksim_by_layer(model, segment_ids: torch.Tensor, shift: int, seed: int = 0) 
 
     def keys(prefix_len):
         ids = seg if prefix_len == 0 else torch.cat([pool[:, :prefix_len].to(device), seg], 1)
-        model(input_ids=ids)
-        return {i: v[0, prefix_len:prefix_len + seg_len].reshape(seg_len, n_kv, -1)
-                for i, v in caps.items()}
+        return {i: v[prefix_len:prefix_len + seg_len] for i, v in keys_for(ids).items()}
 
-    base, shifted = keys(0), keys(shift)
-    for h in handles:
-        h.remove()
+    try:
+        base, shifted = keys(0), keys(shift)
+    finally:
+        close()
     per = [torch.nn.functional.cosine_similarity(
         base[i].float(), shifted[i].float(), dim=-1).mean().item() for i in sorted(base)]
     n = len(per)
     # sorted(set(...)): on a shallow model these quarter-points collide, and printing
     # "L0 L0 L1 L1 L1" makes the report look broken.
     show = sorted({0, n // 4, n // 2, 3 * n // 4, n - 1})
+    note = ("layer0 must be 1.0000: CoPE writes no position into k" if cope_path
+            else "RoPE active: layer0 well below 1.0000 is the point of comparison")
     return (f"shift={shift}: " + " ".join(f"L{i}={per[i]:.4f}" for i in show)
-            + f"  (layer0 must be 1.0000: CoPE writes no position into k)")
+            + f"  ({note})")
 
 
 def pos_ratio_and_reset() -> float:
@@ -1250,8 +1296,11 @@ def main():
             return_tensors="pt",
         ).input_ids
         shifts = [0, 100, 300, 600, 900]
+    # Measured on the CACHED key, so a --keep_rope run gives the RoPE curve to compare
+    # against: the CoPE claim is only "less drift than RoPE", never a number on its own.
+    tag = "RoPE" if args.keep_rope else "CoPE"
     cks = cksim_vs_shift(model, seg_ids, shifts=shifts)
-    print("CKSim vs shift (CoPE):", {k: round(v, 4) for k, v in cks.items()})
+    print(f"CKSim vs shift ({tag}):", {k: round(v, 4) for k, v in cks.items()})
     print("CKSim by layer:", cksim_by_layer(model, seg_ids, shift=max(shifts)))
     print(f"adapters in {out_dir}: cope_adapter_best.pt (lowest eval ppl), "
           f"cope_adapter_last.pt")
