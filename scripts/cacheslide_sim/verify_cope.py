@@ -1,7 +1,7 @@
 """Verify a trained model is really using CoPE (not RoPE) -- CacheSlide.
 
 Three checks:
-  1. Wiring: LlamaAttention.forward is the CoPE forward (RoPE is gone).
+  1. Wiring: <Model>Attention.forward is the CoPE forward (RoPE is gone).
   2. Learned: the loaded pos_emb tables are non-zero (the finetune wrote them).
   3. Ablation (the real proof): eval perplexity with the trained pos_emb vs with
      pos_emb ZEROED. Zeroing removes CoPE's position signal; if ppl blows up, the
@@ -31,14 +31,13 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import train_cope as T  # single source of truth for the CoPE plumbing
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaConfig
-from transformers.models.llama.modeling_llama import LlamaAttention
 
 
 def zero_pos_emb(model):
     """Zero every CoPE pos_emb (disables the position signal). Returns saved copies."""
     saved = {}
     for module in model.modules():
-        if isinstance(module, LlamaAttention) and hasattr(module, "cope"):
+        if T.is_cope_attention(module):
             saved[id(module)] = module.cope.pos_emb.data.clone()
             module.cope.pos_emb.data.zero_()
     return saved
@@ -46,7 +45,7 @@ def zero_pos_emb(model):
 
 def restore_pos_emb(model, saved):
     for module in model.modules():
-        if isinstance(module, LlamaAttention) and hasattr(module, "cope"):
+        if T.is_cope_attention(module):
             module.cope.pos_emb.data.copy_(saved[id(module)])
 
 
@@ -92,7 +91,10 @@ def main():
         rank, alpha = ckpt["lora_rank"], ckpt["lora_alpha"]
 
     model.to(args.device)
-    orig_forward = LlamaAttention.forward  # capture BEFORE the patch, or the check is
+    # Whatever attention class this model uses -- Qwen3Attention, LlamaAttention, ...
+    # Hardcoding LlamaAttention here made every check silently vacuous on Qwen3.
+    attn_cls = T.attention_class(model)
+    orig_forward = attn_cls.forward  # capture BEFORE the patch, or the check is
     T.inject_cope(model, npos_max=npos_max)  # a tautology: inject_cope sets it two
     T.add_lora(model, r=rank, alpha=alpha)  # lines above what we would assert on.
     model.to(args.device)
@@ -102,7 +104,7 @@ def main():
     # test is functional: corrupt the rotary embeddings and confirm the logits do not
     # move. Under RoPE that changes every score; under CoPE the (cos, sin) argument is
     # ignored outright, so identical logits == RoPE is genuinely out of the path.
-    patched = LlamaAttention.forward is T.cope_attention_forward and \
+    patched = attn_cls.forward is T.cope_attention_forward and \
         orig_forward is not T.cope_attention_forward
     probe = torch.randint(0, model.config.vocab_size, (1, 16), device=args.device)
     with torch.no_grad():
@@ -125,7 +127,7 @@ def main():
     # ---- Load adapter (real run) or fake a 'trained' pos_emb (smoke) ----
     if args.smoke:
         for m in model.modules():
-            if isinstance(m, LlamaAttention):
+            if T.is_cope_attention(m):
                 m.cope.pos_emb.data.normal_(std=0.1)  # pretend it was trained
     else:
         missing, unexpected = model.load_state_dict(ckpt["state"], strict=False)
@@ -137,7 +139,7 @@ def main():
 
     # ---- Check 2: pos_emb learned (non-zero) ----
     norms = [m.cope.pos_emb.data.norm().item()
-             for m in model.modules() if isinstance(m, LlamaAttention)]
+             for m in model.modules() if T.is_cope_attention(m)]
     nonzero = sum(n > 0 for n in norms)
     print(f"[2] learned: {nonzero}/{len(norms)} pos_emb tables non-zero "
           f"(mean L2 {sum(norms)/len(norms):.4f})")
