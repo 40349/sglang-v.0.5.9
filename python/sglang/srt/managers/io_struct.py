@@ -19,6 +19,7 @@ processes (TokenizerManager, DetokenizerManager, Scheduler).
 from __future__ import annotations
 
 import copy
+import logging
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
@@ -32,6 +33,8 @@ from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData
+
+logger = logging.getLogger(__name__)
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -331,14 +334,36 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
         their contents so batch-size detection and the rest of the pipeline see one
         single prompt; the actual per-block tokenization (and per-namespace radix
         matching) happens in ``TokenizerManager._tokenize_one_request``.
+
+        A request that also carries ``text`` or ``input_ids`` describes its prompt
+        twice, and the two descriptions have to agree: ``_tokenize_one_request``
+        builds the prompt from whichever it reaches first (``input_ids``, then the
+        blocks, then ``text``), so a disagreement means the request that runs is not
+        the request that was sent. ``input_ids`` wins there and cannot be compared
+        against block *text*, so the split is dropped; ``text`` is compared, and a
+        mismatch is a client error rather than a coin flip between two prompts.
         """
         if not self.sub_contexts:
             return
-        if self.text is not None or self.input_ids is not None:
-            # Explicit text/input_ids take precedence; sub_contexts is only used to
-            # carry the per-block extra_key namespaces alongside them.
+        if self.input_ids is not None:
+            # Pre-tokenized input wins in `_tokenize_one_request`, so the blocks would
+            # describe a prompt that is never used. `sub_context_ids` is the field for
+            # splitting a pre-tokenized prompt.
+            logger.warning(
+                "Sub-context: ignoring `sub_contexts` because `input_ids` was also "
+                "provided; use `sub_context_ids` to split a pre-tokenized prompt."
+            )
+            self.sub_contexts = None
             return
-        self.text = "".join(sc["content"] for sc in self.sub_contexts)
+
+        joined = "".join(sc["content"] for sc in self.sub_contexts)
+        if self.text is None:
+            self.text = joined
+        elif self.text != joined:
+            raise ValueError(
+                "`text` and `sub_contexts` describe different prompts. Send only "
+                "`sub_contexts`, or make its contents concatenate to exactly `text`."
+            )
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""

@@ -1,0 +1,166 @@
+#!/bin/bash
+# MASLab arm of the sub-context A/B.
+#
+#   TAG=ag_he_on  ./run_mas.sh record   run MASLab end to end and record its traffic
+#   TAG=ag_he_ab  ./run_mas.sh toggle   replay a capture, split OFF then ON
+#   TAG=ag_he_on  ./run_mas.sh eval     pass@1 for a record run's results
+#
+# Everything lands in ab_out/maslab. SWE-bench is run_swe.sh.
+#
+# METHOD / MAS_CONFIG / DATASET / TAG / REQUESTS / SUBCTX_OFF stay overridable
+# because run_matrix.sh drives four combinations through this script; edit the
+# rest here.
+set -euo pipefail
+
+REPO=/home/t2503-3090/Desktop/MiaoChen/sglang-v.0.5.9
+OUT=$REPO/ab_out/maslab
+MODEL=QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
+PORT=30000
+CTXLEN=16384
+GEN_TOKENS=32          # replay generates a fixed length so both arms do equal work
+ENV=sglangv59
+MASLAB=/home/t2503-3090/Desktop/MiaoChen/MASLab
+MAS_MODEL=Qwen3-Coder-30B-A3B
+MAS_TEMP=0.0
+
+METHOD=${METHOD:-autogen}
+MAS_CONFIG=${MAS_CONFIG:-config_code}
+DATASET=${DATASET:-humaneval}
+TAG=${TAG:-}
+SUF=${TAG:+_$TAG}
+REQUESTS=${REQUESTS:-$OUT/requests$SUF.jsonl}
+INFER=${INFER:-$OUT/infer$SUF.jsonl}   # overridable so a pre-split run can still be scored
+
+mkdir -p "$OUT"
+source /home/t2503-3090/miniconda3/etc/profile.d/conda.sh
+conda activate $ENV
+export PYTHONNOUSERSITE=1        # ~/.local has a broken torch dist-info ahead of the env
+export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
+
+# The server command lives here, once. Callers set LOG, and optionally
+# CAPTURE / TRACE / STAGE / SUBCTX_OFF / SUBCTX_TRACE before calling.
+launch() {
+  pkill -f "[s]glang\.launch_server" 2>/dev/null || true
+  sleep 6
+  if [ -n "${TRACE:-}" ]; then rm -f "$TRACE"; fi
+  if [ -n "${STAGE:-}" ]; then rm -f "$STAGE".*; fi
+  SGLANG_CAPTURE_REQUESTS=${CAPTURE:-} \
+  SGLANG_FORWARD_TRACE=${TRACE:-} \
+  SGLANG_STAGE_TRACE=${STAGE:-} \
+  SGLANG_DISABLE_SUBCONTEXT=${SUBCTX_OFF:-} \
+  SGLANG_SUBCTX_TRACE=${SUBCTX_TRACE:-} \
+  nohup python -u -m sglang.launch_server \
+    --model-path $MODEL \
+    --context-length $CTXLEN \
+    --quantization moe_wna16 \
+    --tool-call-parser qwen3_coder \
+    --enable-cache-report \
+    --port $PORT \
+    --mem-fraction-static 0.85 \
+    > "$LOG" 2>&1 &
+  echo -n "  waiting"
+  for _ in $(seq 1 300); do
+    if grep -q "fired up and ready" "$LOG"; then echo " ready"; return 0; fi
+    if ! pgrep -f "[s]glang\.launch_server" > /dev/null; then
+      echo " DIED"; tail -30 "$LOG"; exit 1
+    fi
+    echo -n .; sleep 2
+  done
+  echo " TIMEOUT"; tail -30 "$LOG"; exit 1
+}
+
+stop() {
+  pkill -TERM -f "[s]glang\.launch_server" 2>/dev/null || true   # TERM so timers flush
+  sleep 8
+}
+
+# Replay the capture against whatever server is up. Callers set CLIENT (+ TRACE/STAGE).
+replay() {
+  python $REPO/subcontext_bench.py replay "$REQUESTS" \
+    --url http://127.0.0.1:$PORT \
+    --trace "${TRACE:-}" --stage-trace "${STAGE:-}" --out "$CLIENT" \
+    --model $MODEL --gen-tokens $GEN_TOKENS --save-text
+}
+
+case "${1:-}" in
+  record)
+    : "${TAG:?set TAG so this capture does not overwrite another combination}"
+    # RESUME keeps both files so MASLab's own reserve_unprocessed_queries can pick
+    # up where a killed run stopped; the capture then holds both attempts.
+    if [ -z "${RESUME:-}" ]; then rm -f "$REQUESTS" "$INFER"; fi
+    LOG=$OUT/server_record$SUF.log CAPTURE=$REQUESTS launch
+    if [ -n "${SUBCTX_OFF:-}" ]; then
+      grep -q "Sub-context split DISABLED" $OUT/server_record$SUF.log \
+        || { echo "REFUSING: SUBCTX_OFF set but the split did not report itself disabled"; exit 1; }
+    fi
+    # The KV pool size decides whether the A/B measures the split or the eviction
+    # policy. Record what the server actually got: 30B AWQ on 24GB leaves little.
+    grep -m1 -o "max_total_num_tokens=[0-9]*" $OUT/server_record$SUF.log \
+      | tee $OUT/kvpool$SUF.txt || echo "WARNING: could not read KV pool size"
+    # MASLab must not import sglang from the fork tree.
+    ( unset PYTHONPATH; cd $MASLAB && python inference.py \
+        --method_name "$METHOD" \
+        ${MAS_CONFIG:+--method_config_name "$MAS_CONFIG"} \
+        --test_dataset_name "$DATASET" \
+        --model_name $MAS_MODEL \
+        --model_temperature $MAS_TEMP \
+        --output_path "$INFER" )
+    stop
+    echo "captured $(wc -l < "$REQUESTS" 2>/dev/null || echo 0) requests -> $REQUESTS"
+    echo "inference results -> $INFER"
+    ;;
+
+  toggle)
+    [ -s "$REQUESTS" ] || { echo "no capture at $REQUESTS; run '$0 record' first"; exit 1; }
+    echo "captured $(wc -l < "$REQUESTS") requests"
+
+    echo; echo "======== SPLIT OFF ========"
+    SUBCTX_OFF=1 LOG=$OUT/server_off$SUF.log \
+      TRACE=$OUT/trace_base$SUF.jsonl STAGE=$OUT/stage_base$SUF launch
+    # An arm meant to be the baseline that silently ran with the split on is worse
+    # than no arm at all: it looks like a valid comparison.
+    grep -q "Sub-context split DISABLED" $OUT/server_off$SUF.log \
+      || { echo "REFUSING: the split did not report itself disabled"; exit 1; }
+    TRACE=$OUT/trace_base$SUF.jsonl STAGE=$OUT/stage_base$SUF \
+      CLIENT=$OUT/client_base$SUF.json replay
+
+    echo; echo "======== SPLIT ON ========"
+    LOG=$OUT/server_on$SUF.log \
+      TRACE=$OUT/trace_sub$SUF.jsonl STAGE=$OUT/stage_sub$SUF launch
+    TRACE=$OUT/trace_sub$SUF.jsonl STAGE=$OUT/stage_sub$SUF \
+      CLIENT=$OUT/client_sub$SUF.json replay
+
+    stop
+
+    echo; echo "======== GPU (CUDA events) ========"
+    python $REPO/subcontext_bench.py report $OUT/trace_base$SUF.jsonl $OUT/trace_sub$SUF.jsonl
+    echo; echo "======== HOST (CPU stages) ========"
+    python $REPO/subcontext_bench.py stages $OUT/stage_base$SUF $OUT/stage_sub$SUF
+    echo; echo "======== PARITY (generated text) ========"
+    python $REPO/subcontext_bench.py parity \
+      $OUT/client_base$SUF.json $OUT/client_sub$SUF.json || true
+    ;;
+
+  eval)
+    # pass@1 for a record run's results. Kept separate from toggle on purpose: the
+    # replay generates a fixed length with ignore_eos, so its output is not a real
+    # attempt at the benchmark. Quality comes from the record run, which generated
+    # freely.
+    : "${TAG:?set TAG to the run you want scored}"
+    [ -s "$INFER" ] || { echo "no results at $INFER; run '$0 record' first"; exit 1; }
+    ( unset PYTHONPATH; cd $MASLAB && python evaluate.py \
+        --eval_protocol code \
+        --model_name $MAS_MODEL \
+        --tested_dataset_name "$DATASET" \
+        --tested_infer_path "$INFER" \
+        --overwrite )
+    ;;
+
+  *)
+    echo "usage: METHOD=.. DATASET=.. TAG=.. $0 {record|toggle|eval}"
+    echo "  record  METHOD=autogen MAS_CONFIG=config_code DATASET=humaneval TAG=ag_he_on $0 record"
+    echo "  toggle  REQUESTS=$OUT/requests_ag_he_on.jsonl TAG=ag_he_ab $0 toggle"
+    echo "  eval    TAG=ag_he_on DATASET=humaneval $0 eval"
+    echo "  add SUBCTX_OFF=1 to run any of them with the split disabled"
+    exit 1;;
+esac

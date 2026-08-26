@@ -726,6 +726,8 @@ class Scheduler(
             else:
                 self.tree_cache = RadixCache(params)
 
+        self._check_sub_context_support()
+
         if (
             server_args.disaggregation_mode == "decode"
             and server_args.disaggregation_decode_enable_offload_kvcache
@@ -742,6 +744,34 @@ class Scheduler(
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
+
+    def _check_sub_context_support(self):
+        """Sub-context: fail at launch, not once per request, on a cache that
+        cannot serve the split.
+
+        The split is on unless ``SGLANG_DISABLE_SUBCONTEXT`` says otherwise, so
+        every chat request would arrive split into per-namespace blocks. On a
+        cache that cannot insert per namespace those requests silently degrade
+        (matching namespaces nothing writes to) rather than fail, which is the
+        worst outcome to debug -- a run that looks healthy and caches nothing.
+        Requests that carry an explicit ``sub_contexts`` field still fall back to
+        the single-namespace path at runtime, so this only refuses the
+        configuration that would apply the split to everything.
+        """
+        from sglang.srt.utils.subctx_config import (
+            DISABLE_SUBCONTEXT,
+            unsupported_reason,
+        )
+
+        if DISABLE_SUBCONTEXT:
+            return
+        reason = unsupported_reason(self.tree_cache)
+        if reason is not None:
+            raise ValueError(
+                f"The sub-context split is enabled but cannot be served: {reason}. "
+                "Launch without that option, or set SGLANG_DISABLE_SUBCONTEXT=1 to run "
+                "the single-namespace baseline."
+            )
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []

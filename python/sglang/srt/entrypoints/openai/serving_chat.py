@@ -52,6 +52,7 @@ from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import host_timer
+from sglang.srt.utils.subctx_config import DISABLE_SUBCONTEXT
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -59,10 +60,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Sub-context A/B switch. When set, chat requests carry no sub-context split, so the
-# prompt takes the stock single-namespace radix path -- the baseline to measure
-# against, on the same binary and the same loaded weights.
-DISABLE_SUBCONTEXT = os.environ.get("SGLANG_DISABLE_SUBCONTEXT", "") not in ("", "0")
+# Sub-context A/B switch, read from `SGLANG_DISABLE_SUBCONTEXT`. Defined in
+# subctx_config so the launcher can consult the same value when it decides whether
+# the configured prefix cache can serve the split at all.
 if DISABLE_SUBCONTEXT:
     logger.info("Sub-context split DISABLED (baseline mode)")
 

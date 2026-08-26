@@ -178,6 +178,68 @@ class ReqState:
     output_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
 
 
+def _clip_sub_contexts_to_input(
+    sub_context_ids: List[List[int]],
+    sub_context_extra_keys: List[str],
+    input_len: int,
+    rid: str,
+) -> Tuple[Optional[List[List[int]]], Optional[List[str]]]:
+    """Sub-context: restore ``concat(sub_context_ids) == input_ids``.
+
+    ``_validate_one_request`` truncates an over-long prompt in place when
+    ``--allow-auto-truncate`` is set, which leaves the block list describing more
+    tokens than the prompt still has. Downstream that invariant is what makes the
+    per-block offsets absolute positions: the write path clamps each block to the
+    prefill length and degrades quietly, the match path would go on matching (and
+    stitching KV for) tokens that are no longer in the prompt, and only a length
+    assert deep in the insert path stands between that and corrupt reuse.
+
+    Truncation only ever removes a suffix, so the fix is the same cut applied to
+    the blocks: keep whole blocks while they fit, clip the one that straddles the
+    new end, drop the rest. Returns ``(None, None)`` if nothing is left, which
+    turns the request back into an ordinary single-namespace one.
+    """
+    total = sum(len(seg) for seg in sub_context_ids)
+    if total == input_len:
+        return sub_context_ids, sub_context_extra_keys
+
+    if total < input_len:
+        # Not a truncation: something else rewrote input_ids (e.g. a multimodal
+        # processor) and the split no longer describes this prompt at all.
+        logger.warning(
+            "Sub-context: dropping the split for rid=%s -- the blocks cover %d tokens "
+            "but the prompt has %d.",
+            rid,
+            total,
+            input_len,
+        )
+        return None, None
+
+    clipped_ids: List[List[int]] = []
+    clipped_keys: List[str] = []
+    remaining = input_len
+    for seg, key in zip(sub_context_ids, sub_context_extra_keys):
+        if remaining <= 0:
+            break
+        take = min(len(seg), remaining)
+        clipped_ids.append(seg[:take])
+        clipped_keys.append(key)
+        remaining -= take
+
+    logger.warning(
+        "Sub-context: the prompt for rid=%s was truncated from %d to %d tokens; "
+        "clipping the block list to match (%d of %d blocks kept).",
+        rid,
+        total,
+        input_len,
+        len(clipped_ids),
+        len(sub_context_ids),
+    )
+    if not clipped_ids:
+        return None, None
+    return clipped_ids, clipped_keys
+
+
 class InputFormat(Enum):
     """Input format types for tokenization handling."""
 
@@ -775,6 +837,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 )
 
         self._validate_one_request(obj, input_ids)
+        # `_validate_one_request` may have truncated `input_ids` in place
+        # (--allow-auto-truncate); the blocks have to follow it.
+        if sub_context_ids is not None:
+            sub_context_ids, sub_context_extra_keys = _clip_sub_contexts_to_input(
+                sub_context_ids, sub_context_extra_keys, len(input_ids), obj.rid
+            )
         trace_slice_end(RequestStage.TOKENIZE, obj.rid)
         return self._create_tokenized_object(
             obj,

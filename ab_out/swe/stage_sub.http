@@ -1,0 +1,31 @@
+{
+  "proc": "http",
+  "stages": {
+    "subctx_split": {
+      "count": 37,
+      "total_ms": 24.462,
+      "mean_us": 661.134,
+      "max_us": 1171.898
+    },
+    "tpl_render": {
+      "count": 36,
+      "total_ms": 431.9789,
+      "mean_us": 11999.414,
+      "max_us": 23845.531
+    }
+  },
+  "measured": {
+    "subctx_split": {
+      "count": 34,
+      "total_ms": 24.1779,
+      "mean_us": 711.115,
+      "max_us": 1171.898
+    },
+    "tpl_render": {
+      "count": 33,
+      "total_ms": 430.733,
+      "mean_us": 13052.516,
+      "max_us": 23845.531
+    }
+  }
+}

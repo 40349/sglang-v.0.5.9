@@ -106,6 +106,25 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
 
+# Sub-context: a request may carry a split this cache cannot serve (an explicit
+# `sub_contexts` body reaching a page_size>1 / EAGLE / ChunkCache server). It is
+# handled as a normal single-namespace request; say so once rather than per request.
+_warned_sub_contexts_unsupported = False
+
+
+def _warn_sub_contexts_unsupported_once(tree_cache) -> None:
+    global _warned_sub_contexts_unsupported
+    if _warned_sub_contexts_unsupported:
+        return
+    _warned_sub_contexts_unsupported = True
+    from sglang.srt.utils.subctx_config import unsupported_reason
+
+    logger.warning(
+        "Sub-context: ignoring the per-namespace split for requests that carry one, "
+        "because %s. They are served as ordinary single-namespace requests.",
+        unsupported_reason(tree_cache),
+    )
+
 
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
@@ -638,6 +657,16 @@ class Req(ReqDllmMixin):
         # inserted into its namespace, accumulated across chunked-prefill chunks. Used to
         # free only the freshly-computed duplicate slots (parallel to sub_context_ids).
         self.sub_context_owned_lens: Optional[List[int]] = None
+        # WCA: the absolute position each block's hit was *computed* at, parallel to
+        # sub_context_ids (None where the block missed). Equal to the block's own
+        # offset on the fast path; when it differs, `target - canonical` is the
+        # rotation a later stage has to apply to reuse those slots, and is why the
+        # hit is kept and locked rather than forgotten.
+        self.sub_context_match_positions: Optional[List[Optional[int]]] = None
+        # Tokens matched in a namespace but computed at a different position, so
+        # dropped rather than stitched. A subset of `sub_context_discarded`, kept
+        # apart because this is the part a rotation could win back.
+        self.sub_context_moved: int = 0
 
         # # --- 強制攔截：只要是我們自訂的 subcontext，強制不生成任何新 token ---
         # if self.extra_key in ["system_prompt_key", "tools_key", "messages_key"]:
@@ -971,13 +1000,31 @@ class Req(ReqDllmMixin):
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
 
-        if tree_cache is not None and self.has_sub_contexts:
+        if (
+            tree_cache is not None
+            and self.has_sub_contexts
+            and tree_cache.supports_sub_contexts()
+        ):
             # CCPE: sub-context requests are matched per-namespace, never against the
             # default namespace (which would share a KV slot -- e.g. the warmup BOS --
             # with a namespace node and trip the memory leak checker). The contiguous
             # cached prefix is stitched from the per-namespace hits and reused.
+            #
+            # The `supports_sub_contexts` gate is not optional: only a cache that also
+            # *inserts* per namespace may be matched per namespace. Without it a
+            # page_size>1 / EAGLE / ChunkCache setup would probe namespaces nothing
+            # ever writes to (0% hit, forever) while its writes accumulate in the
+            # default namespace that no sub-context request ever reads -- and
+            # ChunkCache has no `root_node` for the tail of this method to fall back
+            # on, so it would raise once per request instead. Falling through to the
+            # single-namespace match below keeps such a server correct, just without
+            # the split; the launcher refuses the combination outright when the
+            # sub-context split is enabled.
             self._stitch_sub_contexts(tree_cache)
         elif tree_cache is not None:
+            if self.has_sub_contexts and not tree_cache.supports_sub_contexts():
+                # A placement conflict lands here too, but it logs its own reason.
+                _warn_sub_contexts_unsupported_once(tree_cache)
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
@@ -1026,12 +1073,14 @@ class Req(ReqDllmMixin):
         """
         if self.sub_context_match_nodes is None:
             self.sub_context_match_indices = None
+            self.sub_context_match_positions = None
             return
         for node in self.sub_context_match_nodes:
             if node is not None:
                 tree_cache.dec_lock_ref(node)
         self.sub_context_match_nodes = None
         self.sub_context_match_indices = None
+        self.sub_context_match_positions = None
 
     def _stitch_sub_contexts(self, tree_cache: BasePrefixCache) -> None:
         """CCPE: match each sub-context in its own namespace, log the hit, and stitch
@@ -1046,12 +1095,14 @@ class Req(ReqDllmMixin):
         parallel to ``sub_context_ids``, with None/0 where a segment missed.
 
         Reuse is the conservative part. A segment's hit is stitched in only while the
-        reused slots still form a contiguous prefix from position 0. Contiguity is
-        broken by a partial hit (``take < len(seg_ids)``) or by the ``input_len - 1``
-        cap that keeps >=1 token to compute; a segment that misses entirely, or that is
-        empty, contributes nothing but leaves contiguity intact, so a later segment can
-        still be stitched. Once broken, subsequent segments are still matched but never
-        reused.
+        reused slots still form a contiguous prefix from position 0 *and* were
+        computed at the position they are being reused at. Contiguity is broken by a
+        partial hit (``take < len(seg_ids)``), by the ``input_len - 1`` cap that
+        keeps >=1 token to compute, by a segment that misses entirely, or by a hit
+        whose ``canonical_position`` is not this segment's offset. An empty segment
+        is skipped before any of that and leaves contiguity intact (the splitter
+        drops empty blocks, so this is a defensive case). Once broken, subsequent
+        segments are still matched but never reused.
 
         The stitched slots become ``prefix_indices`` (so ``#cached-token`` reflects the
         reuse) and per-segment *reused* lengths -- 0 for matched-but-unused segments --
@@ -1081,6 +1132,8 @@ class Req(ReqDllmMixin):
         owned: List[int] = []
         match_indices: List[Optional[torch.Tensor]] = []
         match_nodes: List[Optional[Any]] = []
+        match_positions: List[Optional[int]] = []
+        moved = 0
         total = 0
         contiguous = True
         for seg_ids, seg_key, _offset in self.iter_sub_contexts():
@@ -1089,12 +1142,17 @@ class Req(ReqDllmMixin):
                 owned.append(0)
                 match_indices.append(None)
                 match_nodes.append(None)
+                match_positions.append(None)
                 continue
             seg_match = tree_cache.match_prefix(
                 MatchPrefixParams(key=RadixKey(token_ids=seg_ids, extra_key=seg_key))
             )
             hit = len(seg_match.device_indices)
             match_lens.append(hit)
+            canonical = tree_cache.matched_canonical_position(
+                seg_match.last_device_node, hit
+            )
+            match_positions.append(canonical)
             if hit > 0:
                 # Lock before the slots are handed to WCA: they must outlive scheduling
                 # and survive until forward has read them.
@@ -1104,16 +1162,27 @@ class Req(ReqDllmMixin):
             else:
                 match_nodes.append(None)
                 match_indices.append(None)
+            # A hit computed at another position is real cached content under the
+            # wrong rotation. Stitching it would feed K rotated for someone else's
+            # position into attention -- silently, and worst exactly where the
+            # cached prefix is longest. So it is dropped here, but kept locked and
+            # recorded above: `_offset - canonical` is what a later stage rotates
+            # by to turn this drop back into a reuse.
+            displaced = canonical is not None and canonical != _offset
+            if displaced:
+                moved += hit
             if TRACE_ON:
                 trace(
                     f"[TRACE-4 RadixCache] sub-context match rid={self.rid} "
                     f"extra_key={seg_key!r} hit={hit}/{len(seg_ids)} "
+                    f"offset={_offset} canonical={canonical}"
+                    f"{' MOVED' if displaced else ''} "
                     f"hit_tokens={_preview(seg_ids[:hit])}"
                 )
             take = 0
             if contiguous:
-                if hit == 0:
-                    contiguous = False     
+                if hit == 0 or displaced:
+                    contiguous = False
                 else:
                     take = min(hit, max_prefix_len - total)
                     if take <= 0:
@@ -1130,6 +1199,8 @@ class Req(ReqDllmMixin):
         self.sub_context_owned_lens = owned
         self.sub_context_match_indices = match_indices
         self.sub_context_match_nodes = match_nodes
+        self.sub_context_match_positions = match_positions
+        self.sub_context_moved = moved
         # Matched but not stitched -- the tokens the contiguity rule threw away.
         # The tree walk and the inc_lock_ref above were already paid for them, and
         # prefix_indices keeps no trace, so this is the only place both halves

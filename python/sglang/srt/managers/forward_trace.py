@@ -74,11 +74,20 @@ class ForwardTracer:
             # per-request quantity against a per-pass one and report a negative
             # drop of exactly one chunk on every continuation pass.
             discarded_tokens = 0
+            # The part of the drop that is a *position* mismatch rather than a
+            # contiguity one: matched, locked, and thrown away only because the KV
+            # was computed elsewhere. That is the share a rotation could win back,
+            # so it is worth telling apart from the rest of the drop.
+            moved_tokens = 0
             for req in reqs:
                 d = getattr(req, "sub_context_discarded", 0) or 0
                 if d:
                     req.sub_context_discarded = 0
                     discarded_tokens += d
+                m = getattr(req, "sub_context_moved", 0) or 0
+                if m:
+                    req.sub_context_moved = 0
+                    moved_tokens += m
             matched_tokens = cached_tokens + discarded_tokens
             # How many of these requests took the split path at all. A run with
             # none of them did not observe zero drops -- the contiguity gate it
@@ -90,6 +99,7 @@ class ForwardTracer:
             cached_tokens = 0
             matched_tokens = 0
             discarded_tokens = 0
+            moved_tokens = 0
             sub_reqs = 0
 
         return {
@@ -100,6 +110,7 @@ class ForwardTracer:
             "cached_tokens": cached_tokens,
             "matched_tokens": matched_tokens,
             "discarded_tokens": discarded_tokens,
+            "moved_tokens": moved_tokens,
             "sub_reqs": sub_reqs,
             "t_rel": round(time.perf_counter() - self._t0, 6),
         }

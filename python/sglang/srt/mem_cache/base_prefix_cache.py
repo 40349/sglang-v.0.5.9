@@ -60,6 +60,10 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    # Sub-context: absolute position of key[0] in the prompt. 0 for an ordinary
+    # request (its key starts at the beginning of the sequence); the block's offset
+    # when inserting one block of a split prompt.
+    canonical_position: int = 0
 
 
 @dataclasses.dataclass
@@ -219,6 +223,27 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def is_chunk_cache(self) -> bool:
         return False
+
+    def supports_sub_contexts(self) -> bool:
+        """Whether this cache implements the per-namespace sub-context paths.
+
+        Both halves have to be implemented by the *same* cache: matching each
+        block in its own ``extra_key`` namespace (read) and inserting each block
+        back into that namespace (write). A cache that does only the first would
+        report a 0% hit rate forever while its writes pile up in the default
+        namespace, which no sub-context request ever looks up -- worse than not
+        caching at all. Default False; overridden where both paths exist.
+        """
+        return False
+
+    def matched_canonical_position(self, last_node: Any, hit_len: int) -> Optional[int]:
+        """Where the KV behind a match was computed, or None if unknown.
+
+        A cache that does not track it returns None, which reads as "no reason to
+        doubt the position" -- only sub-context requests, on a cache that does
+        track it, can be handed KV from a different position in the first place.
+        """
+        return None
 
     def is_tree_cache(self) -> bool:
         return not self.is_chunk_cache()

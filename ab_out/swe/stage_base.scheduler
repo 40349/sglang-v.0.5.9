@@ -1,0 +1,43 @@
+{
+  "proc": "scheduler",
+  "stages": {
+    "cache_finished": {
+      "count": 37,
+      "total_ms": 25.1149,
+      "mean_us": 678.781,
+      "max_us": 1342.496
+    },
+    "cache_unfinished": {
+      "count": 38,
+      "total_ms": 42.2325,
+      "mean_us": 1111.38,
+      "max_us": 2356.437
+    },
+    "match": {
+      "count": 38,
+      "total_ms": 24.4619,
+      "mean_us": 643.733,
+      "max_us": 1335.748
+    }
+  },
+  "measured": {
+    "cache_finished": {
+      "count": 33,
+      "total_ms": 24.8088,
+      "mean_us": 751.782,
+      "max_us": 1342.496
+    },
+    "cache_unfinished": {
+      "count": 34,
+      "total_ms": 41.8406,
+      "mean_us": 1230.606,
+      "max_us": 2356.437
+    },
+    "match": {
+      "count": 34,
+      "total_ms": 24.2584,
+      "mean_us": 713.483,
+      "max_us": 1335.748
+    }
+  }
+}

@@ -48,6 +48,7 @@ agent loop has no such bound.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import statistics
 import sys
@@ -145,6 +146,17 @@ def cmd_replay(args: argparse.Namespace) -> int:
     rows = []
     t_start = time.perf_counter()
     for i, body in enumerate(reqs):
+        # Bisection aid: with the tree emptied before every request there is no
+        # reuse in either arm, so the two arms must compute byte-identical
+        # prefills. Divergence that survives this is in the split path itself,
+        # not in what it chose to reuse. Ruins every timing number -- diagnosis
+        # only, never a measurement run.
+        if args.flush_every and i:
+            try:
+                urllib.request.urlopen(f"{base}/flush_cache", timeout=30).read()
+                time.sleep(0.2)
+            except urllib.error.URLError as e:
+                print(f"warning: flush_cache failed ({e})", file=sys.stderr)
         body = dict(body)
         body["stream"] = False
         if not args.full:
@@ -163,6 +175,15 @@ def cmd_replay(args: argparse.Namespace) -> int:
             return 1
         dt = time.perf_counter() - t0
 
+        # Hash the completion so the two arms can be compared token-for-token.
+        # Sub-context only changes WHICH KV slots get reused; the reused KV has
+        # to be bit-identical, so at temperature 0 any divergence here is
+        # cache corruption. This is a sharper correctness test than pass@1 and
+        # it costs one hash per request.
+        try:
+            text = resp["choices"][0]["message"]["content"] or ""
+        except (KeyError, IndexError, TypeError):
+            text = ""
         usage = resp.get("usage") or {}
         prompt = usage.get("prompt_tokens", 0) or 0
         # Only reported when the server ran with --enable-cache-report; otherwise
@@ -177,6 +198,8 @@ def cmd_replay(args: argparse.Namespace) -> int:
                 "prompt_tokens": prompt,
                 "cached_tokens": cached,
                 "completion_tokens": usage.get("completion_tokens", 0) or 0,
+                "text_sha1": hashlib.sha1(text.encode()).hexdigest()[:16],
+                **({"text": text} if args.save_text else {}),
             }
         )
         if cached is None:
@@ -188,12 +211,18 @@ def cmd_replay(args: argparse.Namespace) -> int:
 
     total = time.perf_counter() - t_start
     tot_prompt = sum(r["prompt_tokens"] for r in rows)
-    if any(r["cached_tokens"] is None for r in rows):
+    # A cold request has no `prompt_tokens_details` at all, so a single genuine zero
+    # used to turn the whole run's summary into "n/a" and hide a real hit rate.
+    # Only ALL rows missing means the server ran without --enable-cache-report.
+    missing = sum(1 for r in rows if r["cached_tokens"] is None)
+    if missing == len(rows):
         cache_str = "cached n/a (use --enable-cache-report; the forward trace has it either way)"
     else:
-        tot_cached = sum(r["cached_tokens"] for r in rows)
+        tot_cached = sum(r["cached_tokens"] or 0 for r in rows)
         cache_str = (f"cached {tot_cached} tok "
                      f"({100.0 * tot_cached / tot_prompt if tot_prompt else 0:.1f}%)")
+        if missing:
+            cache_str += f" [{missing} request(s) reported no cache detail, counted as 0]"
     print(
         f"\n{len(rows)} requests in {total:.1f}s | prompt {tot_prompt} tok, {cache_str} | "
         f"client latency sum {sum(r['latency_s'] for r in rows):.2f}s"
@@ -259,6 +288,15 @@ def summarize(rows: List[dict]) -> Dict[str, float]:
     else:
         discarded_tok = sum(r.get("matched_tokens", r["cached_tokens"]) for r in ext) - cached_tok
     matched_tok = cached_tok + discarded_tok
+    # The share of the drop that is a position mismatch: matched in the tree but
+    # computed at a different absolute position, so it cannot be stitched as-is.
+    # None (not 0) when the trace predates the field -- "no moved hits" and "this
+    # trace cannot say" are different claims.
+    moved_tok = (
+        sum(r.get("moved_tokens", 0) for r in ext)
+        if any("moved_tokens" in r for r in ext)
+        else None
+    )
     # None, not 0, when the trace predates the field: "no request took the split
     # path" and "the trace cannot say" are different claims and print differently.
     sub_reqs = sum(r["sub_reqs"] for r in ext) if all("sub_reqs" in r for r in ext) else None
@@ -266,6 +304,7 @@ def summarize(rows: List[dict]) -> Dict[str, float]:
     return {
         "matched_tokens": matched_tok,
         "discarded_tokens": discarded_tok,
+        "moved_tokens": moved_tok,
         "sub_reqs": sub_reqs,
         "prefill_passes": len(ext),
         "prefill_gpu_ms": ext_ms,
@@ -320,6 +359,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         ("prefill_cached_tokens", "  ...from radix cache", "tok"),
         ("matched_tokens", "matched in the tree", "tok"),
         ("discarded_tokens", "  ...matched but DROPPED", "tok"),
+        ("moved_tokens", "     ...dropped as MOVED", "tok"),
         ("hit_rate", "cache hit rate (reuse only)", "%"),
         ("prefill_gpu_ms", "PREFILL GPU time", "ms"),
         ("prefill_ms_median", "  median pass", "ms"),
@@ -339,9 +379,9 @@ def cmd_report(args: argparse.Namespace) -> int:
     print("-" * (w + 58))
     for key, label, unit in keys:
         va, vb = a[key], b[key]
-        na_a = na_b = False
+        na_a, na_b = va is None, vb is None
         if key == "discarded_tokens":
-            na_a, na_b = gate_absent(a), gate_absent(b)
+            na_a, na_b = na_a or gate_absent(a), na_b or gate_absent(b)
         if na_a or na_b:
             delta = "n/a"
         elif key in ("hit_rate",):
@@ -360,7 +400,7 @@ def cmd_report(args: argparse.Namespace) -> int:
             f"\nprefill GPU time saved: {saved:,.1f} ms "
             f"({100.0 * saved / a['prefill_gpu_ms']:+.1f}%)"
         )
-    if a["discarded_tokens"] < 0 or b["discarded_tokens"] < 0:
+    if (a["discarded_tokens"] or 0) < 0 or (b["discarded_tokens"] or 0) < 0:
         print(
             "\nNOTE: a negative DROPPED count means this trace predates the fix that\n"
             "records the drop at stitch time. It was derived by subtracting a\n"
@@ -509,6 +549,54 @@ def cmd_stages(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# parity
+# --------------------------------------------------------------------------- #
+
+
+def cmd_parity(args: argparse.Namespace) -> int:
+    """Compare what the two arms generated, request by request.
+
+    At temperature 0 with the same weights, the arms must produce the same
+    tokens: the split changes which cached KV is reused, and reused KV that is
+    not bit-identical shows up as a different sampled token. A mismatch here is
+    a correctness bug, not noise -- unlike a pass@1 difference, which a single
+    flipped token can cause without anything being wrong.
+    """
+    with open(args.baseline) as f:
+        a = json.load(f)
+    with open(args.treatment) as f:
+        b = json.load(f)
+
+    if len(a) != len(b):
+        print(f"MISMATCH: {len(a)} baseline rows vs {len(b)} treatment rows")
+        return 1
+
+    bad = [i for i, (x, y) in enumerate(zip(a, b))
+           if x.get("text_sha1") != y.get("text_sha1")]
+    if not any("text_sha1" in x for x in a):
+        print("no text_sha1 in the results -- replay predates the field, rerun to compare")
+        return 1
+
+    print(f"{len(a) - len(bad)}/{len(a)} requests generated identical text")
+    if not bad:
+        print("PARITY OK")
+        return 0
+
+    print(f"\nDIVERGED at {len(bad)} request(s): {bad[:20]}{' ...' if len(bad) > 20 else ''}")
+    i = bad[0]
+    if "text" in a[i] and "text" in b[i]:
+        ta, tb = a[i]["text"], b[i]["text"]
+        n = next((j for j in range(min(len(ta), len(tb))) if ta[j] != tb[j]), min(len(ta), len(tb)))
+        print(f"\nfirst divergence, request {i}, at char {n}:")
+        print(f"  common prefix: ...{ta[max(0, n - 60):n]!r}")
+        print(f"  baseline then: {ta[n:n + 80]!r}")
+        print(f"  sub-context:   {tb[n:n + 80]!r}")
+    else:
+        print("(rerun replay with --save-text to see what diverged)")
+    return 1
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -536,7 +624,13 @@ def main() -> int:
                    help="the server's SGLANG_STAGE_TRACE prefix; same purpose as "
                         "--trace, for the host-side timers")
     r.add_argument("--no-flush", action="store_true")
+    r.add_argument("--flush-every", action="store_true",
+                   help="empty the radix tree before every request, so neither "
+                        "arm reuses anything (diagnosis only -- destroys timings)")
     r.add_argument("--out", default=None, help="write per-request stats here")
+    r.add_argument("--save-text", action="store_true",
+                   help="also store each completion in --out, so `parity` can "
+                        "show what diverged and not just that something did")
     r.set_defaults(func=cmd_replay)
 
     s = sub.add_parser("report", help="aggregate/diff forward traces")
@@ -545,6 +639,11 @@ def main() -> int:
     s.add_argument("--all-runs", action="store_true",
                    help="merge every run in the file instead of the last")
     s.set_defaults(func=cmd_report)
+
+    y = sub.add_parser("parity", help="check two arms generated identical text")
+    y.add_argument("baseline", help="--out json from the baseline arm")
+    y.add_argument("treatment", help="--out json from the sub-context arm")
+    y.set_defaults(func=cmd_parity)
 
     t = sub.add_parser("stages", help="diff host-side (CPU) stage timings")
     t.add_argument("baseline", help="SGLANG_STAGE_TRACE prefix from the baseline run")

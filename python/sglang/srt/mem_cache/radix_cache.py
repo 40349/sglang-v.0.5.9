@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.evict_policy import (
 )
 from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
 from sglang.srt.utils import host_timer
+from sglang.srt.utils.subctx_config import CACHE_SUBCONTEXT_OUTPUT
 from sglang.srt.utils.subctx_trace import TRACE_ON, trace
 
 if TYPE_CHECKING:
@@ -119,6 +120,19 @@ class TreeNode:
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
         self.priority = priority
+        # Sub-context: the absolute position in the prompt that this node's first
+        # token sat at when its KV was computed. RoPE rotates K by absolute
+        # position, so KV is only reusable at the position it was built for.
+        #
+        # In a single namespace this is redundant -- the path from the root IS the
+        # position -- and it stays 0-based and exact for those nodes. Per-block
+        # namespaces are what make it load-bearing: a block's path spans only the
+        # block, so its position is the sum of the *preceding* blocks' lengths,
+        # which the tree cannot otherwise know. Recording it per node (rather than
+        # folding the position into the namespace key) keeps one copy of each token
+        # sequence in the tree, and hands a later stage the delta it needs to
+        # rotate a hit into a new position instead of dropping it.
+        self.canonical_position: int = 0
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -341,6 +355,46 @@ class RadixCache(BasePrefixCache):
         self.evictable_leaves.clear()
         self._record_all_cleared_event()
 
+    def supports_sub_contexts(self) -> bool:
+        """Sub-context: this class implements both the per-namespace match
+        (``Req._stitch_sub_contexts``) and the per-namespace insert
+        (``_cache_unfinished_sub_contexts``), but only in its plain device-side
+        form.
+
+        ``type(self) is RadixCache`` rather than ``isinstance``: a subclass adds a
+        tier the sub-context insert path does not maintain (HiRadixCache writes
+        nodes back to a host tier and matches against it), so it would again read
+        and write different places. EAGLE rewrites keys into bigrams and
+        ``page_size > 1`` inserts page-aligned prefixes, neither of which the
+        per-block slicing accounts for.
+        """
+        return (
+            type(self) is RadixCache
+            and not self.disable
+            and self.page_size == 1
+            and not self.is_eagle
+        )
+
+    def matched_canonical_position(
+        self, last_node: Optional[TreeNode], hit_len: int
+    ) -> Optional[int]:
+        """Sub-context: where the KV behind a match was computed.
+
+        The matched prefix runs from the namespace root down to ``last_node``,
+        whose key is fully matched (``match_prefix`` splits a node when the match
+        ends inside it), so the chain starts ``hit_len - len(last_node.key)``
+        tokens before that node's own position.
+
+        A caller compares this against the position it is about to reuse the KV
+        at. Equal is the fast path. Different means the cached content is real but
+        rotated for somewhere else: today that hit is dropped rather than
+        stitched, and the difference is exactly the delta a later stage needs to
+        rotate it into place instead.
+        """
+        if last_node is None or hit_len <= 0:
+            return None
+        return last_node.canonical_position - (hit_len - len(last_node.key))
+
     def maybe_bigram_convert(
         self, key: RadixKey, value: Optional[torch.Tensor] = None
     ) -> Tuple[RadixKey, Optional[torch.Tensor]]:
@@ -443,7 +497,9 @@ class RadixCache(BasePrefixCache):
 
         key, value = self.maybe_bigram_convert(key, value)
 
-        prefix_len = self._insert_helper(self.root_node, key, value, priority)
+        prefix_len = self._insert_helper(
+            self.root_node, key, value, priority, params.canonical_position
+        )
         return InsertResult(prefix_len=prefix_len)
 
     def _page_align_keys(self, key: list) -> list:
@@ -486,10 +542,10 @@ class RadixCache(BasePrefixCache):
         req.release_sub_context_match_locks(self)
 
         # Sub-context (Stage B): the prompt was already inserted per-namespace during
-        # `cache_unfinished_req`. Just unlock those leaves and free the generated tail
-        # (the continuation is not cached in any namespace here).
+        # `cache_unfinished_req`, so this unlocks those leaves rather than re-inserting,
+        # and hands the generated continuation to the last block's namespace.
         if req.sub_context_last_nodes is not None:
-            self._finish_sub_contexts(req, kv_indices)
+            self._finish_sub_contexts(req, token_ids, kv_indices, is_insert)
             return
 
         # Maybe convert to bigram keys for EAGLE
@@ -520,24 +576,110 @@ class RadixCache(BasePrefixCache):
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
 
-    def _finish_sub_contexts(self, req: Req, kv_indices: torch.Tensor):
+    def _finish_sub_contexts(
+        self,
+        req: Req,
+        token_ids: List[int],
+        kv_indices: torch.Tensor,
+        is_insert: bool = True,
+    ):
         """Sub-context (Stage B): finish a request whose prompt was cached per-namespace.
 
         The prompt KV [0:cache_protected_len) is owned and locked by the per-namespace
         leaves recorded in ``req.sub_context_last_nodes`` -- it stays in the tree, we
-        only release those locks. Everything after the prompt (the decode continuation)
-        is not cached in any namespace, so its slots are freed here.
+        only release those locks. The decode continuation is appended to the last
+        block's namespace (see ``_cache_sub_context_output``); whatever the tree does
+        not take is freed here.
         """
-        prompt_len = req.cache_protected_len
-        # Free the generated tail (not owned by any namespace node).
-        if prompt_len < len(kv_indices):
-            self.token_to_kv_pool_allocator.free(kv_indices[prompt_len:])
+        kept = False
+        if is_insert and CACHE_SUBCONTEXT_OUTPUT:
+            kept = self._cache_sub_context_output(req, token_ids, kv_indices)
+
+        if not kept:
+            # Free the generated tail (not owned by any namespace node).
+            prompt_len = req.cache_protected_len
+            if prompt_len < len(kv_indices):
+                self.token_to_kv_pool_allocator.free(kv_indices[prompt_len:])
 
         # Release the per-namespace prompt locks taken in cache_unfinished_req.
         for node in req.sub_context_last_nodes:
             self.dec_lock_ref(node)
         req.sub_context_last_nodes = None
         req.sub_context_owned_lens = None
+
+    def _cache_sub_context_output(
+        self, req: Req, token_ids: List[int], kv_indices: torch.Tensor
+    ) -> bool:
+        """Sub-context: extend the last block's namespace with the generated tokens.
+
+        In an agent loop the reply this request just produced is part of the *prompt*
+        of the next turn: it is appended to the message list and re-rendered into the
+        last block. Dropping its KV at finish time means re-prefilling tokens the
+        model just computed, every turn. So the block's namespace is extended with
+        ``block ++ generated`` -- keyed under the same ``extra_key`` (``messages_key``
+        with the standard system/tools/messages split), continuing the node the block
+        already occupies, so next turn's longer message block matches straight through
+        the reply and stops wherever the render diverges.
+
+        Positions line up for free: the generated tokens sit immediately after the
+        block, so the extension's absolute positions continue the block's own and
+        the whole chain keeps one canonical position.
+
+        Only a fully prefilled prompt qualifies -- a request aborted mid-prefill does
+        not own its whole last block, and an extension hanging off a partial block
+        would be keyed to a prefix that no later request reproduces.
+
+        Returns True if the tail was handed to the tree (the caller must not free it),
+        False if this request was declined and the tail is still the caller's to free.
+        """
+        if not req.sub_context_ids or not req.sub_context_extra_keys:
+            return False
+
+        last_seg = req.sub_context_ids[-1]
+        prompt_len = sum(len(seg) for seg in req.sub_context_ids)
+        if (
+            not last_seg
+            or req.cache_protected_len != prompt_len  # prompt not fully inserted
+            or req.sub_context_owned_lens is None
+            or req.sub_context_owned_lens[-1] != len(last_seg)
+            or len(token_ids) <= prompt_len  # nothing generated (or nothing committed)
+        ):
+            return False
+
+        offset = prompt_len - len(last_seg)
+        seg_key = req.sub_context_extra_keys[-1]
+
+        # The block itself is already in the tree at `offset` (this request put it
+        # there), and the generated tokens continue straight on from it, so the
+        # extension is canonical at the same position as the block.
+        radix_key = RadixKey(token_ids[offset:], seg_key)
+        values = kv_indices[offset:].to(dtype=torch.int64, copy=True)
+        result = self.insert(
+            InsertParams(
+                key=radix_key,
+                value=values,
+                priority=getattr(req, "priority", 0) or 0,
+                canonical_position=offset,
+            )
+        )
+
+        # [offset, offset + len(last_seg)) is the block this request already owns in
+        # the tree, so only a match reaching *past* it is a freshly computed duplicate
+        # -- another request generated the same continuation first. Everything the
+        # insert did not match now belongs to the tree and must not be freed.
+        owned = len(last_seg)
+        if result.prefix_len > owned:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[offset + owned : offset + result.prefix_len]
+            )
+
+        if TRACE_ON:
+            trace(
+                f"[TRACE-4 SUBCTX-OUTPUT] rid={req.rid} extra_key={seg_key!r} "
+                f"block={owned} generated={len(token_ids) - prompt_len} "
+                f"dup={max(result.prefix_len - owned, 0)}"
+            )
+        return True
 
     @host_timer.timed("cache_unfinished")
     def cache_unfinished_req(self, req: Req, chunked=False):
@@ -560,14 +702,17 @@ class RadixCache(BasePrefixCache):
         # Sub-context (Stage B): insert the prompt as one node PER sub-context namespace
         # instead of a single default-namespace node. Handles chunked prefill too: each
         # chunk extends every namespace by the newly-covered slice of its segment
-        # (`sub_context_owned_lens` tracks per-segment progress). NOTE: this deliberately
-        # does not wire cross-namespace prefix matching for decode continuation, so
-        # generated output is not correct yet -- the goal is an observable per-namespace
-        # tree that also survives chunked prefill without leaking/double-freeing KV.
+        # (`sub_context_owned_lens` tracks per-segment progress). NOTE: matching is
+        # still per namespace with no cross-namespace attention correction, so reuse
+        # across blocks remains an approximation; the generated continuation is added
+        # to the last block's namespace at finish time, not here.
+        #
+        # The gate must stay equivalent to the one the read path uses in
+        # `Req.init_next_round_input`, or matches and inserts land in different
+        # namespaces; `supports_sub_contexts` is what both consult.
         if (
             req.has_sub_contexts
-            and self.page_size == 1
-            and not self.is_eagle
+            and self.supports_sub_contexts()
             and len(token_ids) <= sum(len(s) for s in req.sub_context_ids)
         ):
             self._cache_unfinished_sub_contexts(req, token_ids, kv_indices)
@@ -665,9 +810,33 @@ class RadixCache(BasePrefixCache):
             seg_key_ids = token_ids[offset:covered_end]
             radix_key = RadixKey(seg_key_ids, seg_key)
 
+            # First writer wins. These KV were computed at [offset, covered_end);
+            # if the namespace already holds this token sequence from a request
+            # that computed it somewhere else, merging the two would leave one
+            # node standing for two rotations. Stop here instead: this block and
+            # every block after it keep the slots this request computed (freed at
+            # finish time), the tree keeps its single canonical copy, and nothing
+            # downstream can hand either one out at the wrong position.
+            probe = self.match_prefix(MatchPrefixParams(key=radix_key))
+            probe_hit = len(probe.device_indices)
+            existing = self.matched_canonical_position(
+                probe.last_device_node, probe_hit
+            )
+            if existing is not None and existing != offset:
+                if TRACE_ON:
+                    trace(
+                        f"[TRACE-4 SUBCTX-MOVED-WRITE] rid={req.rid} "
+                        f"extra_key={seg_key!r} offset={offset} canonical={existing} "
+                        f"hit={probe_hit} -- not inserted"
+                    )
+                break
+
             result = self.insert(
                 InsertParams(
-                    key=radix_key, value=values[offset:covered_end], priority=priority
+                    key=radix_key,
+                    value=values[offset:covered_end],
+                    priority=priority,
+                    canonical_position=offset,
                 )
             )
             # Free freshly-computed slots that duplicate what is already in this
@@ -844,9 +1013,11 @@ class RadixCache(BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        new_node.canonical_position = child.canonical_position
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
+        child.canonical_position += split_len
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         # Split hash_value if it was already computed, otherwise leave as None
@@ -856,7 +1027,17 @@ class RadixCache(BasePrefixCache):
 
         return new_node
 
-    def _insert_helper(self, node: TreeNode, key: RadixKey, value, priority: int = 0):
+    def _insert_helper(
+        self,
+        node: TreeNode,
+        key: RadixKey,
+        value,
+        priority: int = 0,
+        canonical_position: int = 0,
+    ):
+        # `canonical_position` is where key[0] sits in the prompt: 0 for an ordinary
+        # request, the block's offset for a sub-context block. Every node created
+        # below records where its own first token sits.
         # Convert None priority to 0
         if priority is None:
             priority = 0
@@ -893,6 +1074,7 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            new_node.canonical_position = canonical_position + total_prefix_length
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)
