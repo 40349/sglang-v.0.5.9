@@ -603,11 +603,23 @@ async def server_info():
     if hasattr(_global_state.tokenizer_manager.server_args, "model_config"):
         del _global_state.tokenizer_manager.server_args.model_config
 
+    # The sub-context arm is selected by env vars, not server_args, so it would not
+    # show up here otherwise -- and a client on another machine cannot read the server
+    # log to find out which arm it is talking to. Reporting it is what lets a remote
+    # `run_mas.sh record` refuse an arm that is not the one it was asked for.
+    from sglang.srt.utils import subctx_config
+
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
         "internal_states": internal_states,
         "version": __version__,
+        "sub_context": {
+            "split_enabled": not subctx_config.DISABLE_SUBCONTEXT,
+            "rotate": subctx_config.ROTATE_SUBCONTEXT,
+            "rotate_across_recompute": subctx_config.ROTATE_ACROSS_RECOMPUTE,
+            "cache_output": subctx_config.CACHE_SUBCONTEXT_OUTPUT,
+        },
     }
 
 

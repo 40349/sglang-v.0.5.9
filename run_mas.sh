@@ -7,20 +7,33 @@
 #
 # Everything lands in ab_out/maslab. SWE-bench is run_swe.sh.
 #
+# REMOTE SERVER. Set SERVER_URL to run MASLab here against a server on another box
+# (the H200): `record` then drives it over HTTP and `eval` scores the local results,
+# neither of which needs the GPU. `toggle` does NOT work that way -- it restarts the
+# server three times with different env vars and reads traces the server writes on its
+# own disk -- so run `toggle` on the server box, where the capture already is.
+#
+#   SERVER_URL=http://140.118.202.100:30000 \
+#     METHOD=agentverse MAS_CONFIG= DATASET=humaneval TAG=av_he_on ./run_mas.sh record
+#
 # METHOD / MAS_CONFIG / DATASET / TAG / REQUESTS / SUBCTX_OFF are overridable so
 # run_matrix.sh can drive four combinations through this script; edit the rest here.
 set -euo pipefail
 
-REPO=/home/t2503-3090/Desktop/MiaoChen/sglang-v.0.5.9
-OUT=$REPO/ab_out/maslab
-MODEL=QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
-PORT=30000
-CTXLEN=16384
-GEN_TOKENS=32          # replay generates a fixed length so both arms do equal work
-ENV=sglangv59
-MASLAB=/home/t2503-3090/Desktop/MiaoChen/MASLab
-MAS_MODEL=Qwen3-Coder-30B-A3B
-MAS_TEMP=0.0
+# Overridable so the same script runs on the 3090 (MASLab side) and on the H200
+# (where `toggle` has to run, next to the server and its traces).
+REPO=${REPO:-/home/t2503-3090/Desktop/MiaoChen/sglang-v.0.5.9}
+OUT=${OUT:-$REPO/ab_out/maslab}
+MODEL=${MODEL:-QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ}
+QUANT=${QUANT-moe_wna16}   # set empty on a box with the VRAM for bf16 weights
+PORT=${PORT:-30000}
+CTXLEN=${CTXLEN:-16384}
+GEN_TOKENS=${GEN_TOKENS:-32}   # replay generates a fixed length so both arms do equal work
+ENV=${ENV:-sglangv59}
+CONDA_SH=${CONDA_SH:-/home/t2503-3090/miniconda3/etc/profile.d/conda.sh}
+MASLAB=${MASLAB:-/home/t2503-3090/Desktop/MiaoChen/MASLab}
+MAS_MODEL=${MAS_MODEL:-Qwen3-Coder-30B-A3B}
+MAS_TEMP=${MAS_TEMP:-0.0}
 
 METHOD=${METHOD:-autogen}
 MAS_CONFIG=${MAS_CONFIG:-config_code}
@@ -30,11 +43,36 @@ SUF=${TAG:+_$TAG}
 REQUESTS=${REQUESTS:-$OUT/requests$SUF.jsonl}
 INFER=${INFER:-$OUT/infer$SUF.jsonl}   # overridable so a pre-split run can still be scored
 
+# Empty => this box runs the server too (the original single-machine setup).
+SERVER_URL=${SERVER_URL:-}
+if [ -n "$SERVER_URL" ]; then REMOTE=1; else REMOTE=0; SERVER_URL=http://127.0.0.1:$PORT; fi
+
 mkdir -p "$OUT"
-source /home/t2503-3090/miniconda3/etc/profile.d/conda.sh
+source "$CONDA_SH"
 conda activate $ENV
 export PYTHONNOUSERSITE=1        # ~/.local has a broken torch dist-info ahead of the env
 export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
+
+# Wait for a server on another box and refuse if it is not the arm we asked for.
+remote_check() {
+  echo -n "waiting for $SERVER_URL"
+  for _ in $(seq 1 300); do
+    if curl -sf "$SERVER_URL/health" > /dev/null 2>&1; then echo " up"; break; fi
+    echo -n .; sleep 2
+  done
+  if ! curl -sf "$SERVER_URL/health" > /dev/null 2>&1; then
+    echo " UNREACHABLE"
+    echo "  A Slurm job runs on whichever compute node was allocated, so its address"
+    echo "  changes every submission -- read the URL out of the job log. If that node"
+    echo "  is not routable from here, the server box has to run the client too."
+    exit 1
+  fi
+  python "$REPO/scripts/subcontext_sim/check_remote_arm.py" "$SERVER_URL" \
+    --split "$( [ -n "${SUBCTX_OFF:-}" ] && echo false || echo true )" \
+    --rotate "$( [ -n "${SUBCTX_ROTATE:-}" ] && echo true || echo false )" \
+    --maslab-config "$MASLAB/model_api_configs/model_api_config.json" \
+    --model "$MAS_MODEL"
+}
 
 # The server command lives here, once. Callers set LOG, and optionally CAPTURE /
 # TRACE / STAGE / SUBCTX_OFF / SUBCTX_TRACE / SUBCTX_ROTATE / SUBCTX_ROTATE_ACROSS
@@ -54,7 +92,7 @@ launch() {
   nohup python -u -m sglang.launch_server \
     --model-path $MODEL \
     --context-length $CTXLEN \
-    --quantization moe_wna16 \
+    ${QUANT:+--quantization $QUANT} \
     --tool-call-parser qwen3_coder \
     --enable-cache-report \
     --port $PORT \
@@ -89,16 +127,22 @@ case "${1:-}" in
     : "${TAG:?set TAG so this capture does not overwrite another combination}"
     # RESUME keeps both files so MASLab's own reserve_unprocessed_queries can pick
     # up where a killed run stopped; the capture then holds both attempts.
-    if [ -z "${RESUME:-}" ]; then rm -f "$REQUESTS" "$INFER"; fi
-    LOG=$OUT/server_record$SUF.log CAPTURE=$REQUESTS launch
-    if [ -n "${SUBCTX_OFF:-}" ]; then
-      grep -q "Sub-context split DISABLED" $OUT/server_record$SUF.log \
-        || { echo "REFUSING: SUBCTX_OFF set but the split did not report itself disabled"; exit 1; }
+    if [ -z "${RESUME:-}" ]; then rm -f "$INFER"; [ "$REMOTE" = 1 ] || rm -f "$REQUESTS"; fi
+    if [ "$REMOTE" = 1 ]; then
+      # The server is on another box, already up with its arm baked in at start. The
+      # capture and traces land on ITS disk, which is also where `toggle` needs them.
+      remote_check | tee "$OUT/serverinfo$SUF.txt"
+    else
+      LOG=$OUT/server_record$SUF.log CAPTURE=$REQUESTS launch
+      if [ -n "${SUBCTX_OFF:-}" ]; then
+        grep -q "Sub-context split DISABLED" $OUT/server_record$SUF.log \
+          || { echo "REFUSING: SUBCTX_OFF set but the split did not report itself disabled"; exit 1; }
+      fi
+      # The KV pool size decides whether the A/B measures the split or the eviction
+      # policy. Record what the server actually got: 30B AWQ on 24GB leaves little.
+      grep -m1 -o "max_total_num_tokens=[0-9]*" $OUT/server_record$SUF.log \
+        | tee $OUT/kvpool$SUF.txt || echo "WARNING: could not read KV pool size"
     fi
-    # The KV pool size decides whether the A/B measures the split or the eviction
-    # policy. Record what the server actually got: 30B AWQ on 24GB leaves little.
-    grep -m1 -o "max_total_num_tokens=[0-9]*" $OUT/server_record$SUF.log \
-      | tee $OUT/kvpool$SUF.txt || echo "WARNING: could not read KV pool size"
     # MASLab must not import sglang from the fork tree.
     ( unset PYTHONPATH; cd $MASLAB && python inference.py \
         --method_name "$METHOD" \
@@ -107,12 +151,26 @@ case "${1:-}" in
         --model_name $MAS_MODEL \
         --model_temperature $MAS_TEMP \
         --output_path "$INFER" )
-    stop
-    echo "captured $(wc -l < "$REQUESTS" 2>/dev/null || echo 0) requests -> $REQUESTS"
-    echo "inference results -> $INFER"
+    if [ "$REMOTE" = 1 ]; then
+      echo "inference results -> $INFER"
+      echo "the capture and traces are on the server box, under its traces/ dir;"
+      echo "run 'toggle' there -- it needs them and it restarts the server per arm."
+    else
+      stop
+      echo "captured $(wc -l < "$REQUESTS" 2>/dev/null || echo 0) requests -> $REQUESTS"
+      echo "inference results -> $INFER"
+    fi
     ;;
 
   toggle)
+    # Three arms means three server restarts, and the traces it compares are written
+    # on the server's own disk. Neither is reachable from another box.
+    [ "$REMOTE" = 1 ] && {
+      echo "REFUSING: 'toggle' restarts the server per arm and reads traces it writes"
+      echo "locally, so it must run ON the server box. The capture is already there;"
+      echo "unset SERVER_URL and run this script from the checkout on that machine."
+      exit 1
+    }
     [ -s "$REQUESTS" ] || { echo "no capture at $REQUESTS; run '$0 record' first"; exit 1; }
     echo "captured $(wc -l < "$REQUESTS") requests"
 
