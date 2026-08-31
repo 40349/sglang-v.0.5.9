@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """Explain the contiguity rule's discards from a SUBCTX_TRACE server log.
 
-`_stitch_sub_contexts` reuses a segment's hit only while the reused slots still
-form a contiguous prefix from position 0. With a [system][messages] split that
-collapses to one rule: the messages hit is spendable if and only if the system
-segment hit in full. So every discarded token is a messages hit gated by the
-much smaller system block, and the question is why that small block ever misses.
+With a [system][messages] split the contiguity rule collapses to one condition: the
+messages hit is spendable iff the system segment hit in full. So every discarded
+token is a messages hit gated by the smaller system block, and the question is why
+that block ever misses. Two causes with different fixes:
 
-Two candidate causes, with different fixes:
-  eviction    the system block is in the tree but gets pushed out under memory
-              pressure -> pin the namespace, or reserve for it.
-  never there the block is not being inserted correctly -> a bug, and fixing it
-              would recover the discards outright.
+  eviction     in the tree but pushed out under memory pressure -> pin or reserve.
+  never there  not inserted correctly -> a bug; fixing it recovers the discards.
 
-Eviction predicts discards that START LATE and track KV-pool occupancy.
-A broken insert predicts discards spread evenly from the first request.
+Eviction predicts discards that start LATE and track KV-pool occupancy; a broken
+insert predicts them spread evenly from the first request.
 """
 import re, sys
 from collections import OrderedDict, defaultdict

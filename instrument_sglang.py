@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Inject the same timing probes into another sglang installation.
 
-The baseline arm is a pristine upstream sglang in its own conda env. For its
-stage timings to be subtractable from this fork's, it needs byte-identical
-probes -- so this copies the two timing modules over and inserts the same hook
-lines, rather than anyone hand-editing a second copy.
+The baseline arm is a pristine upstream sglang in its own conda env; its stage
+timings are only subtractable from this fork's with byte-identical probes, so this
+copies the timing modules over and inserts the hook lines rather than hand-editing.
 
 Usage, from inside the baseline env:
 
@@ -13,12 +12,11 @@ Usage, from inside the baseline env:
     python .../instrument_sglang.py --check     # report status, change nothing
     python .../instrument_sglang.py --revert    # undo (restores .orig backups)
 
-Every edit is idempotent and backed up to <file>.orig on first touch. Probes are
-inserted above a `def`, never inside a body, because upstream's function bodies
-differ from this fork's -- only the signatures have to line up.
+Every edit is idempotent and backed up to <file>.orig on first touch. Probes go
+above a `def`, never inside a body: upstream's bodies differ, only signatures line up.
 
-`subctx_split` will be reported as absent on upstream: there is no
-_compute_sub_context_ids there. That is the point -- its baseline cost is zero.
+`subctx_split` reports as absent on upstream -- there is no _compute_sub_context_ids
+there, which is the point: its baseline cost is zero.
 """
 
 from __future__ import annotations

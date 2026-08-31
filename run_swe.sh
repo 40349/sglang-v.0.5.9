@@ -105,12 +105,16 @@ TXT
 
     stop
 
-    echo; echo "======== GPU (CUDA events) ========"
-    python $REPO/subcontext_bench.py report $OUT/trace_base.jsonl $OUT/trace_sub.jsonl
-    echo; echo "======== HOST (CPU stages) ========"
-    python $REPO/subcontext_bench.py stages $OUT/stage_base $OUT/stage_sub
-    echo; echo "======== PARITY (generated text) ========"
-    python $REPO/subcontext_bench.py parity $OUT/client_base.json $OUT/client_sub.json || true
+    # Keep a copy of the tables: they are otherwise only in the terminal. The inputs
+    # stay on disk, so this is a convenience, not the record of the run.
+    {
+      echo; echo "======== GPU (CUDA events) ========"
+      python $REPO/subcontext_bench.py report $OUT/trace_base.jsonl $OUT/trace_sub.jsonl
+      echo; echo "======== HOST (CPU stages) ========"
+      python $REPO/subcontext_bench.py stages $OUT/stage_base $OUT/stage_sub
+      echo; echo "======== PARITY (generated text) ========"
+      python $REPO/subcontext_bench.py parity $OUT/client_base.json $OUT/client_sub.json || true
+    } | tee $OUT/tables.txt
     ;;
 
   *)

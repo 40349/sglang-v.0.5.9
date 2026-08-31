@@ -2,9 +2,8 @@
 Unit tests for the sub-context path of RadixCache.
 
 A sub-context request has its prompt split into ordered blocks, each matched and
-inserted under its own ``extra_key`` namespace. These tests drive the full
-lifecycle on CPU tensors -- match, per-namespace insert, finish -- and cover the
-invariants that path depends on:
+inserted under its own ``extra_key`` namespace. These drive the full lifecycle on
+CPU tensors -- match, insert, finish -- and cover its invariants:
 
 - read and write must agree on whether the cache can serve the split at all,
 - a namespace must stay pinned to one absolute position in the prompt,
@@ -50,9 +49,23 @@ class FakeReqToTokenPool:
 class FakeAllocator:
     """Records freed slots instead of managing a pool."""
 
-    def __init__(self):
+    def __init__(self, next_slot: int = 900, capacity: int = 10**6):
         self.device = torch.device("cpu")
         self.freed = []
+        self.allocated = []
+        self.next_slot = next_slot
+        self.capacity = capacity
+
+    def alloc(self, need_size: int):
+        if need_size > self.capacity:
+            return None  # pool full: the caller must fall back to recomputing
+        self.capacity -= need_size
+        out = torch.arange(
+            self.next_slot, self.next_slot + need_size, dtype=torch.int64
+        )
+        self.next_slot += need_size
+        self.allocated.extend(out.tolist())
+        return out
 
     def free(self, indices):
         self.freed.extend(indices.tolist())
@@ -61,9 +74,34 @@ class FakeAllocator:
         return 0
 
 
-def make_cache(page_size: int = 1, is_eagle: bool = False, disable: bool = False):
+class FakeRotator:
+    """Stands in for the Triton kernel: records the deltas, moves no real KV.
+
+    The kernel's arithmetic is covered on GPU by ``test_rotate_kv.py``; what these
+    tests check is the bookkeeping around it -- which slots get allocated, what ends up
+    in prefix_indices, and that everything is freed exactly once.
+    """
+
+    def __init__(self, max_delta: int = 10**6):
+        self.max_delta = max_delta
+        self.calls = []
+
+    def can_rotate(self, delta: int) -> bool:
+        return delta != 0 and abs(delta) <= self.max_delta
+
+    def rotate_into(self, dst_loc, src_loc, delta):
+        self.calls.append((src_loc.tolist(), dst_loc.tolist(), delta))
+
+
+def make_cache(
+    page_size: int = 1,
+    is_eagle: bool = False,
+    disable: bool = False,
+    rotator=None,
+    capacity: int = 10**6,
+):
     pool = FakeReqToTokenPool()
-    allocator = FakeAllocator()
+    allocator = FakeAllocator(capacity=capacity)
     cache = RadixCache(
         CacheInitParams(
             disable=disable,
@@ -73,6 +111,7 @@ def make_cache(page_size: int = 1, is_eagle: bool = False, disable: bool = False
             is_eagle=is_eagle,
         )
     )
+    cache.kv_rotator = rotator
     return cache, pool, allocator
 
 
@@ -100,8 +139,27 @@ def prefill(cache, pool, req: Req, first_slot: int) -> None:
     reused = len(req.prefix_indices)
     pool.req_to_token[req.req_pool_idx, :reused] = req.prefix_indices
     pool.req_to_token[req.req_pool_idx, reused:n] = slots[reused:n]
+    # `prepare_for_extend` does this: once req_to_token holds them, rotated copies are
+    # freed from there, and keeping the request's own claim would free them twice.
+    req.sub_context_rotated_slots = None
     req.fill_ids = list(req.origin_input_ids)
     cache.cache_unfinished_req(req)
+
+
+def prefill_chunk(cache, pool, req: Req, upto: int, first_slot: int) -> None:
+    """One chunked-prefill pass covering origin_input_ids[:upto].
+
+    Mirrors `prefill`, but stops short of the prompt so the next pass picks up where
+    `cache_unfinished_req` left `prefix_indices` -- which is the whole point of the
+    Stage 2 path, since the scheduler does not re-match a chunked request.
+    """
+    reused = len(req.prefix_indices)
+    pool.req_to_token[req.req_pool_idx, :reused] = req.prefix_indices
+    fresh = torch.arange(first_slot, first_slot + (upto - reused), dtype=torch.int64)
+    pool.req_to_token[req.req_pool_idx, reused:upto] = fresh
+    req.sub_context_rotated_slots = None  # as prepare_for_extend does
+    req.fill_ids = list(req.origin_input_ids[:upto])
+    cache.cache_unfinished_req(req, chunked=True)
 
 
 def decode_and_finish(cache, pool, req: Req, output_ids, first_slot: int) -> None:
@@ -287,6 +345,214 @@ class TestMovedBlocks(unittest.TestCase):
         # [1,2] was already there as a prefix (it only splits a node) and [7,8] was
         # refused, so the tree still holds exactly one copy of each token sequence.
         self.assertEqual(cache.total_size(), before)
+
+
+class TestRotatedBlocks(unittest.TestCase):
+    """A displaced hit is copied to fresh slots and rotated, instead of dropped."""
+
+    TOOLS_KEY = "tools_key"
+
+    def _seed(self, rotator=None, capacity: int = 10**6):
+        """Cache SYS[1,2,3]@0, TOOLS[7,8]@3, MSG[20,21]@5."""
+        cache, pool, allocator = make_cache(rotator=rotator, capacity=capacity)
+        first = make_req(
+            "r1",
+            [[1, 2, 3], [7, 8], [20, 21]],
+            [SYS_KEY, self.TOOLS_KEY, MSG_KEY],
+        )
+        prefill(cache, pool, first, first_slot=100)
+        decode_and_finish(cache, pool, first, [], first_slot=200)
+        return cache, pool, allocator
+
+    def _shifted_req(self):
+        """TOOLS[7,8] now sits at offset 2 instead of 3, so delta is -1."""
+        return make_req(
+            "r2",
+            [[1, 2], [7, 8], [40, 41]],
+            [SYS_KEY, self.TOOLS_KEY, MSG_KEY],
+            req_pool_idx=1,
+        )
+
+    def test_displaced_hit_is_rotated_into_the_prefix(self):
+        rotator = FakeRotator()
+        cache, pool, allocator = self._seed(rotator)
+        req = self._shifted_req()
+        req.init_next_round_input(cache)
+
+        # The head is reused where it is; the displaced block is rotated by
+        # offset - canonical = 2 - 3 and stitched from its fresh copy.
+        self.assertEqual(rotator.calls, [([103, 104], [900, 901], -1)])
+        self.assertEqual(req.prefix_indices.tolist(), [100, 101, 900, 901])
+        self.assertEqual(req.sub_context_rotated, 2)
+        self.assertEqual(req.sub_context_moved, 0)
+        req.release_sub_context_match_locks(cache)
+        req.release_sub_context_rotated_slots(cache)
+
+    def test_without_a_rotator_the_hit_is_still_dropped(self):
+        cache, pool, allocator = self._seed(rotator=None)
+        req = self._shifted_req()
+        req.init_next_round_input(cache)
+
+        self.assertEqual(req.prefix_indices.tolist(), [100, 101])
+        self.assertEqual(req.sub_context_rotated, 0)
+        self.assertEqual(req.sub_context_moved, 2)
+        req.release_sub_context_match_locks(cache)
+
+    def test_a_full_pool_falls_back_to_dropping(self):
+        """An allocator that cannot hand out slots must not change the outcome."""
+        rotator = FakeRotator()
+        cache, pool, allocator = self._seed(rotator, capacity=0)
+        req = self._shifted_req()
+        req.init_next_round_input(cache)
+
+        self.assertEqual(rotator.calls, [])
+        self.assertEqual(req.prefix_indices.tolist(), [100, 101])
+        self.assertEqual(req.sub_context_rotated, 0)
+        self.assertEqual(req.sub_context_moved, 2)
+        req.release_sub_context_match_locks(cache)
+
+    def test_rotated_copy_is_never_inserted(self):
+        """The tree keeps one rotation per token sequence: the first writer's."""
+        rotator = FakeRotator()
+        cache, pool, allocator = self._seed(rotator)
+        req = self._shifted_req()
+        prefill(cache, pool, req, first_slot=300)
+
+        hit = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey([7, 8], self.TOOLS_KEY))
+        )
+        self.assertEqual(hit.device_indices.tolist(), [103, 104])
+        self.assertEqual(cache.matched_canonical_position(hit.last_device_node, 2), 3)
+        # ... and the block after the un-inserted one still gets cached, which a
+        # `break` on the position conflict would have prevented.
+        self.assertEqual(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey([40, 41], MSG_KEY))
+            ).device_indices.tolist(),
+            [304, 305],
+        )
+        self.assertEqual(req.sub_context_tree_owned, [True, False, True])
+
+    def test_restitch_clears_stale_ownership(self):
+        """A re-scheduled request must not inherit last attempt's tree ownership.
+
+        Retraction frees the request's KV, so a block that was tree-owned then may be
+        this request's to free now; a stale True would leak it at finish.
+        """
+        rotator = FakeRotator()
+        cache, pool, allocator = self._seed(rotator)
+        req = self._shifted_req()
+        prefill(cache, pool, req, first_slot=300)
+        self.assertEqual(req.sub_context_tree_owned, [True, False, True])
+
+        req.init_next_round_input(cache)  # as a retracted request would re-stitch
+        self.assertIsNone(req.sub_context_tree_owned)
+        req.release_sub_context_match_locks(cache)
+        req.release_sub_context_rotated_slots(cache)
+
+    def test_rotated_copy_is_freed_exactly_once(self):
+        rotator = FakeRotator()
+        cache, pool, allocator = self._seed(rotator)
+        req = self._shifted_req()
+        prefill(cache, pool, req, first_slot=300)
+        allocator.freed.clear()
+        decode_and_finish(cache, pool, req, [9], first_slot=400)
+
+        # The rotated copy of [7,8] and the generated token. The tree owns the head
+        # and the tail block, so neither is freed, and nothing is freed twice.
+        self.assertEqual(sorted(allocator.freed), [400, 900, 901])
+        self.assertEqual(len(allocator.freed), len(set(allocator.freed)))
+
+    def test_append_leaves_a_token_to_compute(self):
+        """A pass with nothing to compute is not a valid batch, so the append stops
+        one token short of the prompt exactly as the stitch does."""
+        import sglang.srt.utils.subctx_config as subctx_config
+
+        rotator = FakeRotator()
+        cache, pool, allocator = self._seed(rotator)
+        original = subctx_config.ROTATE_ACROSS_RECOMPUTE
+        subctx_config.ROTATE_ACROSS_RECOMPUTE = True
+        try:
+            # Six prompt tokens, and the rotatable block is the last one: taking it
+            # whole would cover the lot.
+            req = make_req(
+                "r2",
+                [[1, 2, 9, 10], [7, 8]],
+                [SYS_KEY, self.TOOLS_KEY],
+                req_pool_idx=1,
+            )
+            req.init_next_round_input(cache)
+            self.assertEqual(req.sub_context_next_boundary, 4)
+
+            prefill_chunk(cache, pool, req, upto=4, first_slot=300)
+
+            # One of the block's two tokens is rotated in; the other is recomputed.
+            self.assertEqual(rotator.calls, [([103], [900], 1)])
+            self.assertEqual(req.sub_context_rotated, 1)
+            # The token the cap refused is a genuine drop, and it is reported by this
+            # pass -- the one that gave up on it -- not by the stitch.
+            self.assertEqual(req.sub_context_moved, 1)
+            self.assertEqual(req.sub_context_deferred_moved, 0)
+            self.assertEqual(len(req.prefix_indices), 5)
+
+            req.init_next_round_input()
+            self.assertEqual(req.extend_input_len, 1)
+        finally:
+            subctx_config.ROTATE_ACROSS_RECOMPUTE = original
+
+    def test_block_after_a_recompute_is_rotated_in(self):
+        """Stage 2: block 0 partially hits, and block 1 is still reused after it.
+
+        The stitch cannot take block 1 -- the tokens before it do not exist yet -- so
+        the chunk is cut at block 1's offset, and once the gap is computed the block is
+        rotated onto the end of the prefix instead of being recomputed.
+        """
+        import sglang.srt.utils.subctx_config as subctx_config
+
+        rotator = FakeRotator()
+        cache, pool, allocator = self._seed(rotator)
+        original = subctx_config.ROTATE_ACROSS_RECOMPUTE
+        subctx_config.ROTATE_ACROSS_RECOMPUTE = True
+        try:
+            req = make_req(
+                "r2",
+                [[1, 2, 9, 10], [7, 8], [22, 23]],
+                [SYS_KEY, self.TOOLS_KEY, MSG_KEY],
+                req_pool_idx=1,
+            )
+            req.init_next_round_input(cache)
+
+            # [1,2] of the head hits, [9,10] must be computed, so the stitch stops at
+            # 2 and the boundary is where TOOLS starts in THIS prompt.
+            self.assertEqual(req.prefix_indices.tolist(), [100, 101])
+            self.assertEqual(req.sub_context_next_boundary, 4)
+            # Held back, not reported as a drop: the append is about to attempt it,
+            # and a pass that reported the drop would have to un-report it later.
+            self.assertEqual(req.sub_context_moved, 0)
+            self.assertEqual(req.sub_context_deferred_moved, 2)
+
+            # The chunk the scheduler would cut at that boundary.
+            prefill_chunk(cache, pool, req, upto=4, first_slot=300)
+
+            # TOOLS was rotated by 4 - 3 and appended, so the prefix now runs past it.
+            self.assertEqual(rotator.calls, [([103, 104], [900, 901], 1)])
+            self.assertEqual(
+                req.prefix_indices.tolist(), [100, 101, 300, 301, 900, 901]
+            )
+            self.assertEqual(req.sub_context_rotated, 2)
+            # The append took all of it, so nothing was dropped after all.
+            self.assertEqual(req.sub_context_moved, 0)
+            self.assertEqual(req.sub_context_deferred_moved, 0)
+            # Only the head is tree-owned so far; the rotated block is this
+            # request's, and MSG has not been reached by any chunk yet.
+            self.assertEqual(req.cache_protected_len, 4)
+            self.assertEqual(req.sub_context_tree_owned, [True, False, False])
+
+            # The next pass picks up where this one left off: it has 2 tokens left.
+            req.init_next_round_input()
+            self.assertEqual(req.extend_input_len, 2)
+        finally:
+            subctx_config.ROTATE_ACROSS_RECOMPUTE = original
 
 
 class TestSubContextLifecycle(unittest.TestCase):

@@ -193,10 +193,9 @@ class SchedulePolicy:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             # NOTE: the prefix_indices must always be aligned with last_node
-            # Sub-context requests are matched/stitched per-namespace in
-            # Req.init_next_round_input (which always runs, unlike this LPM-only path),
-            # so the default-namespace match here is left as-is for sorting only and is
-            # harmlessly overwritten there.
+            # Sub-context requests are matched per-namespace in
+            # Req.init_next_round_input (which always runs, unlike this LPM-only
+            # path), so this match is for sorting only and is overwritten there.
             match_result = self.tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
@@ -242,34 +241,6 @@ class SchedulePolicy:
                         )
                     )
         return temporary_deprioritized
-
-    # Sub-context: superseded by Req._stitch_sub_contexts in schedule_batch.py, which
-    # runs unconditionally in init_next_round_input (this path is LPM-only). Kept here,
-    # commented out, for reference.
-    # def _match_sub_contexts(self, r: Req) -> None:
-    #     """Sub-context: match each sub-context block against its own radix namespace.
-    #
-    #     Records per-block hit lengths on ``r.sub_context_match_lens`` (parallel to
-    #     ``r.sub_context_extra_keys``) for later CCPE/WCA stages, and logs them so the
-    #     three per-namespace trees are observable. Does not mutate ``r.prefix_indices``.
-    #     """
-    #     match_lens: List[int] = []
-    #     for seg_ids, seg_key, _offset in r.iter_sub_contexts():
-    #         if len(seg_ids) == 0:
-    #             match_lens.append(0)
-    #             continue
-    #         seg_match = self.tree_cache.match_prefix(
-    #             MatchPrefixParams(
-    #                 key=RadixKey(token_ids=seg_ids, extra_key=seg_key)
-    #             )
-    #         )
-    #         hit = len(seg_match.device_indices)
-    #         match_lens.append(hit)
-    #         print(
-    #             f"[TRACE-4 RadixCache] sub-context match rid={r.rid} "
-    #             f"extra_key={seg_key!r} hit={hit}/{len(seg_ids)}"
-    #         )
-    #     r.sub_context_match_lens = match_lens
 
     @staticmethod
     def _sort_by_longest_prefix(
@@ -798,6 +769,16 @@ class PrefillAdder:
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
 
+            # Tokens this pass would have to compute to land on the block edge that
+            # makes the next block rotatable. Given up on when the gap does not fit the
+            # prefill budget: splitting there would cost an extra pass without reaching
+            # the boundary, and the ordinary chunking rules do better.
+            boundary_trunc = None
+            if req.sub_context_next_boundary is not None:
+                gap = req.sub_context_next_boundary - prefix_len
+                if 0 < gap <= self.rem_input_tokens:
+                    boundary_trunc = gap
+
             if (self.prefill_delayer_single_pass is not None) and (
                 not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                     local_prefillable=True
@@ -815,6 +796,27 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
+            elif (
+                boundary_trunc is not None
+                and boundary_trunc < input_tokens
+                and truncation_align_size is None
+                and (
+                    self.rem_chunk_tokens is None
+                    or boundary_trunc <= self.rem_chunk_tokens
+                )
+            ):
+                # Sub-context Stage 2: end this pass on a block edge so the block behind
+                # it can be rotated into the prefix instead of recomputed. Skipped when
+                # a truncation alignment is in force -- that constraint is about
+                # attention-kernel determinism and outranks a cache heuristic.
+                req.set_extend_input_len(boundary_trunc)
+                req.fill_ids = req.fill_ids[: prefix_len + boundary_trunc]
+
+                self.can_run_list.append(req)
+                self.new_chunked_req = req
+
+                self._req_inc_lock_ref(req)
+                self._update_prefill_budget(prefix_len, boundary_trunc, 0)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)

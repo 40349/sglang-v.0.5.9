@@ -1,18 +1,14 @@
 #!/bin/bash
 # Diagnostic replay: why does the contiguity rule discard so much?
 #
-# On av_he the split matched 265,398 tokens in the tree and could only spend
-# 227,812 of them -- 37,586 thrown away, more than twice the 18,271 it actually
-# gained. With a [system][messages] split the rule discards a segment's hit
-# only when an EARLIER segment failed to hit in full, so every one of those
-# tokens is a messages-block hit gated by the much smaller system block. There
-# are only four distinct system prompts in this workload, so after the first
-# occurrence each should stay in the tree -- unless it is being evicted, or
-# never inserted properly. Those two have very different fixes.
+# On av_he the split matched 265,398 tokens and spent only 227,812 -- 37,586 thrown
+# away vs 18,271 gained. With a [system][messages] split a hit is discarded only when
+# an EARLIER segment missed, so those are messages-block hits gated by the system
+# block. Only four distinct system prompts exist here, so each should stay in the
+# tree unless it is evicted or never inserted -- two very different fixes.
 #
-# SUBCTX_TRACE is deliberately ON here even though it bills its own debug output
-# to the mechanism: this run is for the per-namespace hit lengths, not timings.
-# Do not read GPU or host numbers out of it.
+# SUBCTX_TRACE is ON deliberately: this run is for per-namespace hit lengths. Do not
+# read GPU or host numbers out of it.
 set -euo pipefail
 
 REPO=/home/t2503-3090/Desktop/MiaoChen/sglang-v.0.5.9

@@ -254,18 +254,16 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
-    # Sub-contexts. An ordered list of logically-distinct blocks that
-    # openclaw splits a single request into (e.g. system_prompt / tools / messages).
-    # Each item is a dict {"content": str, "extra_key": str}. Every block is
-    # tokenized independently and matched/inserted in its own radix namespace
-    # (keyed by its extra_key), then stitched into a single sequence for one decode.
+    # Ordered, logically-distinct blocks of one request (e.g. system_prompt / tools /
+    # messages), each a dict {"content": str, "extra_key": str}. Every block is
+    # tokenized and matched/inserted in its own radix namespace, then stitched into a
+    # single sequence for one decode.
     sub_contexts: Optional[List[Dict[str, str]]] = None
 
-    # Sub-context: pre-split token ids for the same blocks, parallel to
-    # ``sub_context_extra_keys``. Used by the OpenAI chat path, which renders the chat
-    # template itself and therefore splits the rendered *ids* instead of raw text, so
-    # ``concat(sub_context_ids) == input_ids`` holds exactly. Ignored (with a warning)
-    # if that invariant does not hold.
+    # Pre-split token ids for the same blocks, parallel to ``sub_context_extra_keys``.
+    # Used by the OpenAI chat path, which renders the template itself and so splits the
+    # rendered *ids*: ``concat(sub_context_ids) == input_ids`` holds exactly, and the
+    # split is dropped with a warning if it does not.
     sub_context_ids: Optional[List[List[int]]] = None
     sub_context_extra_keys: Optional[List[str]] = None
 
@@ -328,27 +326,23 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             self._normalize_batch_inputs()
 
     def _normalize_sub_contexts(self):
-        """Sub-context: derive a single ``text`` prompt from ``sub_contexts``.
+        """Derive a single ``text`` prompt from ``sub_contexts``.
 
-        openclaw sends the request pre-split into ordered blocks. We concatenate
-        their contents so batch-size detection and the rest of the pipeline see one
-        single prompt; the actual per-block tokenization (and per-namespace radix
-        matching) happens in ``TokenizerManager._tokenize_one_request``.
+        The blocks are concatenated so batch-size detection and the rest of the
+        pipeline see one prompt; per-block tokenization happens in
+        ``TokenizerManager._tokenize_one_request``.
 
-        A request that also carries ``text`` or ``input_ids`` describes its prompt
-        twice, and the two descriptions have to agree: ``_tokenize_one_request``
-        builds the prompt from whichever it reaches first (``input_ids``, then the
-        blocks, then ``text``), so a disagreement means the request that runs is not
-        the request that was sent. ``input_ids`` wins there and cannot be compared
-        against block *text*, so the split is dropped; ``text`` is compared, and a
-        mismatch is a client error rather than a coin flip between two prompts.
+        A request carrying ``text`` or ``input_ids`` too describes its prompt twice,
+        and ``_tokenize_one_request`` uses whichever it reaches first (``input_ids``,
+        blocks, ``text``). ``input_ids`` wins there and cannot be compared against
+        block text, so the split is dropped; ``text`` is compared and a mismatch is a
+        client error rather than a coin flip between two prompts.
         """
         if not self.sub_contexts:
             return
         if self.input_ids is not None:
-            # Pre-tokenized input wins in `_tokenize_one_request`, so the blocks would
-            # describe a prompt that is never used. `sub_context_ids` is the field for
-            # splitting a pre-tokenized prompt.
+            # Pre-tokenized input wins in `_tokenize_one_request`, so the blocks
+            # would describe a prompt that is never used.
             logger.warning(
                 "Sub-context: ignoring `sub_contexts` because `input_ids` was also "
                 "provided; use `sub_context_ids` to split a pre-tokenized prompt."

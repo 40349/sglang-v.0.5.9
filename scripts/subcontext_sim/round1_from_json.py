@@ -2,17 +2,16 @@
 """Sub-context round-1 driver.
 
 Reads an openclaw normalized-request JSON capture, splits it into the three
-sub-contexts (system_prompt / tools / messages), and POSTs a single
-`/generate` request to a running sglang server with the `sub_contexts` field.
+sub-contexts (system_prompt / tools / messages), and POSTs one `/generate` request
+to a running sglang server with the `sub_contexts` field.
 
-This exercises Stage 0 of the sub-context pipeline end-to-end: the server tokenizes
-each block independently, matches/inserts it in its own radix namespace, prints the
-three per-namespace radix trees (TRACE-1..4 + pretty_print), and decodes the turn-1
-output. See ~/.claude/plans/linked-wandering-bonbon.md.
+This exercises Stage 0 end-to-end: the server tokenizes each block independently,
+matches/inserts it in its own radix namespace, prints the three per-namespace radix
+trees (TRACE-1..4 + pretty_print), and decodes the turn-1 output.
 
 Usage:
     conda activate sglangv59
-    python scripts/cacheslide_sim/round1_from_json.py \
+    python scripts/subcontext_sim/round1_from_json.py \
         --json 2026-05-04T14-52-26-258Z_127_0001_chat_google_gemma-4-31b-it.json \
         --url http://127.0.0.1:30000 --max-new-tokens 128
 

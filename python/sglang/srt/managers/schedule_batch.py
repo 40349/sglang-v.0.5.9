@@ -106,9 +106,8 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
 
-# Sub-context: a request may carry a split this cache cannot serve (an explicit
-# `sub_contexts` body reaching a page_size>1 / EAGLE / ChunkCache server). It is
-# handled as a normal single-namespace request; say so once rather than per request.
+# A request may carry a split this cache cannot serve (page_size>1 / EAGLE /
+# ChunkCache). It falls back to a normal request; say so once, not per request.
 _warned_sub_contexts_unsupported = False
 
 
@@ -657,16 +656,38 @@ class Req(ReqDllmMixin):
         # inserted into its namespace, accumulated across chunked-prefill chunks. Used to
         # free only the freshly-computed duplicate slots (parallel to sub_context_ids).
         self.sub_context_owned_lens: Optional[List[int]] = None
-        # WCA: the absolute position each block's hit was *computed* at, parallel to
-        # sub_context_ids (None where the block missed). Equal to the block's own
-        # offset on the fast path; when it differs, `target - canonical` is the
-        # rotation a later stage has to apply to reuse those slots, and is why the
-        # hit is kept and locked rather than forgotten.
+        # The absolute position each block's hit was *computed* at, parallel to
+        # sub_context_ids (None on a miss). Equal to the block's own offset on the
+        # fast path; when it differs, `target - canonical` is the rotation a later
+        # stage must apply -- which is why the hit is kept and locked, not forgotten.
         self.sub_context_match_positions: Optional[List[Optional[int]]] = None
-        # Tokens matched in a namespace but computed at a different position, so
-        # dropped rather than stitched. A subset of `sub_context_discarded`, kept
-        # apart because this is the part a rotation could win back.
+        # Matched but computed at a different position, so dropped. A subset of
+        # `sub_context_discarded`: the part a rotation could win back -- and once
+        # rotation is on, the part it did *not* win back.
         self.sub_context_moved: int = 0
+        # Displaced hits recovered by rotating their K to the position they are being
+        # reused at. Drained by the forward trace like `sub_context_moved`.
+        self.sub_context_rotated: int = 0
+        # Slots holding rotated copies, allocated by this request and owned by it (the
+        # tree keeps only the canonical rotation, so these are never inserted). Ownership
+        # passes to `req_to_token` in `prepare_for_extend`, which is where the list is
+        # cleared: after that the normal free-from-req_to_token paths cover them, and
+        # freeing here as well would be a double free.
+        self.sub_context_rotated_slots: Optional[List[torch.Tensor]] = None
+        # Displaced hits the stitch is holding back rather than reporting as dropped,
+        # because a chunk boundary is about to be cut so `_rotate_append_sub_contexts`
+        # can try them. Settled there -- as rotated, or as moved for what it declined.
+        self.sub_context_deferred_moved: int = 0
+        # Offset of the first block past the stitched prefix that only needs a
+        # rotation to be reusable. Cutting the prefill chunk here lets
+        # `_rotate_append_sub_contexts` attach it once the tokens before it exist.
+        # None when there is no such block or Stage 2 is off.
+        self.sub_context_next_boundary: Optional[int] = None
+        # Per block, whether the radix tree owns that block's range of `req_to_token`.
+        # Blocks the tree declined (a rotated copy, or a position conflict) stay this
+        # request's to free, so the finish path cannot use one contiguous protected
+        # prefix. Parallel to sub_context_ids; None until the first insert pass.
+        self.sub_context_tree_owned: Optional[List[bool]] = None
 
         # # --- 強制攔截：只要是我們自訂的 subcontext，強制不生成任何新 token ---
         # if self.extra_key in ["system_prompt_key", "tools_key", "messages_key"]:
@@ -1005,21 +1026,15 @@ class Req(ReqDllmMixin):
             and self.has_sub_contexts
             and tree_cache.supports_sub_contexts()
         ):
-            # CCPE: sub-context requests are matched per-namespace, never against the
-            # default namespace (which would share a KV slot -- e.g. the warmup BOS --
-            # with a namespace node and trip the memory leak checker). The contiguous
-            # cached prefix is stitched from the per-namespace hits and reused.
+            # Matched per-namespace, never against the default one (which would share
+            # a KV slot -- e.g. the warmup BOS -- with a namespace node and trip the
+            # leak checker). The contiguous prefix is stitched from those hits.
             #
             # The `supports_sub_contexts` gate is not optional: only a cache that also
-            # *inserts* per namespace may be matched per namespace. Without it a
-            # page_size>1 / EAGLE / ChunkCache setup would probe namespaces nothing
-            # ever writes to (0% hit, forever) while its writes accumulate in the
-            # default namespace that no sub-context request ever reads -- and
-            # ChunkCache has no `root_node` for the tail of this method to fall back
-            # on, so it would raise once per request instead. Falling through to the
-            # single-namespace match below keeps such a server correct, just without
-            # the split; the launcher refuses the combination outright when the
-            # sub-context split is enabled.
+            # *inserts* per namespace may be matched per namespace, or it probes
+            # namespaces nothing writes to (0% forever). Falling through to the
+            # single-namespace match keeps such a server correct, just without the
+            # split; the launcher refuses the combination outright.
             self._stitch_sub_contexts(tree_cache)
         elif tree_cache is not None:
             if self.has_sub_contexts and not tree_cache.supports_sub_contexts():
@@ -1065,11 +1080,10 @@ class Req(ReqDllmMixin):
         self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
 
     def release_sub_context_match_locks(self, tree_cache: BasePrefixCache) -> None:
-        """WCA: drop the per-block match locks taken in ``_stitch_sub_contexts``.
+        """Drop the per-block match locks taken in ``_stitch_sub_contexts``.
 
-        Idempotent -- safe to call when nothing is held. Clears
-        ``sub_context_match_indices`` together with the nodes: once unlocked the slots
-        may be evicted, so keeping the indices around would leave dangling references.
+        Idempotent. Clears ``sub_context_match_indices`` with the nodes: once unlocked
+        the slots may be evicted, so keeping the indices would leave dangling refs.
         """
         if self.sub_context_match_nodes is None:
             self.sub_context_match_indices = None
@@ -1082,38 +1096,102 @@ class Req(ReqDllmMixin):
         self.sub_context_match_indices = None
         self.sub_context_match_positions = None
 
+    def release_sub_context_rotated_slots(self, tree_cache: BasePrefixCache) -> None:
+        """Free rotated copies this request allocated but never handed to req_to_token.
+
+        Only correct while the list is still owned here. ``prepare_for_extend`` clears
+        it (without freeing) the moment ``req_to_token`` takes over, so this stays a
+        no-op for any request that actually ran -- whose slots the ordinary
+        free-from-req_to_token paths already cover.
+        """
+        if not self.sub_context_rotated_slots:
+            self.sub_context_rotated_slots = None
+            return
+        for slots in self.sub_context_rotated_slots:
+            tree_cache.token_to_kv_pool_allocator.free(slots)
+        self.sub_context_rotated_slots = None
+
+    def _next_rotatable_boundary(
+        self,
+        tree_cache: BasePrefixCache,
+        match_lens: List[int],
+        match_positions: List[Optional[int]],
+        stitched: int,
+    ) -> Optional[int]:
+        """Where a chunk boundary would turn a dropped hit into a reuse.
+
+        The first block starting at or after the stitched prefix that hit its namespace
+        in full but at another position. The stitch cannot use it -- the tokens before
+        it do not exist yet -- but a chunk that ends exactly at its offset leaves it
+        flush with the covered prefix, which is what `_rotate_append_sub_contexts`
+        needs to rotate it in rather than recompute it.
+        """
+        from sglang.srt.utils import subctx_config
+
+        if not subctx_config.ROTATE_ACROSS_RECOMPUTE:
+            return None
+        if getattr(tree_cache, "kv_rotator", None) is None:
+            return None
+        for i, (seg_ids, _seg_key, offset) in enumerate(self.iter_sub_contexts()):
+            if not seg_ids or offset < stitched:
+                continue
+            position = match_positions[i]
+            if (
+                match_lens[i] == len(seg_ids)
+                and position is not None
+                and position != offset
+            ):
+                return offset
+        return None
+
+    def _rotate_sub_context_block(
+        self, tree_cache: BasePrefixCache, src_indices: torch.Tensor, delta: int
+    ) -> Optional[torch.Tensor]:
+        """Copy a block's KV to fresh slots with K rotated by ``delta``.
+
+        Returns the new slots, or None when rotation is unavailable for this delta or
+        the pool has no room -- in which case the caller must fall back to recomputing
+        the block, exactly as if the hit had never happened.
+
+        The copy is deliberate: ``src_indices`` belongs to a tree node other requests
+        hold a lock_ref on, and rotating it in place would corrupt every one of them.
+        """
+        rotator = getattr(tree_cache, "kv_rotator", None)
+        if rotator is None or not rotator.can_rotate(delta):
+            return None
+        dst = tree_cache.token_to_kv_pool_allocator.alloc(len(src_indices))
+        if dst is None:
+            return None
+        rotator.rotate_into(dst, src_indices, delta)
+        if self.sub_context_rotated_slots is None:
+            self.sub_context_rotated_slots = []
+        self.sub_context_rotated_slots.append(dst)
+        return dst
+
     def _stitch_sub_contexts(self, tree_cache: BasePrefixCache) -> None:
-        """CCPE: match each sub-context in its own namespace, log the hit, and stitch
-        the contiguous cached prefix so prefill reuses those KV slots.
+        """Match each sub-context in its own namespace and stitch the contiguous
+        cached prefix so prefill reuses those KV slots.
 
-        Matching is exhaustive: the loop never breaks, so every non-empty segment is
-        probed and its result is recorded even when the hit ends up unused -- that is
-        the raw material WCA needs. ``sub_context_match_lens`` holds the hit length,
-        ``sub_context_match_indices`` the actual KV slots, and
-        ``sub_context_match_nodes`` the owning nodes, which are lock-ref'd here so the
-        slots cannot be evicted out from under a later reuse pass. All three are
-        parallel to ``sub_context_ids``, with None/0 where a segment missed.
+        Matching is exhaustive -- every non-empty segment is probed and recorded even
+        when its hit goes unused. ``sub_context_match_lens`` / ``_match_indices`` /
+        ``_match_nodes`` are parallel to ``sub_context_ids`` (None/0 on a miss); the
+        nodes are lock-ref'd so the slots cannot be evicted under a later reuse pass.
 
-        Reuse is the conservative part. A segment's hit is stitched in only while the
-        reused slots still form a contiguous prefix from position 0 *and* were
-        computed at the position they are being reused at. Contiguity is broken by a
-        partial hit (``take < len(seg_ids)``), by the ``input_len - 1`` cap that
-        keeps >=1 token to compute, by a segment that misses entirely, or by a hit
-        whose ``canonical_position`` is not this segment's offset. An empty segment
-        is skipped before any of that and leaves contiguity intact (the splitter
-        drops empty blocks, so this is a defensive case). Once broken, subsequent
-        segments are still matched but never reused.
+        Reuse requires the slots to form a contiguous prefix from position 0. A hit
+        computed at a *different* position no longer disqualifies itself: with rotation
+        enabled a whole-block hit is copied to fresh slots with its K rotated by
+        ``offset - canonical``, which is exact (see ``mem_cache/rotate_kv.py``).
+        Contiguity still breaks on a miss, a partial hit, the ``input_len - 1`` cap, or
+        a displaced hit that could not be rotated; empty segments are skipped and leave
+        it intact. Once broken, later segments are matched but never reused.
 
-        The stitched slots become ``prefix_indices`` (so ``#cached-token`` reflects the
-        reuse) and per-segment *reused* lengths -- 0 for matched-but-unused segments --
-        are seeded into ``sub_context_owned_lens`` so
-        ``RadixCache._cache_unfinished_sub_contexts`` treats them as already-owned and
-        does not free the reused slots.
+        Stitched slots become ``prefix_indices``, and per-segment reused lengths seed
+        ``sub_context_owned_lens`` so ``_cache_unfinished_sub_contexts`` treats them as
+        already-owned instead of freeing them.
 
-        NOTE (first-cut): only the match locks above are taken -- the *stitched* prefix
-        is still protected solely by them, so reuse remains safe only for as long as
-        they are held; full lock coverage lands with WCA. Decode output is still
-        approximate (no cross-namespace position/attention correction yet).
+        NOTE: only the match locks protect the stitched prefix, so reuse is safe only
+        while they are held. Rotation fixes the *position* a block is reused at, not the
+        *context* it was computed under, so decode output remains an approximation.
         """
 
         def _preview(ids, head: int = 10, tail: int = 5) -> str:
@@ -1123,8 +1201,11 @@ class Req(ReqDllmMixin):
             return f"{ids[:head]} ... {ids[-tail:]}"
 
         # A re-scheduled request (e.g. after retraction) stitches again; drop the locks
-        # the previous pass took before recording a fresh set.
+        # the previous pass took before recording a fresh set. Its rotated copies go
+        # too -- this pass will build its own, and a request that never reached
+        # `prepare_for_extend` is the only one whose slots are still ours to free.
         self.release_sub_context_match_locks(tree_cache)
+        self.release_sub_context_rotated_slots(tree_cache)
 
         max_prefix_len = max(len(self.fill_ids) - 1, 0)
         stitched: List[torch.Tensor] = []
@@ -1134,6 +1215,7 @@ class Req(ReqDllmMixin):
         match_nodes: List[Optional[Any]] = []
         match_positions: List[Optional[int]] = []
         moved = 0
+        rotated = 0
         total = 0
         contiguous = True
         for seg_ids, seg_key, _offset in self.iter_sub_contexts():
@@ -1154,20 +1236,18 @@ class Req(ReqDllmMixin):
             )
             match_positions.append(canonical)
             if hit > 0:
-                # Lock before the slots are handed to WCA: they must outlive scheduling
-                # and survive until forward has read them.
+                # Lock now: the slots must outlive scheduling and survive until
+                # forward has read them.
                 tree_cache.inc_lock_ref(seg_match.last_device_node)
                 match_nodes.append(seg_match.last_device_node)
                 match_indices.append(seg_match.device_indices)
             else:
                 match_nodes.append(None)
                 match_indices.append(None)
-            # A hit computed at another position is real cached content under the
-            # wrong rotation. Stitching it would feed K rotated for someone else's
-            # position into attention -- silently, and worst exactly where the
-            # cached prefix is longest. So it is dropped here, but kept locked and
-            # recorded above: `_offset - canonical` is what a later stage rotates
-            # by to turn this drop back into a reuse.
+            # A hit computed at another position is real content under the wrong
+            # rotation; stitching it would silently feed misrotated K into attention.
+            # Dropped, but kept locked and recorded: `_offset - canonical` is the
+            # rotation a later stage needs to turn this back into a reuse.
             displaced = canonical is not None and canonical != _offset
             if displaced:
                 moved += hit
@@ -1181,8 +1261,40 @@ class Req(ReqDllmMixin):
                 )
             take = 0
             if contiguous:
-                if hit == 0 or displaced:
+                if hit == 0:
                     contiguous = False
+                elif displaced:
+                    # `_offset - canonical` is the rotation that moves this block's K
+                    # to where it is about to be read. `_offset` is the position it
+                    # lands at precisely because contiguity still holds: every earlier
+                    # block was stitched whole, so the prompt layout and the stitched
+                    # layout agree up to here.
+                    #
+                    # A partial take is sound and load-bearing: the delta belongs to
+                    # the block, so it moves each of its tokens by the same amount, and
+                    # the `input_len - 1` cap otherwise refuses the *last* block whole
+                    # -- which in an agent prompt is `messages`, the one worth reusing.
+                    take = min(hit, max_prefix_len - total)
+                    rotated_indices = None
+                    if take > 0:
+                        rotated_indices = self._rotate_sub_context_block(
+                            tree_cache,
+                            seg_match.device_indices[:take],
+                            _offset - canonical,
+                        )
+                    if rotated_indices is None:
+                        # Rotation off, delta out of range, or the pool is full: keep
+                        # the original behaviour and drop the hit.
+                        take = 0
+                        contiguous = False
+                    else:
+                        stitched.append(rotated_indices)
+                        total += take
+                        # Won back, so it is no longer part of the moved drop.
+                        moved -= take
+                        rotated += take
+                        if take < len(seg_ids):
+                            contiguous = False
                 else:
                     take = min(hit, max_prefix_len - total)
                     if take <= 0:
@@ -1197,18 +1309,44 @@ class Req(ReqDllmMixin):
 
         self.sub_context_match_lens = match_lens
         self.sub_context_owned_lens = owned
+        # Rebuilt from scratch by the next insert pass. A re-scheduled request (after
+        # retraction) has had its KV freed, so last time's ownership is stale -- and a
+        # stale True means the finish path leaves this request's own slots unfreed.
+        self.sub_context_tree_owned = None
         self.sub_context_match_indices = match_indices
         self.sub_context_match_nodes = match_nodes
         self.sub_context_match_positions = match_positions
+        boundary = self._next_rotatable_boundary(
+            tree_cache, match_lens, match_positions, total
+        )
+        # Hold back the drops the append is about to attempt. Counting them here and
+        # cancelling them a pass later would make that pass report a negative drop --
+        # the totals would still come out right, but a negative token count in a trace
+        # row is the kind of thing that makes the whole dataset suspect.
+        deferred = 0
+        if boundary is not None:
+            for i, (seg_ids, _seg_key, off) in enumerate(self.iter_sub_contexts()):
+                if off < boundary or not seg_ids:
+                    continue
+                position = match_positions[i]
+                if (
+                    match_lens[i] == len(seg_ids)
+                    and position is not None
+                    and position != off
+                ):
+                    deferred += match_lens[i]
+                else:
+                    break  # the append cannot reach past this block anyway
+            moved -= deferred
+
         self.sub_context_moved = moved
-        # Matched but not stitched -- the tokens the contiguity rule threw away.
-        # The tree walk and the inc_lock_ref above were already paid for them, and
-        # prefix_indices keeps no trace, so this is the only place both halves
-        # exist. Record it here rather than letting a reader subtract
-        # len(prefix_indices) from sum(match_lens) downstream: that mixes a
-        # per-request quantity with a per-pass one, and chunked prefill rewrites
-        # prefix_indices between passes to include the chunk just computed, so the
-        # subtraction goes negative by exactly one chunk on every continuation.
+        self.sub_context_deferred_moved = deferred
+        self.sub_context_rotated = rotated
+        self.sub_context_next_boundary = boundary
+        # Matched but not stitched -- what the contiguity rule threw away. Recorded
+        # here because this is the only place both halves exist: subtracting
+        # len(prefix_indices) downstream goes negative on chunked prefill, which
+        # rewrites prefix_indices between passes.
         self.sub_context_discarded = sum(match_lens) - sum(owned)
         if stitched:
             self.prefix_indices = torch.cat(stitched)
@@ -1796,6 +1934,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
+            # `write_cache_indices` has just put prefix_indices -- rotated copies
+            # included -- into req_to_token, which is what the free paths walk. Drop our
+            # claim so they are not freed twice.
+            req.sub_context_rotated_slots = None
             assert seq_len - pre_len == req.extend_input_len
 
             req.extend_batch_idx += 1

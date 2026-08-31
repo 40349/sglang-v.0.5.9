@@ -1,15 +1,12 @@
 """Per-forward-pass GPU timing, for A/B-ing sub-context KV reuse.
 
-Enabled by setting ``SGLANG_FORWARD_TRACE`` to an output path. Every forward pass
-is bracketed by a pair of CUDA events and one JSON row is appended per pass, so a
-run can be compared against a run with the sub-context split turned off
-(``SGLANG_DISABLE_SUBCONTEXT=1``) without rebuilding or swapping checkouts.
+Set ``SGLANG_FORWARD_TRACE`` to an output path: every forward pass is bracketed by
+CUDA events and appends one JSON row, so the two arms are comparable on the same
+binary (``SGLANG_DISABLE_SUBCONTEXT=1`` for the baseline).
 
-The elapsed time is only read once the end event has actually completed
-(``Event.query()``), never by synchronising on it. That matters here: the
-scheduler runs the forward on a side stream under overlap scheduling, so a
-blocking ``elapsed_time()`` would stall the very pipeline being measured and
-inflate the numbers it reports.
+Elapsed time is read only once the end event has completed (``Event.query()``),
+never by synchronising: under overlap scheduling the forward runs on a side stream,
+so a blocking ``elapsed_time()`` would stall the pipeline being measured.
 """
 
 from __future__ import annotations
@@ -57,28 +54,25 @@ class ForwardTracer:
         bs = len(reqs)
 
         if batch.forward_mode.is_extend():
-            # Tokens actually pushed through the model this pass, vs. tokens served
-            # from the radix cache (the quantity sub-context reuse is meant to move).
+            # Tokens pushed through the model this pass vs. served from the radix
+            # cache -- the quantity sub-context reuse is meant to move.
             new_tokens = batch.extend_num_tokens or 0
             cached_tokens = sum(len(req.prefix_indices) for req in reqs)
-            # Per-namespace matching can find MORE than the contiguity rule lets it
-            # stitch: once a non-final segment misses or only partially hits, every
-            # later segment's hit is dropped even though it was matched and locked.
-            # prefix_indices holds only what was stitched, so that waste is invisible
-            # unless it is recorded next to it.
-            #
-            # The drop is taken from where `_stitch_sub_contexts` recorded it, and
-            # drained on read, so one stitch is counted once no matter how many
-            # forward passes chunked prefill splits the request into. Deriving it
-            # here from sum(sub_context_match_lens) instead would compare a
-            # per-request quantity against a per-pass one and report a negative
-            # drop of exactly one chunk on every continuation pass.
+            # Matching can find MORE than the contiguity rule stitches: after a
+            # non-final segment misses, every later hit is dropped though matched and
+            # locked, and prefix_indices keeps no trace of it. Taken from where
+            # `_stitch_sub_contexts` recorded it and drained on read, so one stitch is
+            # counted once however many chunks prefill splits into -- deriving it from
+            # sum(sub_context_match_lens) here would go negative on continuations.
             discarded_tokens = 0
-            # The part of the drop that is a *position* mismatch rather than a
-            # contiguity one: matched, locked, and thrown away only because the KV
-            # was computed elsewhere. That is the share a rotation could win back,
-            # so it is worth telling apart from the rest of the drop.
+            # The part of the drop caused by a *position* mismatch rather than
+            # contiguity, and still dropped: the share a rotation could have won back
+            # but did not (rotation off, delta out of range, or the pool was full).
             moved_tokens = 0
+            # Displaced hits that WERE won back, by copying the block to fresh slots
+            # with its K rotated to the position it is reused at. These are part of
+            # cached_tokens, so moved + rotated is the whole displaced population.
+            rotated_tokens = 0
             for req in reqs:
                 d = getattr(req, "sub_context_discarded", 0) or 0
                 if d:
@@ -88,11 +82,13 @@ class ForwardTracer:
                 if m:
                     req.sub_context_moved = 0
                     moved_tokens += m
+                r = getattr(req, "sub_context_rotated", 0) or 0
+                if r:
+                    req.sub_context_rotated = 0
+                    rotated_tokens += r
             matched_tokens = cached_tokens + discarded_tokens
-            # How many of these requests took the split path at all. A run with
-            # none of them did not observe zero drops -- the contiguity gate it
-            # would have measured is not in the code path. Reporting that as 0
-            # invites reading "0 vs 0" as evidence the gate behaves.
+            # How many of these requests took the split path at all. A run with none
+            # did not observe zero drops; without this, "0 vs 0" reads as evidence.
             sub_reqs = sum(1 for req in reqs if getattr(req, "has_sub_contexts", False))
         else:
             new_tokens = bs  # one token per sequence per decode step
@@ -100,6 +96,7 @@ class ForwardTracer:
             matched_tokens = 0
             discarded_tokens = 0
             moved_tokens = 0
+            rotated_tokens = 0
             sub_reqs = 0
 
         return {
@@ -111,6 +108,7 @@ class ForwardTracer:
             "matched_tokens": matched_tokens,
             "discarded_tokens": discarded_tokens,
             "moved_tokens": moved_tokens,
+            "rotated_tokens": rotated_tokens,
             "sub_reqs": sub_reqs,
             "t_rel": round(time.perf_counter() - self._t0, 6),
         }

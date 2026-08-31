@@ -746,17 +746,13 @@ class Scheduler(
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     def _check_sub_context_support(self):
-        """Sub-context: fail at launch, not once per request, on a cache that
-        cannot serve the split.
+        """Fail at launch, not per request, on a cache that cannot serve the split.
 
-        The split is on unless ``SGLANG_DISABLE_SUBCONTEXT`` says otherwise, so
-        every chat request would arrive split into per-namespace blocks. On a
-        cache that cannot insert per namespace those requests silently degrade
-        (matching namespaces nothing writes to) rather than fail, which is the
-        worst outcome to debug -- a run that looks healthy and caches nothing.
-        Requests that carry an explicit ``sub_contexts`` field still fall back to
-        the single-namespace path at runtime, so this only refuses the
-        configuration that would apply the split to everything.
+        The split is on unless ``SGLANG_DISABLE_SUBCONTEXT`` says otherwise, so every
+        chat request would arrive split. On a cache that cannot insert per namespace
+        they degrade silently instead of failing -- a run that looks healthy and caches
+        nothing. Explicit ``sub_contexts`` requests still fall back at runtime; this
+        only refuses the config that would split everything.
         """
         from sglang.srt.utils.subctx_config import (
             DISABLE_SUBCONTEXT,
@@ -772,6 +768,46 @@ class Scheduler(
                 "Launch without that option, or set SGLANG_DISABLE_SUBCONTEXT=1 to run "
                 "the single-namespace baseline."
             )
+        self._init_sub_context_rotation()
+
+    def _init_sub_context_rotation(self):
+        """Attach the KV rotator to the tree cache, or say why there is none.
+
+        Refusing loudly matters more here than for the split itself: an unsupported
+        RoPE would not fail, it would rotate by the wrong law and quietly degrade every
+        reused block. So an explicitly requested rotation that cannot be served raises,
+        and the default off-state just logs.
+        """
+        from sglang.srt.mem_cache.rotate_kv import KVRotator, find_rotary_embedding
+        from sglang.srt.utils.subctx_config import (
+            ROTATE_ACROSS_RECOMPUTE,
+            ROTATE_NATIVE,
+            ROTATE_SUBCONTEXT,
+            rotation_unsupported_reason,
+        )
+
+        if not (ROTATE_SUBCONTEXT or ROTATE_ACROSS_RECOMPUTE):
+            return
+        model_runner = self.tp_worker.model_runner
+        reason = rotation_unsupported_reason(model_runner, self.tree_cache)
+        if reason is not None:
+            raise ValueError(
+                f"Sub-context KV rotation is enabled but cannot be served: {reason}. "
+                "Unset SGLANG_SUBCONTEXT_ROTATE to run the plain split."
+            )
+        rotary, _ = find_rotary_embedding(model_runner.model)
+        self.tree_cache.kv_rotator = KVRotator(
+            model_runner.token_to_kv_pool,
+            rotary.cos_sin_cache,
+            rotary.rotary_dim,
+            use_native=ROTATE_NATIVE,
+        )
+        logger.info(
+            "Sub-context KV rotation ENABLED (max delta %d, across-recompute=%s%s)",
+            self.tree_cache.kv_rotator.max_delta,
+            ROTATE_ACROSS_RECOMPUTE,
+            ", native torch path" if ROTATE_NATIVE else "",
+        )
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []

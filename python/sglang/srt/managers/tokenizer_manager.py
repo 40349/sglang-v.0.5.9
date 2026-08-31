@@ -184,20 +184,16 @@ def _clip_sub_contexts_to_input(
     input_len: int,
     rid: str,
 ) -> Tuple[Optional[List[List[int]]], Optional[List[str]]]:
-    """Sub-context: restore ``concat(sub_context_ids) == input_ids``.
+    """Restore ``concat(sub_context_ids) == input_ids``.
 
-    ``_validate_one_request`` truncates an over-long prompt in place when
-    ``--allow-auto-truncate`` is set, which leaves the block list describing more
-    tokens than the prompt still has. Downstream that invariant is what makes the
-    per-block offsets absolute positions: the write path clamps each block to the
-    prefill length and degrades quietly, the match path would go on matching (and
-    stitching KV for) tokens that are no longer in the prompt, and only a length
-    assert deep in the insert path stands between that and corrupt reuse.
+    ``_validate_one_request`` truncates an over-long prompt in place under
+    ``--allow-auto-truncate``, leaving the blocks describing more tokens than remain.
+    That invariant is what makes the per-block offsets absolute positions, so without
+    this the match path stitches KV for tokens no longer in the prompt.
 
-    Truncation only ever removes a suffix, so the fix is the same cut applied to
-    the blocks: keep whole blocks while they fit, clip the one that straddles the
-    new end, drop the rest. Returns ``(None, None)`` if nothing is left, which
-    turns the request back into an ordinary single-namespace one.
+    Truncation only removes a suffix, so apply the same cut: keep whole blocks while
+    they fit, clip the straddling one, drop the rest. ``(None, None)`` if nothing is
+    left, which makes the request an ordinary single-namespace one.
     """
     total = sum(len(seg) for seg in sub_context_ids)
     if total == input_len:
@@ -818,11 +814,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         else:
             mm_inputs = None
 
-        # Sub-context: the OpenAI chat path renders the chat template itself, so it
-        # arrives with `input_ids` already set (the branch above did no splitting) and
-        # carries the per-namespace split alongside. Accept it only if it really
-        # reconstructs the prompt -- a stale or mis-sliced split would silently feed
-        # the wrong tokens into the radix namespaces.
+        # The OpenAI chat path renders the template itself, so it arrives with
+        # `input_ids` set and the split alongside. Accept it only if it really
+        # reconstructs the prompt -- a mis-sliced split would feed the wrong tokens
+        # into the radix namespaces.
         if sub_context_ids is None and getattr(obj, "sub_context_ids", None):
             flat = [tok for seg in obj.sub_context_ids for tok in seg]
             if input_ids is not None and flat == list(input_ids):

@@ -3,45 +3,31 @@
 
 Two subcommands:
 
-  replay   Re-send a captured SWE-bench chat sequence to a server, in order.
-  report   Aggregate the CUDA-event forward traces the server wrote, and diff
-           a baseline run against a sub-context run.
+  replay   Re-send a captured chat sequence to a server, in order.
+  report   Aggregate the CUDA-event forward traces and diff baseline vs sub-context.
 
-Why replay instead of just timing two SWE-bench runs: an agent loop is closed.
-The moment one sampled token differs the two runs take different actions, run
-different bash commands and end with different numbers of turns, so their total
-GPU time compares two different conversations. Replaying one captured request
-sequence against both configs fixes the input and leaves KV reuse as the only
-variable.
+Replay rather than timing two live agent runs: an agent loop is closed, so the
+moment one sampled token differs the runs take different actions and their GPU
+totals compare different conversations. Replaying one captured sequence fixes the
+input and leaves KV reuse as the only variable.
 
-Replay pins every turn to the same fixed number of generated tokens
-(--gen-tokens, with ignore_eos) rather than letting the model generate freely.
-Free generation makes each turn's decode length depend on the config, which adds
-a large, uncontrolled block of decode time on top of the prefill effect actually
-being measured.
+Every turn is pinned to --gen-tokens (with ignore_eos); free generation makes decode
+length depend on the arm and swamps the prefill effect being measured.
 
-Do NOT lower --gen-tokens to 1 to "measure prefill only". A request that finishes
-without ever going through cache_unfinished_req never gets sub_context_last_nodes
-set, so RadixCache.cache_finished_req falls through to the stock insert and files
-the prompt under extra_key=None instead of the per-namespace keys. The next
-request then misses every namespace, and the run reports 0% reuse -- measuring
-the harness, not the cache. Pass --full to use each captured request's own
-max_tokens instead.
+Do NOT lower --gen-tokens to 1 to "measure prefill only": a request that never goes
+through cache_unfinished_req gets no sub_context_last_nodes, so cache_finished_req
+files the prompt under extra_key=None and the next request misses every namespace --
+0% reuse, measuring the harness. Use --full for each request's own max_tokens.
 
-The functional floor is 2, but the useful floor is higher. Decode is what makes
-the GPU numbers readable: the mechanism cannot touch decode kernels, so the
-decode delta is a direct readout of this run's drift, and the prefill delta is
-only interpretable next to it. Measured: at 32 (1600 decode passes) the drift
-came in at 0.02%/-0.11% on a clock-locked card; dropping to 8 (400 passes) put
-it at +3.4%, larger than at 32 with the clocks unlocked. 32 is the sweet spot
-here -- low enough that prefill is ~28% of GPU time instead of ~5%, high enough
-that the control still works.
+The functional floor is 2, the useful floor higher. Decode is the control: the
+mechanism cannot touch decode kernels, so the decode delta reads out this run's
+drift. Measured at 32 (1600 decode passes) drift was 0.02%/-0.11% clock-locked; at
+8 (400 passes) it was +3.4%. 32 keeps prefill at ~28% of GPU time and the control
+working.
 
---gen-tokens also caps an effect worth knowing about: the baseline caches its
-generated output while the sub-context path frees it, and the replay's regenerated
-tokens often match the recorded assistant reply verbatim for a few tokens (same
-model, same prompt), so the baseline reuses them next turn. That advantage is
-bounded by --gen-tokens and scales with it: 168 tokens at 32, 89 at 8. A real
+--gen-tokens also caps a known asymmetry: the baseline caches its generated output
+while the split frees it, and regenerated tokens often match the recorded reply
+verbatim, so the baseline reuses them next turn -- 168 tokens at 32, 89 at 8. A real
 agent loop has no such bound.
 """
 
@@ -297,6 +283,15 @@ def summarize(rows: List[dict]) -> Dict[str, float]:
         if any("moved_tokens" in r for r in ext)
         else None
     )
+    # The share of the position mismatch that was WON BACK by rotating the block's K
+    # to the position it is reused at. These tokens are counted in cached_tokens, so
+    # moved + rotated is the whole displaced population and `rotated` is the arm's
+    # headline number. None (not 0) when the trace predates the field.
+    rotated_tok = (
+        sum(r.get("rotated_tokens", 0) for r in ext)
+        if any("rotated_tokens" in r for r in ext)
+        else None
+    )
     # None, not 0, when the trace predates the field: "no request took the split
     # path" and "the trace cannot say" are different claims and print differently.
     sub_reqs = sum(r["sub_reqs"] for r in ext) if all("sub_reqs" in r for r in ext) else None
@@ -305,6 +300,7 @@ def summarize(rows: List[dict]) -> Dict[str, float]:
         "matched_tokens": matched_tok,
         "discarded_tokens": discarded_tok,
         "moved_tokens": moved_tok,
+        "rotated_tokens": rotated_tok,
         "sub_reqs": sub_reqs,
         "prefill_passes": len(ext),
         "prefill_gpu_ms": ext_ms,
@@ -360,6 +356,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         ("matched_tokens", "matched in the tree", "tok"),
         ("discarded_tokens", "  ...matched but DROPPED", "tok"),
         ("moved_tokens", "     ...dropped as MOVED", "tok"),
+        ("rotated_tokens", "  ...MOVED but ROTATED in", "tok"),
         ("hit_rate", "cache hit rate (reuse only)", "%"),
         ("prefill_gpu_ms", "PREFILL GPU time", "ms"),
         ("prefill_ms_median", "  median pass", "ms"),
@@ -427,19 +424,12 @@ STAGE_NOTES = {
 
 # child -> enclosing stage. The two overlap, so only one may enter the total.
 #
-# Take the http-side cost from the child. subctx_split is measured directly --
-# the baseline's ~2 us is just the disabled early return, so the delta is very
-# nearly the level itself, and it reproduces to 0.4% across runs. tpl_render's
-# delta is a difference between two ~13 ms numbers that tokenize a ~12k-token
-# prompt with a heavy tail; its own run-to-run spread (~800 us) swamps the
-# ~680 us being resolved, and it swung +574 / +105 / +924 us over three runs of
-# the same comparison.
-#
-# They estimate the same quantity: subtracting the nested child from the parent
-# leaves the jinja work itself, which is identical in both arms and duly lands
-# on zero (-112 / -583 / +242 us over those runs). So this picks the better
-# estimator of one number, not a different number. cmd_stages prints the
-# residual so that assumption stays checkable.
+# Take the http-side cost from the child. subctx_split is measured directly and
+# reproduces to 0.4% across runs; tpl_render's delta is a difference between two
+# ~13 ms numbers whose own spread (~800 us) swamps the ~680 us being resolved.
+# Both estimate the same quantity -- the parent minus the nested child is the jinja
+# work, identical in both arms and duly ~0 -- so this picks the better estimator,
+# not a different number. cmd_stages prints the residual to keep that checkable.
 NESTED = {"subctx_split": "tpl_render"}
 
 

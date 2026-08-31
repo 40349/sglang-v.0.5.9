@@ -7,9 +7,8 @@
 #
 # Everything lands in ab_out/maslab. SWE-bench is run_swe.sh.
 #
-# METHOD / MAS_CONFIG / DATASET / TAG / REQUESTS / SUBCTX_OFF stay overridable
-# because run_matrix.sh drives four combinations through this script; edit the
-# rest here.
+# METHOD / MAS_CONFIG / DATASET / TAG / REQUESTS / SUBCTX_OFF are overridable so
+# run_matrix.sh can drive four combinations through this script; edit the rest here.
 set -euo pipefail
 
 REPO=/home/t2503-3090/Desktop/MiaoChen/sglang-v.0.5.9
@@ -37,8 +36,9 @@ conda activate $ENV
 export PYTHONNOUSERSITE=1        # ~/.local has a broken torch dist-info ahead of the env
 export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
 
-# The server command lives here, once. Callers set LOG, and optionally
-# CAPTURE / TRACE / STAGE / SUBCTX_OFF / SUBCTX_TRACE before calling.
+# The server command lives here, once. Callers set LOG, and optionally CAPTURE /
+# TRACE / STAGE / SUBCTX_OFF / SUBCTX_TRACE / SUBCTX_ROTATE / SUBCTX_ROTATE_ACROSS
+# before calling.
 launch() {
   pkill -f "[s]glang\.launch_server" 2>/dev/null || true
   sleep 6
@@ -49,6 +49,8 @@ launch() {
   SGLANG_STAGE_TRACE=${STAGE:-} \
   SGLANG_DISABLE_SUBCONTEXT=${SUBCTX_OFF:-} \
   SGLANG_SUBCTX_TRACE=${SUBCTX_TRACE:-} \
+  SGLANG_SUBCONTEXT_ROTATE=${SUBCTX_ROTATE:-} \
+  SGLANG_SUBCONTEXT_ROTATE_ACROSS=${SUBCTX_ROTATE_ACROSS:-} \
   nohup python -u -m sglang.launch_server \
     --model-path $MODEL \
     --context-length $CTXLEN \
@@ -130,6 +132,20 @@ case "${1:-}" in
     TRACE=$OUT/trace_sub$SUF.jsonl STAGE=$OUT/stage_sub$SUF \
       CLIENT=$OUT/client_sub$SUF.json replay
 
+    # Third arm: the split plus position compensation. Only run when asked, so the
+    # two-arm comparison stays exactly what it was before rotation existed.
+    if [ -n "${ROTATE:-}" ]; then
+      echo; echo "======== SPLIT ON + ROTATE ========"
+      SUBCTX_ROTATE=1 SUBCTX_ROTATE_ACROSS=${ACROSS:-} LOG=$OUT/server_rot$SUF.log \
+        TRACE=$OUT/trace_rot$SUF.jsonl STAGE=$OUT/stage_rot$SUF launch
+      # Same reasoning as the baseline guard: an arm that silently ran without the
+      # rotation it is named for is worse than no arm at all.
+      grep -q "Sub-context KV rotation ENABLED" $OUT/server_rot$SUF.log \
+        || { echo "REFUSING: rotation did not report itself enabled"; exit 1; }
+      TRACE=$OUT/trace_rot$SUF.jsonl STAGE=$OUT/stage_rot$SUF \
+        CLIENT=$OUT/client_rot$SUF.json replay
+    fi
+
     stop
 
     echo; echo "======== GPU (CUDA events) ========"
@@ -139,6 +155,21 @@ case "${1:-}" in
     echo; echo "======== PARITY (generated text) ========"
     python $REPO/subcontext_bench.py parity \
       $OUT/client_base$SUF.json $OUT/client_sub$SUF.json || true
+
+    if [ -n "${ROTATE:-}" ]; then
+      echo; echo "======== ROTATE vs SPLIT (GPU) ========"
+      python $REPO/subcontext_bench.py report $OUT/trace_sub$SUF.jsonl $OUT/trace_rot$SUF.jsonl
+      echo; echo "======== ROTATE vs BASELINE (GPU) ========"
+      python $REPO/subcontext_bench.py report $OUT/trace_base$SUF.jsonl $OUT/trace_rot$SUF.jsonl
+      echo; echo "======== ROTATE host cost ========"
+      python $REPO/subcontext_bench.py stages $OUT/stage_sub$SUF $OUT/stage_rot$SUF
+      # Rotation fixes the position a block is reused at, not the context it was
+      # computed under, so divergence here is expected and is the number to read,
+      # not a failure. pass@1 from a `record` run is what prices it.
+      echo; echo "======== PARITY: rotate vs split (divergence EXPECTED) ========"
+      python $REPO/subcontext_bench.py parity \
+        $OUT/client_sub$SUF.json $OUT/client_rot$SUF.json || true
+    fi
     ;;
 
   eval)

@@ -12,10 +12,10 @@ system_prompt. So the second request decodes against out-of-context KV.
 How to use (two server sessions, to get a clean comparison):
 
   # (1) CORRECT baseline: run only the varied request on a fresh server.
-  python scripts/cacheslide_sim/crosscontext_test.py --order B
+  python scripts/subcontext_sim/crosscontext_test.py --order B
 
   # (2) CONTAMINATED: restart the server, then prime with A and run B.
-  python scripts/cacheslide_sim/crosscontext_test.py --order A,B
+  python scripts/subcontext_sim/crosscontext_test.py --order A,B
 
 Compare B's output between (1) and (2). If they differ, the tools/messages KV cached
 under system_prompt_A leaked into B -> cross-context contamination reproduced.

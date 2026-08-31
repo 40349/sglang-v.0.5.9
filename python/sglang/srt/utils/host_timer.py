@@ -1,26 +1,17 @@
 """Host-side (CPU) stage timing, for costing the sub-context mechanism itself.
 
-CUDA events measure what the GPU does. The work sub-context reuse *adds* is not
-on the GPU at all: re-rendering the chat template to find block boundaries, one
-``match_prefix`` per namespace instead of one per request, one insert per
-namespace instead of one. All of that is host time, and none of it shows up in a
-forward-pass trace.
+What the split *adds* is not on the GPU: re-rendering the template to find block
+boundaries, one ``match_prefix`` and one insert per namespace instead of per
+request. None of it shows up in a forward-pass trace.
 
-Enabled by setting ``SGLANG_STAGE_TRACE`` to an output path. Each process writes
-to ``<path>.<proc>`` because the stages live in different processes: the template
-split happens in the HTTP/tokenizer process, matching and insertion in the
-scheduler.
+Set ``SGLANG_STAGE_TRACE`` to an output path. Each process writes ``<path>.<proc>``
+-- the template split happens in the HTTP/tokenizer process, matching and insertion
+in the scheduler. Stages are named identically in both arms and placed at the branch
+point, so subtracting per stage across an A/B gives the added cost directly.
 
-Stages are named identically in both configs and placed at the branch point, so
-the same name covers the stock path and the sub-context path. Running once with
-``SGLANG_DISABLE_SUBCONTEXT=1`` and once without, then subtracting per stage,
-gives the added cost directly.
-
-Counters accumulate from process start, which includes the replay client's
-warm-up generations. Once that client creates ``<SGLANG_STAGE_TRACE>.mark`` a
-second accumulator opens and is reported as ``measured``, matching the window
-the forward trace's ``measure_start`` marker defines. Comparing the two traces
-over different windows is how warm-up cost ends up attributed to a mechanism.
+Counters accumulate from process start, which includes the replay client's warm-up.
+Once that client creates ``<SGLANG_STAGE_TRACE>.mark`` a second accumulator opens and
+is reported as ``measured``, matching the forward trace's ``measure_start`` window.
 """
 
 from __future__ import annotations
@@ -39,8 +30,7 @@ from typing import Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # A benchmark server usually dies by SIGKILL, which atexit never sees, so the
-# snapshot on disk has to stay close to current. Bounded by both time and call
-# count: a short run that ends before the interval elapses still lands.
+# snapshot must stay current. Bounded by time and call count, so a short run lands.
 _DUMP_INTERVAL_S = 1.0
 _DUMP_EVERY_N = 20
 
@@ -51,8 +41,8 @@ class HostTimer:
         self._proc = proc
         # stage -> [count, total_ns, max_ns]
         self._stages: Dict[str, List[int]] = {}
-        # Same shape, but started fresh when the replay client marks the end of
-        # warm-up. None until then. See _check_mark.
+        # Same shape, restarted when the client marks the end of warm-up. See
+        # _check_mark.
         self._measured: Optional[Dict[str, List[int]]] = None
         self._mark_path: Optional[str] = f"{path}.mark"
         self._lock = threading.Lock()
