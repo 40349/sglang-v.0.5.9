@@ -1,0 +1,23 @@
+{
+  "proc": "scheduler",
+  "stages": {
+    "cache_finished": {
+      "count": 854,
+      "total_ms": 508.0069,
+      "mean_us": 594.856,
+      "max_us": 232351.317
+    },
+    "cache_unfinished": {
+      "count": 1213,
+      "total_ms": 317.4305,
+      "mean_us": 261.69,
+      "max_us": 45108.472
+    },
+    "match": {
+      "count": 1225,
+      "total_ms": 123.2552,
+      "mean_us": 100.616,
+      "max_us": 383.806
+    }
+  }
+}

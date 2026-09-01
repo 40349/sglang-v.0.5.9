@@ -13,8 +13,11 @@
 # server three times with different env vars and reads traces the server writes on its
 # own disk -- so run `toggle` on the server box, where the capture already is.
 #
-#   SERVER_URL=http://140.118.202.100:30000 \
-#     METHOD=agentverse MAS_CONFIG= DATASET=humaneval TAG=av_he_on ./run_mas.sh record
+#   SERVER_URL=http://140.118.202.100:30000 ARM=rot \
+#     METHOD=agentverse MAS_CONFIG= DATASET=humaneval TAG=av_he_rot ./run_mas.sh record
+#
+# ARM must match how the remote server was started (`ARM=... sbatch sglang_server.sh`);
+# `record` reads /server_info and refuses if it does not.
 #
 # METHOD / MAS_CONFIG / DATASET / TAG / REQUESTS / SUBCTX_OFF are overridable so
 # run_matrix.sh can drive four combinations through this script; edit the rest here.
@@ -49,6 +52,20 @@ INFER=${INFER:-$OUT/infer$SUF.jsonl}   # overridable so a pre-split run can stil
 # Empty => this box runs the server too (the original single-machine setup).
 SERVER_URL=${SERVER_URL:-}
 if [ -n "$SERVER_URL" ]; then REMOTE=1; else REMOTE=0; SERVER_URL=http://127.0.0.1:$PORT; fi
+
+# Which arm. Same three words as sglang_server.sh, so one word means one thing on
+# both boxes: against a remote server this is what `record` asserts /server_info
+# reports, and locally it is what `launch` starts. `toggle` drives all three arms
+# itself and refuses to be told one. Leaving ARM unset keeps the older
+# SUBCTX_OFF / SUBCTX_ROTATE spelling working.
+ARM=${ARM:-}
+case "$ARM" in
+  "")  ;;
+  on)  SUBCTX_OFF=""; SUBCTX_ROTATE=""; SUBCTX_ROTATE_ACROSS="" ;;
+  off) SUBCTX_OFF="1"; SUBCTX_ROTATE=""; SUBCTX_ROTATE_ACROSS="" ;;
+  rot) SUBCTX_OFF=""; SUBCTX_ROTATE="1"; SUBCTX_ROTATE_ACROSS="1" ;;
+  *)   echo "REFUSING: unknown ARM='$ARM' (want on|off|rot)"; exit 1 ;;
+esac
 
 mkdir -p "$OUT"
 source "$CONDA_SH"
@@ -154,6 +171,22 @@ case "${1:-}" in
         --model_name $MAS_MODEL \
         --model_temperature $MAS_TEMP \
         --output_path "$INFER" )
+    # A run whose server went away mid-flight still writes a full-length results
+    # file, with `None` where the calls failed -- and `evaluate.py` then reports an
+    # accuracy over only the rows it could score, which looks like a clean number.
+    # Refuse to call that a recording.
+    python - "$INFER" <<'EOF' || exit 1
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1])]
+missing = [r.get("task_id") for r in rows if not r.get("response")]
+if missing:
+    print(f"REFUSING: {len(missing)}/{len(rows)} results are empty -- the server went "
+          f"away before this run finished (first: {missing[0]}, last: {missing[-1]}). "
+          f"Any pass@1 over the rest would be scored on a subset. Re-run.",
+          file=sys.stderr)
+    raise SystemExit(1)
+print(f"  all {len(rows)} results present")
+EOF
     if [ "$REMOTE" = 1 ]; then
       echo "inference results -> $INFER"
       echo "the capture and traces are on the server box, under its traces/ dir;"
@@ -168,6 +201,7 @@ case "${1:-}" in
   toggle)
     # Three arms means three server restarts, and the traces it compares are written
     # on the server's own disk. Neither is reachable from another box.
+    [ -z "$ARM" ] || { echo "REFUSING: toggle runs all three arms; do not set ARM"; exit 1; }
     [ "$REMOTE" = 1 ] && {
       echo "REFUSING: 'toggle' restarts the server per arm and reads traces it writes"
       echo "locally, so it must run ON the server box. The capture is already there;"
@@ -253,6 +287,6 @@ case "${1:-}" in
     echo "  record  METHOD=autogen MAS_CONFIG=config_code DATASET=humaneval TAG=ag_he_on $0 record"
     echo "  toggle  REQUESTS=$OUT/requests_ag_he_on.jsonl TAG=ag_he_ab $0 toggle"
     echo "  eval    TAG=ag_he_on DATASET=humaneval $0 eval"
-    echo "  add SUBCTX_OFF=1 to run any of them with the split disabled"
+    echo "  add ARM=off|rot to run any of them on another arm (default: on)"
     exit 1;;
 esac

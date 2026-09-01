@@ -547,7 +547,17 @@ class RadixCache(BasePrefixCache):
         # this unlocks those leaves rather than re-inserting, and hands the generated
         # continuation to the last block's namespace.
         if req.sub_context_last_nodes is not None:
+            if TRACE_ON:
+                held = kv_indices.tolist()
+                before = self.token_to_kv_pool_allocator.available_size()
+                # `_finish_sub_contexts` clears these on its way out.
+                owned_at_entry = list(req.sub_context_tree_owned or [])
+                lens_at_entry = list(req.sub_context_owned_lens or [])
             self._finish_sub_contexts(req, token_ids, kv_indices, is_insert)
+            if TRACE_ON:
+                self._audit_sub_context_finish(
+                    req, token_ids, held, before, owned_at_entry, lens_at_entry
+                )
             return
 
         # Maybe convert to bigram keys for EAGLE
@@ -577,6 +587,58 @@ class RadixCache(BasePrefixCache):
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
+
+    def _audit_sub_context_finish(
+        self,
+        req: Req,
+        token_ids: List[int],
+        held: List[int],
+        before: int,
+        owned_at_entry: List[bool],
+        lens_at_entry: List[int],
+    ) -> None:
+        """Every slot the request held must now be freed or owned by a namespace.
+
+        The sub-context finish path frees per block, and a block can end up freed,
+        handed to the tree, or -- the failure this exists to catch -- neither, which
+        surfaces much later and far away as sglang's own
+        ``token_to_kv_pool_allocator memory leak detected``. Names the request, the
+        block and the count while the frame that lost the slots is still on record.
+
+        Behind SGLANG_SUBCTX_TRACE: it costs a match_prefix per block.
+        """
+        released = self.token_to_kv_pool_allocator.available_size() - before
+        owned = set()
+        segs = list(req.iter_sub_contexts())
+        for seg_ids, seg_key, offset in segs:
+            end = min(offset + len(seg_ids), len(token_ids))
+            if end <= offset:
+                continue
+            m = self.match_prefix(
+                MatchPrefixParams(key=RadixKey(token_ids[offset:end], seg_key))
+            )
+            owned.update(m.device_indices.tolist())
+        if segs:
+            # The last namespace may also hold the generated tail.
+            _ids, last_key, last_off = segs[-1]
+            m = self.match_prefix(
+                MatchPrefixParams(key=RadixKey(token_ids[last_off:], last_key))
+            )
+            owned.update(m.device_indices.tolist())
+
+        held_set = set(held)
+        kept = len(held_set & owned)
+        missing = len(held_set) - released - kept
+        if missing or len(held_set) != len(held):
+            trace(
+                f"[TRACE-4 SUBCTX-LEAK] rid={req.rid} held={len(held)} "
+                f"distinct={len(held_set)} released={released} kept_by_tree={kept} "
+                f"MISSING={missing} "
+                f"tree_owned={owned_at_entry} owned_lens={lens_at_entry} "
+                f"blocks={[(k, len(i), o) for i, k, o in segs]} "
+                f"reinserted={req.sub_context_reinserted} "
+                f"rotated={req.sub_context_rotated}"
+            )
 
     def _finish_sub_contexts(
         self,

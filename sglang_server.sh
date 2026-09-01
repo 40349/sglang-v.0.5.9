@@ -14,6 +14,15 @@
 #   ARM=off sbatch sglang_server.sh      split OFF              (the baseline arm)
 #   ARM=rot sbatch sglang_server.sh      split ON + rotation    (the new arm)
 #
+# Diagnostic switches, both off by default and both of which make the run's timings
+# unusable for the A/B -- they bill host work to one arm:
+#   SUBCTX_TRACE=1  per-match/insert/finish tracing, including the finish-path leak
+#                   audit that names the request that lost KV slots. Also sets
+#                   PYTHONUNBUFFERED: the scheduler is a spawned child and does not
+#                   inherit `python -u`, so its print() output is block-buffered and
+#                   the last -- most interesting -- lines are lost when it dies.
+#   DUMP_TREE=1     print the whole radix tree after every extend pass
+#
 # The arm is an env var read once at server start, so it cannot be changed without a
 # restart -- that is why each arm is a separate job.
 #
@@ -80,6 +89,9 @@ EOF
 SGLANG_DISABLE_SUBCONTEXT=$SUBCTX_OFF \
 SGLANG_SUBCONTEXT_ROTATE=$ROT \
 SGLANG_SUBCONTEXT_ROTATE_ACROSS=$ROT_ACROSS \
+SGLANG_SUBCTX_TRACE=${SUBCTX_TRACE:-} \
+PYTHONUNBUFFERED=${SUBCTX_TRACE:+1} \
+SGLANG_DUMP_TREE=${DUMP_TREE:-} \
 SGLANG_CAPTURE_REQUESTS=$WORK_DIR/traces/requests_${SUF}.jsonl \
 SGLANG_FORWARD_TRACE=$WORK_DIR/traces/trace_${SUF}.jsonl \
 SGLANG_STAGE_TRACE=$WORK_DIR/traces/stage_${SUF} \

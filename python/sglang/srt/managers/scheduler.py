@@ -221,6 +221,8 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
+# Debug: dump the whole radix tree after every extend pass. See the call site.
+DUMP_TREE_AFTER_EXTEND = os.environ.get("SGLANG_DUMP_TREE", "") not in ("", "0")
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
@@ -2535,16 +2537,18 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
 
-        if batch.forward_mode.is_extend():
-            print("\n" + "="*50)
-            print(f"[DEBUG] Tree State AFTER Extend")
-            print("="*50)
-            
-            if hasattr(self, "tree_cache") and self.tree_cache is not None:
+        # Whole-tree dump per extend pass. Gated because it is O(nodes) of host work
+        # and log volume on every prefill, and the node count differs by arm -- the rot
+        # arm keeps a live `messages` namespace where the on arm keeps four nodes -- so
+        # left on it charges one arm of an A/B far more than the other. GPU timings are
+        # unaffected (this sits outside the CUDA-event bracket), wall clock is not.
+        if DUMP_TREE_AFTER_EXTEND and batch.forward_mode.is_extend():
+            print("\n" + "=" * 50)
+            print("[DEBUG] Tree State AFTER Extend")
+            print("=" * 50)
+            if getattr(self, "tree_cache", None) is not None:
                 self.tree_cache.pretty_print()
-                
-            print("="*50 + "\n")
-            return
+            print("=" * 50 + "\n")
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ct:

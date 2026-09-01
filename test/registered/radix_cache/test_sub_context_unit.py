@@ -71,7 +71,10 @@ class FakeAllocator:
         self.freed.extend(indices.tolist())
 
     def available_size(self):
-        return 0
+        # Capacity is unbounded here, so "how many slots have come back" is the only
+        # meaningful reading -- and it is what the finish-path leak audit needs, since
+        # that only ever looks at the delta across one call.
+        return len(self.freed)
 
 
 class FakeRotator:
