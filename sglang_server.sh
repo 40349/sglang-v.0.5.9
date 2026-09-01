@@ -16,11 +16,13 @@
 #
 # Diagnostic switches, both off by default and both of which make the run's timings
 # unusable for the A/B -- they bill host work to one arm:
-#   SUBCTX_TRACE=1  per-match/insert/finish tracing, including the finish-path leak
-#                   audit that names the request that lost KV slots. Also sets
-#                   PYTHONUNBUFFERED: the scheduler is a spawned child and does not
-#                   inherit `python -u`, so its print() output is block-buffered and
-#                   the last -- most interesting -- lines are lost when it dies.
+#   SUBCTX_TRACE=1  per-match/insert/finish tracing. Also sets PYTHONUNBUFFERED: the
+#                   scheduler is a spawned child and does not inherit `python -u`, so
+#                   its print() output is block-buffered and the last -- most
+#                   interesting -- lines are lost when it dies.
+#
+# The pool-accounting audit (SUBCTX-IMBALANCE) needs neither: it is always on, costs
+# three O(1) reads per finished request, and goes through the logger.
 #   DUMP_TREE=1     print the whole radix tree after every extend pass
 #
 # The arm is an env var read once at server start, so it cannot be changed without a

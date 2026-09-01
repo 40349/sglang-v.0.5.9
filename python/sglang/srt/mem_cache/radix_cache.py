@@ -288,6 +288,10 @@ class RadixCache(BasePrefixCache):
         # forward trace. Kept on the cache rather than the request because the re-file
         # happens at finish, after that request's last forward pass.
         self.sub_context_reinserted_tokens = 0
+        # Pool-accounting audit (see `_audit_sub_context_finish`). The pool size is not
+        # known here; the scheduler fills it in once it has one. 0 disables the check.
+        self.max_total_num_tokens_for_audit = 0
+        self._sub_context_audit_drift = 0
 
         self.kv_event_queue = []
 
@@ -547,16 +551,13 @@ class RadixCache(BasePrefixCache):
         # this unlocks those leaves rather than re-inserting, and hands the generated
         # continuation to the last block's namespace.
         if req.sub_context_last_nodes is not None:
-            if TRACE_ON:
-                held = kv_indices.tolist()
-                before = self.token_to_kv_pool_allocator.available_size()
-                # `_finish_sub_contexts` clears these on its way out.
-                owned_at_entry = list(req.sub_context_tree_owned or [])
-                lens_at_entry = list(req.sub_context_owned_lens or [])
+            # `_finish_sub_contexts` clears these on its way out.
+            owned_at_entry = list(req.sub_context_tree_owned or [])
+            lens_at_entry = list(req.sub_context_owned_lens or [])
             self._finish_sub_contexts(req, token_ids, kv_indices, is_insert)
-            if TRACE_ON:
+            if self.max_total_num_tokens_for_audit:
                 self._audit_sub_context_finish(
-                    req, token_ids, held, before, owned_at_entry, lens_at_entry
+                    req, token_ids, owned_at_entry, lens_at_entry
                 )
             return
 
@@ -592,53 +593,49 @@ class RadixCache(BasePrefixCache):
         self,
         req: Req,
         token_ids: List[int],
-        held: List[int],
-        before: int,
         owned_at_entry: List[bool],
         lens_at_entry: List[int],
     ) -> None:
-        """Every slot the request held must now be freed or owned by a namespace.
+        """Name the request that broke the pool's accounting, the moment it breaks it.
 
-        The sub-context finish path frees per block, and a block can end up freed,
-        handed to the tree, or -- the failure this exists to catch -- neither, which
-        surfaces much later and far away as sglang's own
-        ``token_to_kv_pool_allocator memory leak detected``. Names the request, the
-        block and the count while the frame that lost the slots is still on record.
+        sglang checks ``available + evictable == max - protected`` only when the
+        scheduler goes idle, by which point hundreds of requests have finished and the
+        culprit is unrecoverable. This is the same identity, evaluated after every
+        sub-context finish -- three O(1) reads -- and it reports only when the drift
+        *changes*, so the first line names the one request that caused it and how.
 
-        Behind SGLANG_SUBCTX_TRACE: it costs a match_prefix per block.
+        Both signs matter and mean different things:
+          drift < 0  slots that are neither free nor in the tree -- lost
+          drift > 0  the tree claims more than the pool holds -- two nodes owning the
+                     same slots, which is the more dangerous one: those slots get
+                     handed out twice.
         """
-        released = self.token_to_kv_pool_allocator.available_size() - before
-        owned = set()
-        segs = list(req.iter_sub_contexts())
-        for seg_ids, seg_key, offset in segs:
-            end = min(offset + len(seg_ids), len(token_ids))
-            if end <= offset:
-                continue
-            m = self.match_prefix(
-                MatchPrefixParams(key=RadixKey(token_ids[offset:end], seg_key))
-            )
-            owned.update(m.device_indices.tolist())
-        if segs:
-            # The last namespace may also hold the generated tail.
-            _ids, last_key, last_off = segs[-1]
-            m = self.match_prefix(
-                MatchPrefixParams(key=RadixKey(token_ids[last_off:], last_key))
-            )
-            owned.update(m.device_indices.tolist())
-
-        held_set = set(held)
-        kept = len(held_set & owned)
-        missing = len(held_set) - released - kept
-        if missing or len(held_set) != len(held):
-            trace(
-                f"[TRACE-4 SUBCTX-LEAK] rid={req.rid} held={len(held)} "
-                f"distinct={len(held_set)} released={released} kept_by_tree={kept} "
-                f"MISSING={missing} "
-                f"tree_owned={owned_at_entry} owned_lens={lens_at_entry} "
-                f"blocks={[(k, len(i), o) for i, k, o in segs]} "
-                f"reinserted={req.sub_context_reinserted} "
-                f"rotated={req.sub_context_rotated}"
-            )
+        alloc = self.token_to_kv_pool_allocator
+        drift = (
+            alloc.available_size() + self.evictable_size() + self.protected_size()
+        ) - self.max_total_num_tokens_for_audit
+        if drift == self._sub_context_audit_drift:
+            return
+        delta = drift - self._sub_context_audit_drift
+        self._sub_context_audit_drift = drift
+        segs = [(k, len(i), o) for i, k, o in req.iter_sub_contexts()]
+        logger.error(
+            "SUBCTX-IMBALANCE rid=%s this_request=%+d running=%+d (%s) "
+            "prompt=%d committed=%d tree_owned=%s owned_lens=%s blocks=%s "
+            "reinserted=%d rotated=%d moved=%d",
+            req.rid,
+            delta,
+            drift,
+            "tree owns slots twice" if delta > 0 else "slots lost",
+            sum(n for _, n, _ in segs),
+            len(token_ids),
+            owned_at_entry,
+            lens_at_entry,
+            segs,
+            req.sub_context_reinserted,
+            req.sub_context_rotated,
+            req.sub_context_moved,
+        )
 
     def _finish_sub_contexts(
         self,
