@@ -36,7 +36,10 @@ MAS_MODEL=${MAS_MODEL:-Qwen3-Coder-30B-A3B}
 MAS_TEMP=${MAS_TEMP:-0.0}
 
 METHOD=${METHOD:-autogen}
-MAS_CONFIG=${MAS_CONFIG:-config_code}
+# `-` not `:-`: an explicitly empty MAS_CONFIG must stay empty. agentverse picks its
+# own config from the dataset (agentverse_humaneval.py:10 defaults to
+# config_humaneval), and substituting autogen's config_code there is a FileNotFoundError.
+MAS_CONFIG=${MAS_CONFIG-config_code}
 DATASET=${DATASET:-humaneval}
 TAG=${TAG:-}
 SUF=${TAG:+_$TAG}

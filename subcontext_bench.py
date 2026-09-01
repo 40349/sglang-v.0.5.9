@@ -292,6 +292,15 @@ def summarize(rows: List[dict]) -> Dict[str, float]:
         if any("rotated_tokens" in r for r in ext)
         else None
     )
+    # Tokens of a block the tree had refused, rotated back to the position it holds
+    # and filed there when the request finished. Not part of this run's cached_tokens
+    # -- the payoff lands on *later* requests, as a longer hit and a cached reply.
+    # None (not 0) when the trace predates the field.
+    reinserted_tok = (
+        sum(r.get("reinserted_tokens", 0) for r in ext)
+        if any("reinserted_tokens" in r for r in ext)
+        else None
+    )
     # None, not 0, when the trace predates the field: "no request took the split
     # path" and "the trace cannot say" are different claims and print differently.
     sub_reqs = sum(r["sub_reqs"] for r in ext) if all("sub_reqs" in r for r in ext) else None
@@ -301,6 +310,7 @@ def summarize(rows: List[dict]) -> Dict[str, float]:
         "discarded_tokens": discarded_tok,
         "moved_tokens": moved_tok,
         "rotated_tokens": rotated_tok,
+        "reinserted_tokens": reinserted_tok,
         "sub_reqs": sub_reqs,
         "prefill_passes": len(ext),
         "prefill_gpu_ms": ext_ms,
@@ -357,6 +367,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         ("discarded_tokens", "  ...matched but DROPPED", "tok"),
         ("moved_tokens", "     ...dropped as MOVED", "tok"),
         ("rotated_tokens", "  ...MOVED but ROTATED in", "tok"),
+        ("reinserted_tokens", "REVERSE-ROTATED into tree", "tok"),
         ("hit_rate", "cache hit rate (reuse only)", "%"),
         ("prefill_gpu_ms", "PREFILL GPU time", "ms"),
         ("prefill_ms_median", "  median pass", "ms"),

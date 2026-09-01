@@ -73,6 +73,16 @@ class ForwardTracer:
             # with its K rotated to the position it is reused at. These are part of
             # cached_tokens, so moved + rotated is the whole displaced population.
             rotated_tokens = 0
+            # Tokens of a block the namespace had refused, rotated back to the position
+            # it holds and filed there at finish -- which is what lets the reply be
+            # cached at all. Cache-level, not per-request: the re-file happens after the
+            # request's last forward pass, so this pass reports work another request
+            # finished. The totals are right; a single row's attribution is not.
+            reinserted_tokens = 0
+            cache = getattr(batch, "tree_cache", None)
+            if getattr(cache, "sub_context_reinserted_tokens", 0):
+                reinserted_tokens = cache.sub_context_reinserted_tokens
+                cache.sub_context_reinserted_tokens = 0
             for req in reqs:
                 d = getattr(req, "sub_context_discarded", 0) or 0
                 if d:
@@ -97,6 +107,7 @@ class ForwardTracer:
             discarded_tokens = 0
             moved_tokens = 0
             rotated_tokens = 0
+            reinserted_tokens = 0
             sub_reqs = 0
 
         return {
@@ -109,6 +120,7 @@ class ForwardTracer:
             "discarded_tokens": discarded_tokens,
             "moved_tokens": moved_tokens,
             "rotated_tokens": rotated_tokens,
+            "reinserted_tokens": reinserted_tokens,
             "sub_reqs": sub_reqs,
             "t_rel": round(time.perf_counter() - self._t0, 6),
         }

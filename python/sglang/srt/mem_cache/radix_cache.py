@@ -284,6 +284,10 @@ class RadixCache(BasePrefixCache):
         # delta-composable (see `subctx_config.rotation_unsupported_reason`). None
         # means displaced sub-context hits are dropped rather than rotated.
         self.kv_rotator = None
+        # Tokens re-filed by `_reverse_rotate_insert_sub_contexts`, drained by the
+        # forward trace. Kept on the cache rather than the request because the re-file
+        # happens at finish, after that request's last forward pass.
+        self.sub_context_reinserted_tokens = 0
 
         self.kv_event_queue = []
 
@@ -588,6 +592,11 @@ class RadixCache(BasePrefixCache):
         goes to the last block's namespace (``_cache_sub_context_output``); whatever the
         tree does not take is freed here.
         """
+        # Re-file blocks the namespace refused first: it is what makes the last block
+        # tree-owned, which is what the output insert below requires.
+        if is_insert:
+            self._reverse_rotate_insert_sub_contexts(req, token_ids, kv_indices)
+
         kept = False
         if is_insert and CACHE_SUBCONTEXT_OUTPUT:
             kept = self._cache_sub_context_output(req, token_ids, kv_indices)
@@ -621,6 +630,99 @@ class RadixCache(BasePrefixCache):
         req.sub_context_last_nodes = None
         req.sub_context_owned_lens = None
         req.sub_context_tree_owned = None
+        req.sub_context_tree_canonical = None
+
+    def _reverse_rotate_insert_sub_contexts(
+        self, req: Req, token_ids: List[int], kv_indices: torch.Tensor
+    ) -> int:
+        """File a declined block under the position its namespace already stands for.
+
+        A block whose namespace holds the same tokens at another position is refused by
+        `_cache_unfinished_sub_contexts`: one node cannot stand for two rotations. But
+        the request *has* that block's KV, only rotated for its own offset -- so
+        rotating it back by ``canonical - offset`` makes it exactly what the namespace
+        already means, and it can be inserted there with the chain intact. This is the
+        read path's rotation run backwards, and it is what lets the generated reply be
+        cached: `_cache_sub_context_output` only extends a namespace this request owns
+        its whole last block in.
+
+        **This runs at finish, not per chunk, and that is load-bearing.** The rotation
+        is in place, and `cache_unfinished_req` fires right after prefill on a request
+        that is still decoding (`scheduler_output_processor_mixin.py:183`) -- its own
+        attention reads these slots on every step that follows, so moving them to
+        another position would silently corrupt the generation still in flight.
+        A finished request reads them never again.
+
+        Returns how many tokens were re-filed.
+        """
+        if self.kv_rotator is None or req.sub_context_tree_owned is None:
+            return 0
+
+        prompt_len = sum(len(seg) for seg in req.sub_context_ids)
+        if len(kv_indices) < prompt_len:
+            return 0  # aborted mid-prefill; nothing settled enough to re-file
+
+        reinserted = 0
+        for i, (seg_ids, seg_key, offset) in enumerate(req.iter_sub_contexts()):
+            if not seg_ids or req.sub_context_tree_owned[i]:
+                continue
+            end = offset + len(seg_ids)
+            radix_key = RadixKey(token_ids[offset:end], seg_key)
+            probe = self.match_prefix(MatchPrefixParams(key=radix_key))
+            canonical = self.matched_canonical_position(
+                probe.last_device_node, len(probe.device_indices)
+            )
+            if canonical is None:
+                # Whatever conflicted has since been evicted: the namespace is free to
+                # take this block where it actually sits.
+                canonical = offset
+            delta = canonical - offset
+            if delta != 0:
+                if not self.kv_rotator.can_rotate(delta):
+                    continue  # out of the cos_sin_cache's range; drop as before
+                seg_slots = kv_indices[offset:end]
+                # In place: these slots are this request's own (freshly computed, or a
+                # rotated copy it owns), never a node other requests hold a lock on.
+                self.kv_rotator.rotate_into(seg_slots, seg_slots, delta)
+
+            result = self.insert(
+                InsertParams(
+                    key=radix_key,
+                    value=kv_indices[offset:end].to(dtype=torch.int64, copy=True),
+                    priority=getattr(req, "priority", 0) or 0,
+                    canonical_position=canonical,
+                )
+            )
+            # Nothing of this block was ever tree-owned, so everything the namespace
+            # already had is a duplicate this request must give back.
+            if result.prefix_len > 0:
+                self.token_to_kv_pool_allocator.free(
+                    kv_indices[offset : offset + result.prefix_len]
+                )
+            seg_match = self.match_prefix(MatchPrefixParams(key=radix_key))
+            self.req_to_token_pool.write(
+                (req.req_pool_idx, slice(offset, end)), seg_match.device_indices
+            )
+            req.sub_context_tree_owned[i] = True
+            req.sub_context_tree_canonical[i] = canonical
+            req.sub_context_owned_lens[i] = len(seg_ids)
+            reinserted += len(seg_ids)
+            if TRACE_ON:
+                trace(
+                    f"[TRACE-4 SUBCTX-REVERSE-ROTATE] rid={req.rid} "
+                    f"extra_key={seg_key!r} offset={offset} canonical={canonical} "
+                    f"delta={delta} tokens={len(seg_ids)} dup={result.prefix_len}"
+                )
+        req.sub_context_reinserted += reinserted
+        self.sub_context_reinserted_tokens += reinserted
+        if reinserted:
+            # Blocks that were holes a moment ago are tree-owned now, so the protected
+            # prefix has grown -- and `_cache_sub_context_output` gates on it covering
+            # the whole prompt.
+            req.cache_protected_len = self._sub_context_protected_len(
+                req, len(kv_indices)
+            )
+        return reinserted
 
     def _cache_sub_context_output(
         self, req: Req, token_ids: List[int], kv_indices: torch.Tensor
@@ -631,8 +733,10 @@ class RadixCache(BasePrefixCache):
         its KV means re-prefilling it every turn. The namespace is extended with
         ``block ++ generated`` under the same ``extra_key``, continuing the node the
         block already occupies, so next turn matches through the reply and stops where
-        the render diverges. Positions line up for free -- the tail sits immediately
-        after the block, so the whole chain keeps one canonical position.
+        the render diverges. The tail sits immediately after the block, so it inherits
+        the block's canonical position -- which is the *tree's*, not necessarily this
+        request's: `_reverse_rotate_insert_sub_contexts` may have filed the block under
+        a position it was not computed at, and then the reply has to make the same trip.
 
         Only a fully prefilled prompt qualifies: an extension off a partial block would
         be keyed to a prefix no later request reproduces.
@@ -657,9 +761,24 @@ class RadixCache(BasePrefixCache):
         offset = prompt_len - len(last_seg)
         seg_key = req.sub_context_extra_keys[-1]
 
-        # The block itself is already in the tree at `offset` (this request put it
-        # there), and the generated tokens continue straight on from it, so the
-        # extension is canonical at the same position as the block.
+        # Where the tree holds the block -- `offset` on the fast path, and the position
+        # the namespace already stood for when the block was re-filed there.
+        canonical = offset
+        if req.sub_context_tree_canonical is not None:
+            canonical = req.sub_context_tree_canonical[-1]
+            if canonical is None:
+                return False
+        delta = canonical - offset
+        if delta != 0:
+            # The reply was computed at `prompt_len` but continues a block the tree
+            # holds `delta` earlier, so it has to move by the same delta. In place: the
+            # generated slots are this request's and it is finished reading them.
+            if self.kv_rotator is None or not self.kv_rotator.can_rotate(delta):
+                return False
+            self.kv_rotator.rotate_into(
+                kv_indices[prompt_len:], kv_indices[prompt_len:], delta
+            )
+
         radix_key = RadixKey(token_ids[offset:], seg_key)
         values = kv_indices[offset:].to(dtype=torch.int64, copy=True)
         result = self.insert(
@@ -667,7 +786,7 @@ class RadixCache(BasePrefixCache):
                 key=radix_key,
                 value=values,
                 priority=getattr(req, "priority", 0) or 0,
-                canonical_position=offset,
+                canonical_position=canonical,
             )
         )
 
@@ -684,6 +803,7 @@ class RadixCache(BasePrefixCache):
             trace(
                 f"[TRACE-4 SUBCTX-OUTPUT] rid={req.rid} extra_key={seg_key!r} "
                 f"block={owned} generated={len(token_ids) - prompt_len} "
+                f"canonical={canonical} delta={delta} "
                 f"dup={max(result.prefix_len - owned, 0)}"
             )
         return True
@@ -886,6 +1006,8 @@ class RadixCache(BasePrefixCache):
             req.sub_context_owned_lens = [0] * len(req.sub_context_extra_keys)
         if req.sub_context_tree_owned is None:
             req.sub_context_tree_owned = [False] * len(req.sub_context_extra_keys)
+        if req.sub_context_tree_canonical is None:
+            req.sub_context_tree_canonical = [None] * len(req.sub_context_extra_keys)
 
         seg_last_nodes = []
         for i, (seg_ids, seg_key, offset) in enumerate(req.iter_sub_contexts()):
@@ -948,6 +1070,7 @@ class RadixCache(BasePrefixCache):
             self.inc_lock_ref(seg_match.last_device_node)
             seg_last_nodes.append(seg_match.last_device_node)
             req.sub_context_tree_owned[i] = True
+            req.sub_context_tree_canonical[i] = offset
             req.sub_context_owned_lens[i] = covered_end - offset
 
         req.sub_context_last_nodes = seg_last_nodes

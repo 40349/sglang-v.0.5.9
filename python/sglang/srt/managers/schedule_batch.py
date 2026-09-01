@@ -688,6 +688,15 @@ class Req(ReqDllmMixin):
         # request's to free, so the finish path cannot use one contiguous protected
         # prefix. Parallel to sub_context_ids; None until the first insert pass.
         self.sub_context_tree_owned: Optional[List[bool]] = None
+        # Per block, the absolute position the *tree* holds that block at. Equal to the
+        # block's own offset except where `_reverse_rotate_insert_sub_contexts` filed it
+        # under a namespace that already stood for another position; the generated tail
+        # has to be rotated by the same delta to continue that chain. Parallel to
+        # sub_context_ids; None until the first insert pass.
+        self.sub_context_tree_canonical: Optional[List[Optional[int]]] = None
+        # Tokens of a declined block rotated *back* to the tree's position at finish and
+        # inserted there. Drained by the forward trace like `sub_context_rotated`.
+        self.sub_context_reinserted: int = 0
 
         # # --- 強制攔截：只要是我們自訂的 subcontext，強制不生成任何新 token ---
         # if self.extra_key in ["system_prompt_key", "tools_key", "messages_key"]:
@@ -1313,6 +1322,7 @@ class Req(ReqDllmMixin):
         # retraction) has had its KV freed, so last time's ownership is stale -- and a
         # stale True means the finish path leaves this request's own slots unfreed.
         self.sub_context_tree_owned = None
+        self.sub_context_tree_canonical = None
         self.sub_context_match_indices = match_indices
         self.sub_context_match_nodes = match_nodes
         self.sub_context_match_positions = match_positions

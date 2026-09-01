@@ -159,6 +159,52 @@ class TestRotateKV(unittest.TestCase):
         for layer in range(2):
             self.assertTrue(torch.equal(pool.k_buffer[layer][src], before[layer]))
 
+    def test_in_place_rotation_matches_the_copying_one(self):
+        """``dst is src``: the write path rotates a block where it already lies.
+
+        Nothing new is allocated there -- the slots are the finishing request's own --
+        so the kernel has to be correct when source and destination are the same row.
+        Each program loads its row before it stores to it, so this holds, and it is
+        cheap enough to keep proving.
+        """
+        device = "cuda"
+        for native in (False, True):
+            with self.subTest(native=native):
+                rope = get_rope(128, 128, 40960, 1000000, rope_scaling=None).to(device)
+                pool = FakePool(64, 3, 4, 128, torch.bfloat16, device)
+                loc = torch.arange(1, 17, dtype=torch.int64, device=device)
+                other = torch.arange(20, 36, dtype=torch.int64, device=device)
+                torch.manual_seed(1)
+                for layer in range(3):
+                    block = torch.randn(
+                        16, 4, 128, dtype=torch.bfloat16, device=device
+                    )
+                    pool.k_buffer[layer][loc] = block
+                    pool.k_buffer[layer][other] = block  # the same K, twice
+                    pool.v_buffer[layer][loc] = torch.randn(
+                        16, 4, 128, dtype=torch.bfloat16, device=device
+                    )
+                    pool.v_buffer[layer][other] = pool.v_buffer[layer][loc]
+                v_before = [pool.v_buffer[i][loc].clone() for i in range(3)]
+
+                rotator = KVRotator(
+                    pool, rope.cos_sin_cache, 128, use_native=native
+                )
+                rotator.rotate_into(loc, loc, -23)  # in place
+                rotator.rotate_into(other, other.clone(), -23)  # separate tensors
+
+                for layer in range(3):
+                    self.assertTrue(
+                        torch.equal(
+                            pool.k_buffer[layer][loc], pool.k_buffer[layer][other]
+                        ),
+                        f"in-place K differs from the two-tensor result at {layer}",
+                    )
+                    self.assertTrue(
+                        torch.equal(pool.v_buffer[layer][loc], v_before[layer]),
+                        f"in-place V was disturbed at layer {layer}",
+                    )
+
     def test_delta_bounds(self):
         rope = get_rope(128, 128, 40960, 1000000, rope_scaling=None).to("cuda")
         rotator = KVRotator(FakePool(8, 1, 4, 128, torch.bfloat16, "cuda"), rope.cos_sin_cache, 128)

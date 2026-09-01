@@ -458,9 +458,11 @@ class TestRotatedBlocks(unittest.TestCase):
         allocator.freed.clear()
         decode_and_finish(cache, pool, req, [9], first_slot=400)
 
-        # The rotated copy of [7,8] and the generated token. The tree owns the head
-        # and the tail block, so neither is freed, and nothing is freed twice.
-        self.assertEqual(sorted(allocator.freed), [400, 900, 901])
+        # Only the rotated copy of [7,8], which the re-file handed back as a duplicate
+        # of what the namespace already held. The generated token 400 is NOT here: the
+        # re-file closed the hole [7,8] left, so the reply could be cached. The tree
+        # owns the head and the tail block, and nothing is freed twice.
+        self.assertEqual(sorted(allocator.freed), [900, 901])
         self.assertEqual(len(allocator.freed), len(set(allocator.freed)))
 
     def test_append_leaves_a_token_to_compute(self):
@@ -683,6 +685,139 @@ class TestSubContextLifecycle(unittest.TestCase):
             ).device_indices.tolist(),
             [103, 104, 200, 201],
         )
+
+
+class TestReverseRotateInsert(unittest.TestCase):
+    """A block the namespace refused is rotated back to its position and filed there.
+
+    The read path can rescue a displaced block for *this* request; the write path could
+    not, so the block stayed a hole, the prompt was never fully tree-owned, and
+    `_cache_sub_context_output` refused the reply. In an agent loop that costs a whole
+    turn: the next round re-prefills every reply it was meant to have cached.
+    """
+
+    TOOLS_KEY = "tools_key"
+
+    def _seed(self, rotator=None):
+        """Cache SYS[1,2,3]@0, TOOLS[7,8]@3, MSG[20,21]@5."""
+        cache, pool, allocator = make_cache(rotator=rotator)
+        first = make_req(
+            "r1", [[1, 2, 3], [7, 8], [20, 21]], [SYS_KEY, self.TOOLS_KEY, MSG_KEY]
+        )
+        prefill(cache, pool, first, first_slot=100)
+        decode_and_finish(cache, pool, first, [], first_slot=200)
+        return cache, pool, allocator
+
+    def _shifted(self):
+        """TOOLS[7,8] sits at offset 2 here, so the tree holds it one place later."""
+        return make_req(
+            "r2",
+            [[1, 2], [7, 8], [40, 41]],
+            [SYS_KEY, self.TOOLS_KEY, MSG_KEY],
+            req_pool_idx=1,
+        )
+
+    def test_declined_block_is_rotated_back_and_filed(self):
+        rotator = FakeRotator()
+        cache, pool, allocator = self._seed(rotator)
+        req = self._shifted()
+        prefill(cache, pool, req, first_slot=300)
+        # The write path still refuses it during prefill: the request is decoding over
+        # these slots, so nothing may move them yet.
+        self.assertEqual(req.sub_context_tree_owned, [True, False, True])
+        rotator.calls.clear()
+
+        decode_and_finish(cache, pool, req, [9], first_slot=400)
+
+        # `canonical - offset` = 3 - 2, the read path's rotation run backwards, and in
+        # place: source and destination are the same slots.
+        self.assertEqual(rotator.calls, [([900, 901], [900, 901], 1)])
+        self.assertEqual(req.sub_context_reinserted, 2)
+        self.assertEqual(cache.sub_context_reinserted_tokens, 2)
+
+    def test_the_reply_is_cached_once_the_hole_is_closed(self):
+        rotator = FakeRotator()
+        cache, pool, allocator = self._seed(rotator)
+        req = self._shifted()
+        prefill(cache, pool, req, first_slot=300)
+        decode_and_finish(cache, pool, req, [9], first_slot=400)
+
+        # MSG is the last block, so the reply extends its namespace -- which the gate
+        # only allows because the re-file left no block un-owned.
+        extended = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey([40, 41, 9], MSG_KEY))
+        )
+        self.assertEqual(extended.device_indices.tolist(), [304, 305, 400])
+
+    def test_the_namespace_keeps_one_position(self):
+        """The re-filed block must read back at the first writer's position."""
+        rotator = FakeRotator()
+        cache, pool, allocator = self._seed(rotator)
+        req = self._shifted()
+        prefill(cache, pool, req, first_slot=300)
+        decode_and_finish(cache, pool, req, [9], first_slot=400)
+
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey([7, 8], self.TOOLS_KEY)))
+        self.assertEqual(cache.matched_canonical_position(m.last_device_node, 2), 3)
+        # A full duplicate: the tree keeps its own copy and the re-file gave back the
+        # rotated one it no longer needs.
+        self.assertEqual(m.device_indices.tolist(), [103, 104])
+        self.assertIn(900, allocator.freed)
+        self.assertIn(901, allocator.freed)
+
+    def test_a_new_tail_reaches_the_tree(self):
+        """The payoff case: the request's block runs past what the namespace holds."""
+        rotator = FakeRotator()
+        cache, pool, allocator = self._seed(rotator)
+        req = make_req(
+            "r2",
+            [[1, 2], [7, 8, 30, 31], [40, 41]],
+            [SYS_KEY, self.TOOLS_KEY, MSG_KEY],
+            req_pool_idx=1,
+        )
+        prefill(cache, pool, req, first_slot=300)
+        decode_and_finish(cache, pool, req, [], first_slot=400)
+
+        # [7,8] was already there at 3; [30,31] is new and lands right after it.
+        m = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey([7, 8, 30, 31], self.TOOLS_KEY))
+        )
+        self.assertEqual(len(m.device_indices), 4)
+        self.assertEqual(cache.matched_canonical_position(m.last_device_node, 4), 3)
+
+    def test_an_unrotatable_delta_keeps_the_old_behaviour(self):
+        rotator = FakeRotator()
+        cache, pool, allocator = self._seed(rotator)
+        req = self._shifted()
+        prefill(cache, pool, req, first_slot=300)  # the read path rotates into 900,901
+        cache.kv_rotator = FakeRotator(max_delta=0)  # ...but the re-file cannot
+        allocator.freed.clear()
+        decode_and_finish(cache, pool, req, [9], first_slot=400)
+
+        self.assertEqual(req.sub_context_reinserted, 0)
+        # The block stays this request's to free, and the reply is dropped as before.
+        self.assertEqual(sorted(allocator.freed), [400, 900, 901])
+        self.assertEqual(
+            len(
+                cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey([40, 41, 9], MSG_KEY))
+                ).device_indices
+            ),
+            2,  # the block, not the reply
+        )
+
+    def test_without_a_rotator_nothing_is_refiled(self):
+        """The plain ON arm must behave exactly as it did before this existed."""
+        cache, pool, allocator = self._seed(rotator=None)
+        req = self._shifted()
+        prefill(cache, pool, req, first_slot=300)
+        allocator.freed.clear()
+        decode_and_finish(cache, pool, req, [9], first_slot=400)
+
+        self.assertEqual(req.sub_context_reinserted, 0)
+        self.assertEqual(cache.sub_context_reinserted_tokens, 0)
+        # Nothing was rotated on the read path either, so [7,8] was recomputed at 302.
+        self.assertEqual(sorted(allocator.freed), [302, 303, 400])
 
 
 class TestSubContextRequestNormalization(unittest.TestCase):
