@@ -172,21 +172,48 @@ case "${1:-}" in
         --model_name $MAS_MODEL \
         --model_temperature $MAS_TEMP \
         --output_path "$INFER" )
-    # A run whose server went away mid-flight still writes a full-length results
-    # file, with `None` where the calls failed -- and `evaluate.py` then reports an
-    # accuracy over only the rows it could score, which looks like a clean number.
-    # Refuse to call that a recording.
+    # A run whose server went away mid-flight still writes a full-length results file,
+    # with `None` where the calls failed -- and `evaluate.py` then reports an accuracy
+    # over only the rows it could score, which looks like a clean number. Refuse to call
+    # that a recording.
+    #
+    # But an empty response is not automatically that. AgentVerse's `parse_solver`
+    # does `re.findall(r"```.*?\n(.+?)```", out)[-1]`, so a reply that runs out of
+    # tokens mid-fence raises IndexError -- the model answered, the method could not
+    # use the answer. That is a real result (a failure) and every arm has some: off 4,
+    # on 1, rot 2 on agentverse/humaneval. Refusing on those would make a clean run
+    # unrecordable, and dropping them would score each arm on its own denominator.
     python - "$INFER" <<'EOF' || exit 1
 import json, sys
 rows = [json.loads(l) for l in open(sys.argv[1])]
-missing = [r.get("task_id") for r in rows if not r.get("response")]
-if missing:
-    print(f"REFUSING: {len(missing)}/{len(rows)} results are empty -- the server went "
-          f"away before this run finished (first: {missing[0]}, last: {missing[-1]}). "
-          f"Any pass@1 over the rest would be scored on a subset. Re-run.",
+gone, unparsed = [], []
+for r in rows:
+    if r.get("response"):
+        continue
+    err = r.get("error") or ""
+    calls = sum(v.get("num_llm_calls", 0) for v in (r.get("token_stats") or {}).values())
+    # Classify on the exception TYPE, not on words anywhere in the traceback: matching
+    # bare status codes read "503" out of a source line number and refused a clean run.
+    tail = [ln for ln in err.strip().splitlines() if ln and not ln[0].isspace()]
+    kind = tail[-1].split(":", 1)[0].lower() if tail else ""
+    transport = not err or calls == 0 or any(
+        w in kind
+        for w in ("connection", "timeout", "apierror", "apistatus", "internalserver",
+                  "serviceunavailable", "badgateway", "remotedisconnected",
+                  "protocolerror", "oserror", "httpx")
+    )
+    (gone if transport else unparsed).append(r.get("task_id"))
+if gone:
+    print(f"REFUSING: {len(gone)}/{len(rows)} results never reached the model -- the "
+          f"server went away before this run finished (first: {gone[0]}, last: "
+          f"{gone[-1]}). Any pass@1 over the rest would be scored on a subset. Re-run.",
           file=sys.stderr)
     raise SystemExit(1)
-print(f"  all {len(rows)} results present")
+if unparsed:
+    print(f"  {len(rows)} results, {len(unparsed)} the method could not parse "
+          f"({', '.join(unparsed[:5])}) -- scored as failures, not dropped")
+else:
+    print(f"  all {len(rows)} results present")
 EOF
     if [ "$REMOTE" = 1 ]; then
       echo "inference results -> $INFER"
@@ -281,6 +308,22 @@ EOF
         --tested_dataset_name "$DATASET" \
         --tested_infer_path "$INFER" \
         --overwrite )
+    # `evaluate.py` leaves eval_score None where the method produced nothing and reports
+    # accuracy over the rest, so each arm gets its own denominator -- on agentverse it
+    # scored off 152/160 = 95.00% and on 154/163 = 94.48%, which reverses over the whole
+    # set. A row the method could not answer is a failure of that arm's run, so score
+    # every row.
+    python - "$OUT/xverify_eval$SUF.jsonl" <<'EOF'
+import json, os, sys
+p = sys.argv[1]
+if not os.path.exists(p):
+    print(f"  (no {p} to re-score)"); raise SystemExit(0)
+rows = [json.loads(l) for l in open(p)]
+ok = sum(1 for r in rows if r.get("eval_score") == 1)
+unscored = sum(1 for r in rows if r.get("eval_score") is None)
+print(f"  pass@1 over ALL {len(rows)}: {ok}/{len(rows)} = {ok / len(rows):.2%}"
+      f"   ({unscored} unanswered, counted as failures)")
+EOF
     ;;
 
   *)
