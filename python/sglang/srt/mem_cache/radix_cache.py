@@ -61,7 +61,12 @@ from sglang.srt.mem_cache.evict_policy import (
 from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
 from sglang.srt.utils import host_timer
 from sglang.srt.utils import subctx_config
+import os
+
 from sglang.srt.utils.subctx_config import CACHE_SUBCONTEXT_OUTPUT
+
+# Per-request KV conservation check on the sub-context finish path.
+AUDIT_ON = os.environ.get("SGLANG_SUBCTX_AUDIT", "") not in ("", "0")
 from sglang.srt.utils.subctx_trace import TRACE_ON, trace
 
 if TYPE_CHECKING:
@@ -288,10 +293,6 @@ class RadixCache(BasePrefixCache):
         # forward trace. Kept on the cache rather than the request because the re-file
         # happens at finish, after that request's last forward pass.
         self.sub_context_reinserted_tokens = 0
-        # Pool-accounting audit (see `_audit_sub_context_finish`). The pool size is not
-        # known here; the scheduler fills it in once it has one. 0 disables the check.
-        self.max_total_num_tokens_for_audit = 0
-        self._sub_context_audit_drift = 0
 
         self.kv_event_queue = []
 
@@ -551,13 +552,16 @@ class RadixCache(BasePrefixCache):
         # this unlocks those leaves rather than re-inserting, and hands the generated
         # continuation to the last block's namespace.
         if req.sub_context_last_nodes is not None:
-            # `_finish_sub_contexts` clears these on its way out.
-            owned_at_entry = list(req.sub_context_tree_owned or [])
-            lens_at_entry = list(req.sub_context_owned_lens or [])
+            if AUDIT_ON:
+                held = kv_indices.tolist()
+                avail_before = self.token_to_kv_pool_allocator.available_size()
+                # `_finish_sub_contexts` clears these on its way out.
+                owned_at_entry = list(req.sub_context_tree_owned or [])
+                lens_at_entry = list(req.sub_context_owned_lens or [])
             self._finish_sub_contexts(req, token_ids, kv_indices, is_insert)
-            if self.max_total_num_tokens_for_audit:
+            if AUDIT_ON:
                 self._audit_sub_context_finish(
-                    req, token_ids, owned_at_entry, lens_at_entry
+                    req, token_ids, held, avail_before, owned_at_entry, lens_at_entry
                 )
             return
 
@@ -593,45 +597,71 @@ class RadixCache(BasePrefixCache):
         self,
         req: Req,
         token_ids: List[int],
+        held: List[int],
+        avail_before: int,
         owned_at_entry: List[bool],
         lens_at_entry: List[int],
     ) -> None:
-        """Name the request that broke the pool's accounting, the moment it breaks it.
+        """Every slot this request held must now be freed exactly once, or tree-owned.
 
-        sglang checks ``available + evictable == max - protected`` only when the
-        scheduler goes idle, by which point hundreds of requests have finished and the
-        culprit is unrecoverable. This is the same identity, evaluated after every
-        sub-context finish -- three O(1) reads -- and it reports only when the drift
-        *changes*, so the first line names the one request that caused it and how.
+        Note what this deliberately does NOT do: check the pool-wide identity
+        ``available + evictable + protected == max``. That only holds when nothing is
+        in flight -- which is why sglang checks it at idle -- and evaluating it per
+        request just measures whatever other requests are holding at that moment.
 
-        Both signs matter and mean different things:
-          drift < 0  slots that are neither free nor in the tree -- lost
-          drift > 0  the tree claims more than the pool holds -- two nodes owning the
-                     same slots, which is the more dangerous one: those slots get
-                     handed out twice.
+        This is per request and self-contained: of the slots this request held,
+        ``released`` went back to the pool and ``kept`` are in a namespace now.
+
+            missing > 0   slots that are in neither -- lost
+            missing < 0   slots that are in BOTH: freed while a node still points at
+                          them, so the pool will hand them out to someone else while
+                          the tree serves them as cache. The corrupting one.
+
+        Behind SGLANG_SUBCTX_AUDIT rather than SGLANG_SUBCTX_TRACE: it costs a
+        match_prefix per block, and the trace flag turns on probes that sit inside the
+        regions host_timer measures, which this does not need to disturb.
         """
-        alloc = self.token_to_kv_pool_allocator
-        drift = (
-            alloc.available_size() + self.evictable_size() + self.protected_size()
-        ) - self.max_total_num_tokens_for_audit
-        if drift == self._sub_context_audit_drift:
+        released = self.token_to_kv_pool_allocator.available_size() - avail_before
+        owned = set()
+        segs = list(req.iter_sub_contexts())
+        for seg_ids, seg_key, offset in segs:
+            end = min(offset + len(seg_ids), len(token_ids))
+            if end > offset:
+                owned.update(
+                    self.match_prefix(
+                        MatchPrefixParams(key=RadixKey(token_ids[offset:end], seg_key))
+                    ).device_indices.tolist()
+                )
+        if segs:
+            # The last namespace may also hold the generated tail.
+            _ids, last_key, last_off = segs[-1]
+            owned.update(
+                self.match_prefix(
+                    MatchPrefixParams(key=RadixKey(token_ids[last_off:], last_key))
+                ).device_indices.tolist()
+            )
+
+        held_set = set(held)
+        kept = len(held_set & owned)
+        missing = len(held_set) - released - kept
+        if missing == 0 and len(held_set) == len(held):
             return
-        delta = drift - self._sub_context_audit_drift
-        self._sub_context_audit_drift = drift
-        segs = [(k, len(i), o) for i, k, o in req.iter_sub_contexts()]
         logger.error(
-            "SUBCTX-IMBALANCE rid=%s this_request=%+d running=%+d (%s) "
-            "prompt=%d committed=%d tree_owned=%s owned_lens=%s blocks=%s "
-            "reinserted=%d rotated=%d moved=%d",
+            "SUBCTX-AUDIT rid=%s %s held=%d distinct=%d released=%d kept=%d "
+            "missing=%+d prompt=%d committed=%d tree_owned=%s owned_lens=%s "
+            "blocks=%s reinserted=%d rotated=%d moved=%d",
             req.rid,
-            delta,
-            drift,
-            "tree owns slots twice" if delta > 0 else "slots lost",
-            sum(n for _, n, _ in segs),
+            "LOST" if missing > 0 else ("DOUBLE-OWNED" if missing < 0 else "DUP-SLOTS"),
+            len(held),
+            len(held_set),
+            released,
+            kept,
+            missing,
+            sum(len(i) for i, _, _ in segs),
             len(token_ids),
             owned_at_entry,
             lens_at_entry,
-            segs,
+            [(k, len(i), o) for i, k, o in segs],
             req.sub_context_reinserted,
             req.sub_context_rotated,
             req.sub_context_moved,

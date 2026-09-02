@@ -20,9 +20,10 @@
 #                   scheduler is a spawned child and does not inherit `python -u`, so
 #                   its print() output is block-buffered and the last -- most
 #                   interesting -- lines are lost when it dies.
-#
-# The pool-accounting audit (SUBCTX-IMBALANCE) needs neither: it is always on, costs
-# three O(1) reads per finished request, and goes through the logger.
+#   SUBCTX_AUDIT=1  per-request KV conservation check on the finish path: reports
+#                   SUBCTX-AUDIT naming any request whose slots end up in neither the
+#                   pool nor a namespace (LOST) or in both (DOUBLE-OWNED). Costs a
+#                   match_prefix per block; goes through the logger, so no buffering.
 #   DUMP_TREE=1     print the whole radix tree after every extend pass
 #
 # The arm is an env var read once at server start, so it cannot be changed without a
@@ -92,6 +93,7 @@ SGLANG_DISABLE_SUBCONTEXT=$SUBCTX_OFF \
 SGLANG_SUBCONTEXT_ROTATE=$ROT \
 SGLANG_SUBCONTEXT_ROTATE_ACROSS=$ROT_ACROSS \
 SGLANG_SUBCTX_TRACE=${SUBCTX_TRACE:-} \
+SGLANG_SUBCTX_AUDIT=${SUBCTX_AUDIT:-} \
 PYTHONUNBUFFERED=${SUBCTX_TRACE:+1} \
 SGLANG_DUMP_TREE=${DUMP_TREE:-} \
 SGLANG_CAPTURE_REQUESTS=$WORK_DIR/traces/requests_${SUF}.jsonl \

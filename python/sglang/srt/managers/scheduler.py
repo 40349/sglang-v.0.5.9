@@ -763,10 +763,6 @@ class Scheduler(
 
         if DISABLE_SUBCONTEXT:
             return
-        # Lets the tree cache check the pool's accounting after every sub-context
-        # finish, so a request that loses or double-owns KV names itself immediately
-        # instead of surfacing as an idle-time leak hundreds of requests later.
-        self.tree_cache.max_total_num_tokens_for_audit = self.max_total_num_tokens
         reason = unsupported_reason(self.tree_cache)
         if reason is not None:
             raise ValueError(
