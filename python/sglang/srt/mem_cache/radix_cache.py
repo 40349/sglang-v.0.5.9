@@ -527,6 +527,10 @@ class RadixCache(BasePrefixCache):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        # A VIEW of req_to_token, not a copy: anything that re-points a slot -- the
+        # sub-context paths do -- is visible through it immediately. That is what makes
+        # it the authoritative position->slot map, and it is why the sub-context paths
+        # free before they write back, never after.
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -552,17 +556,30 @@ class RadixCache(BasePrefixCache):
         # this unlocks those leaves rather than re-inserting, and hands the generated
         # continuation to the last block's namespace.
         if req.sub_context_last_nodes is not None:
-            if AUDIT_ON:
-                held = kv_indices.tolist()
-                avail_before = self.token_to_kv_pool_allocator.available_size()
-                # `_finish_sub_contexts` clears these on its way out.
-                owned_at_entry = list(req.sub_context_tree_owned or [])
-                lens_at_entry = list(req.sub_context_owned_lens or [])
-            self._finish_sub_contexts(req, token_ids, kv_indices, is_insert)
-            if AUDIT_ON:
-                self._audit_sub_context_finish(
-                    req, token_ids, held, avail_before, owned_at_entry, lens_at_entry
-                )
+            if not AUDIT_ON:
+                self._finish_sub_contexts(req, token_ids, kv_indices, is_insert)
+                return
+            held = kv_indices.tolist()
+            # `_finish_sub_contexts` clears these on its way out.
+            owned_at_entry = list(req.sub_context_tree_owned or [])
+            lens_at_entry = list(req.sub_context_owned_lens or [])
+            # Count frees exactly rather than reading them off the allocator: this runs
+            # inside a free_group, where they are batched and invisible until it closes.
+            alloc = self.token_to_kv_pool_allocator
+            real_free, freed = alloc.free, set()
+
+            def _counting_free(indices):
+                freed.update(indices.tolist())
+                return real_free(indices)
+
+            alloc.free = _counting_free
+            try:
+                self._finish_sub_contexts(req, token_ids, kv_indices, is_insert)
+            finally:
+                alloc.free = real_free
+            self._audit_sub_context_finish(
+                req, token_ids, held, freed, owned_at_entry, lens_at_entry
+            )
             return
 
         # Maybe convert to bigram keys for EAGLE
@@ -598,30 +615,29 @@ class RadixCache(BasePrefixCache):
         req: Req,
         token_ids: List[int],
         held: List[int],
-        avail_before: int,
+        freed: set,
         owned_at_entry: List[bool],
         lens_at_entry: List[int],
     ) -> None:
-        """Every slot this request held must now be freed exactly once, or tree-owned.
+        """Every slot this request held must end up freed exactly once, or tree-owned.
 
-        Note what this deliberately does NOT do: check the pool-wide identity
-        ``available + evictable + protected == max``. That only holds when nothing is
-        in flight -- which is why sglang checks it at idle -- and evaluating it per
-        request just measures whatever other requests are holding at that moment.
+        Two things this deliberately does NOT infer, both of which produced convincing
+        false positives before:
 
-        This is per request and self-contained: of the slots this request held,
-        ``released`` went back to the pool and ``kept`` are in a namespace now.
+        - the pool-wide identity ``available + evictable + protected == max``. It only
+          holds with nothing in flight, which is why sglang checks it at idle; per
+          request it just measures what other requests are holding.
+        - frees, from the allocator's available_size. ``release_kv_cache`` runs inside
+          a ``free_group`` (``scheduler_output_processor_mixin.py:385``), so frees are
+          batched and available_size does not move until the group closes.
 
-            missing > 0   slots that are in neither -- lost
-            missing < 0   slots that are in BOTH: freed while a node still points at
-                          them, so the pool will hand them out to someone else while
-                          the tree serves them as cache. The corrupting one.
+        So ``freed`` is the exact set of slots this call passed to ``free``, captured
+        by wrapping the allocator for the duration.
 
-        Behind SGLANG_SUBCTX_AUDIT rather than SGLANG_SUBCTX_TRACE: it costs a
-        match_prefix per block, and the trace flag turns on probes that sit inside the
-        regions host_timer measures, which this does not need to disturb.
+            lost    in neither the pool nor a namespace
+            double  in BOTH: freed while a node still points at them, so the pool will
+                    hand them out again while the tree still serves them as cache
         """
-        released = self.token_to_kv_pool_allocator.available_size() - avail_before
         owned = set()
         segs = list(req.iter_sub_contexts())
         for seg_ids, seg_key, offset in segs:
@@ -642,21 +658,20 @@ class RadixCache(BasePrefixCache):
             )
 
         held_set = set(held)
-        kept = len(held_set & owned)
-        missing = len(held_set) - released - kept
-        if missing == 0 and len(held_set) == len(held):
+        lost = held_set - freed - owned
+        double = held_set & freed & owned
+        if not lost and not double:
             return
         logger.error(
-            "SUBCTX-AUDIT rid=%s %s held=%d distinct=%d released=%d kept=%d "
-            "missing=%+d prompt=%d committed=%d tree_owned=%s owned_lens=%s "
-            "blocks=%s reinserted=%d rotated=%d moved=%d",
+            "SUBCTX-AUDIT rid=%s lost=%d double_owned=%d held=%d freed=%d kept=%d "
+            "prompt=%d committed=%d tree_owned=%s owned_lens=%s blocks=%s "
+            "reinserted=%d rotated=%d moved=%d lost_at=%s",
             req.rid,
-            "LOST" if missing > 0 else ("DOUBLE-OWNED" if missing < 0 else "DUP-SLOTS"),
-            len(held),
+            len(lost),
+            len(double),
             len(held_set),
-            released,
-            kept,
-            missing,
+            len(freed),
+            len(held_set & owned),
             sum(len(i) for i, _, _ in segs),
             len(token_ids),
             owned_at_entry,
@@ -665,6 +680,19 @@ class RadixCache(BasePrefixCache):
             req.sub_context_reinserted,
             req.sub_context_rotated,
             req.sub_context_moved,
+            # Which block the lost slots sat in, by position in req_to_token.
+            sorted(
+                {
+                    k
+                    for i, k, o in segs
+                    for pos, slot in enumerate(held)
+                    if slot in lost and o <= pos < o + len(i)
+                }
+                | ({"generated_tail"} if any(
+                    slot in lost
+                    for slot in held[sum(len(i) for i, _, _ in segs):]
+                ) else set())
+            ) if lost else [],
         )
 
     def _finish_sub_contexts(
@@ -792,6 +820,14 @@ class RadixCache(BasePrefixCache):
             self.req_to_token_pool.write(
                 (req.req_pool_idx, slice(offset, end)), seg_match.device_indices
             )
+            # Lock it, exactly as the unfinished path locks every block it inserts.
+            # Nothing can evict between here and the end of this call today, so this
+            # buys no safety now -- it keeps the invariant true, so that a later change
+            # that *can* evict in between does not silently pull the node out from
+            # under `_cache_sub_context_output`. Released by the dec_lock_ref loop at
+            # the end of `_finish_sub_contexts`, which walks this same list.
+            self.inc_lock_ref(seg_match.last_device_node)
+            req.sub_context_last_nodes.append(seg_match.last_device_node)
             req.sub_context_tree_owned[i] = True
             req.sub_context_tree_canonical[i] = canonical
             req.sub_context_owned_lens[i] = len(seg_ids)
@@ -883,6 +919,26 @@ class RadixCache(BasePrefixCache):
         # only a match reaching *past* it is a freshly computed duplicate. Everything
         # the insert did not match now belongs to the tree and must not be freed.
         owned = len(last_seg)
+        # `kv_indices` is a view of req_to_token, and the block's entries may have been
+        # re-pointed at the tree's slots by `_reverse_rotate_insert_sub_contexts`. That
+        # is only safe while the tree really does hold the whole block, because then
+        # `insert` matches it and stores nothing from `value[:owned]`. If it ever did
+        # store part of it, those slots would be owned by two nodes at once and handed
+        # out again while still being served as cache. It cannot happen today -- the
+        # block was inserted a few lines ago and nothing evicts in between -- so say so
+        # out loud rather than leave it resting on that.
+        if result.prefix_len < owned:
+            logger.error(
+                "SUBCTX-OUTPUT-UNDERMATCH rid=%s extra_key=%r offset=%d "
+                "block=%d matched=%d -- the namespace lost the block between the "
+                "insert and here; %d slots may now be owned twice",
+                req.rid,
+                seg_key,
+                offset,
+                owned,
+                result.prefix_len,
+                owned - result.prefix_len,
+            )
         if result.prefix_len > owned:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[offset + owned : offset + result.prefix_len]
