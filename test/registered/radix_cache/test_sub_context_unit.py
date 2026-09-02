@@ -980,3 +980,78 @@ class TestSubContextTruncation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRetractedRequest(unittest.TestCase):
+    """A retracted request re-enters prefill with its generated tokens in fill_ids.
+
+    `init_next_round_input` sets ``fill_ids = origin_input_ids + output_ids``
+    (`schedule_batch.py:1029`), so once a request has produced anything its fill_ids are
+    longer than the prompt the split describes. The read path stitches per namespace
+    regardless -- its gate never looks at that length -- so the request comes back
+    holding the namespaces' own slots.
+    """
+
+    def _retracted(self, cache, pool):
+        first = make_req("r1", [[1, 2, 3], [40, 41]], [SYS_KEY, MSG_KEY])
+        prefill(cache, pool, first, first_slot=100)
+        decode_and_finish(cache, pool, first, [], first_slot=200)
+
+        second = make_req(
+            "r2", [[1, 2, 3], [40, 41]], [SYS_KEY, MSG_KEY], req_pool_idx=1
+        )
+        second.output_ids = [9]  # retracted after generating one token
+        second.init_next_round_input(cache)
+        n = len(second.origin_input_ids)
+        reused = len(second.prefix_indices)
+        pool.req_to_token[1, :reused] = second.prefix_indices
+        pool.req_to_token[1, reused : n + 1] = torch.arange(
+            300, 300 + n + 1 - reused, dtype=torch.int64
+        )
+        second.sub_context_rotated_slots = None
+        self.assertGreater(len(second.fill_ids), n, "not the retracted shape")
+        self.assertGreater(reused, 0, "the stitch reused nothing; nothing to protect")
+        return second
+
+    def _namespace_slots(self, cache):
+        slots = set()
+        for key, ids in ((SYS_KEY, [1, 2, 3]), (MSG_KEY, [40, 41])):
+            slots.update(
+                cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(ids, key))
+                ).device_indices.tolist()
+            )
+        return slots
+
+    def test_a_namespace_slot_never_gets_a_second_owner(self):
+        """The write path must follow the read path into the namespaces.
+
+        Writing this request to the default namespace instead files the KV the
+        namespaces already own under a second node. Nothing is freed at that moment, so
+        no audit fires -- but from then on either owner can free it while the other goes
+        on serving it, which is how the pool starts handing out live KV.
+        """
+        cache, pool, allocator = make_cache()
+        second = self._retracted(cache, pool)
+        cache.cache_unfinished_req(second)
+
+        default = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(list(second.fill_ids), None))
+        ).device_indices.tolist()
+        self.assertEqual(
+            sorted(self._namespace_slots(cache) & set(default)),
+            [],
+            "namespace slots filed under the default namespace as well",
+        )
+
+    def test_it_still_reaches_the_audited_finish_path(self):
+        """...and therefore finishes through the audited branch rather than around it.
+
+        `cache_finished_req` picks its branch on `sub_context_last_nodes`, which only
+        the per-namespace insert sets. A request that wrote to the default namespace
+        finishes through the ordinary path, where the conservation check never runs.
+        """
+        cache, pool, allocator = make_cache()
+        second = self._retracted(cache, pool)
+        cache.cache_unfinished_req(second)
+        self.assertIsNotNone(second.sub_context_last_nodes)

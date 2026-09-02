@@ -674,6 +674,28 @@ class RadixCache(BasePrefixCache):
             )
         return owned
 
+    def _double_owners(self, double: set) -> List[Tuple[str, int]]:
+        """Which namespaces hold the doubly-owned slots, by walking the whole tree.
+
+        Only ever called once the check has already failed -- a full walk is far too
+        expensive to do routinely -- and it is what names the *second* owner. Two owners
+        in the same namespace is a free that ran past what this request owned; owners in
+        two different namespaces means something wrote across the split, which no
+        per-block bookkeeping can see.
+        """
+        owners = Counter()
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children.values())
+            value = node.value
+            if value is None or len(value) == 0 or not torch.is_tensor(value):
+                continue
+            hit = len(double.intersection(value.tolist()))
+            if hit:
+                owners[str(node.key.extra_key)] += hit
+        return sorted(owners.items())
+
     def _audit_sub_context_chunk(
         self, req: Req, token_ids: List[int], freed: set, freed_at: dict
     ) -> None:
@@ -690,7 +712,7 @@ class RadixCache(BasePrefixCache):
             return
         logger.error(
             "SUBCTX-AUDIT-CHUNK rid=%s double_owned=%d freed=%d covered=%d "
-            "tree_owned=%s owned_lens=%s double_at=%s",
+            "tree_owned=%s owned_lens=%s double_at=%s owners=%s",
             req.rid,
             len(double),
             len(freed),
@@ -702,6 +724,7 @@ class RadixCache(BasePrefixCache):
                     site for slot in double for site in freed_at.get(slot, ())
                 ).items()
             ),
+            self._double_owners(double),
         )
 
     def _audit_sub_context_finish(
@@ -749,7 +772,8 @@ class RadixCache(BasePrefixCache):
         logger.error(
             "SUBCTX-AUDIT rid=%s lost=%d double_owned=%d held=%d dup=%d freed=%d "
             "kept=%d prompt=%d committed=%d tree_owned=%s owned_lens=%s blocks=%s "
-            "reinserted=%d rotated=%d moved=%d lost_at=%s double_at=%s double_in=%s",
+            "reinserted=%d rotated=%d moved=%d lost_at=%s double_at=%s double_in=%s "
+            "owners=%s double_pos=%s double_slots=%s",
             req.rid,
             len(lost),
             len(double),
@@ -793,6 +817,13 @@ class RadixCache(BasePrefixCache):
                     if slot in double and o <= pos < o + len(i)
                 }
             ) if double else [],
+            self._double_owners(double) if double else [],
+            # Where the doubly-owned slots sit in this request's own map, and which
+            # slots they are. With `owners` that is enough to say whether they came in
+            # with the stitch, were computed fresh, or belong to the generated tail --
+            # the three cases have entirely different causes.
+            [pos for pos, slot in enumerate(held) if slot in double][:8],
+            sorted(double)[:8],
         )
 
     def _finish_sub_contexts(
@@ -1109,11 +1140,18 @@ class RadixCache(BasePrefixCache):
         # This gate must stay equivalent to the read path's in
         # `Req.init_next_round_input`, or matches and inserts land in different
         # namespaces; `supports_sub_contexts` is what both consult.
-        if (
-            req.has_sub_contexts
-            and self.supports_sub_contexts()
-            and len(token_ids) <= sum(len(s) for s in req.sub_context_ids)
-        ):
+        # Exactly the read path's gate in `Req.init_next_round_input`, and it has to
+        # stay that way. It once also required `len(token_ids)` to fit inside the split
+        # prompt, which looks harmless and is not: a retracted request comes back with
+        # `fill_ids = origin_input_ids + output_ids` (`schedule_batch.py:1029`), so it
+        # failed that clause while the read path -- which never looked at the length --
+        # had already stitched it out of the namespaces. It was then written to the
+        # DEFAULT namespace, filing slots the namespace nodes own under a second owner,
+        # and finished through the branch the conservation check does not cover. The
+        # per-block insert below clamps every block to what this pass covers, so a
+        # longer `token_ids` needs no gate: the generated tail simply belongs to no
+        # block, and `_cache_sub_context_output` is what offers it to the tree.
+        if req.has_sub_contexts and self.supports_sub_contexts():
             if not AUDIT_ON:
                 self._cache_unfinished_sub_contexts(req, token_ids, kv_indices)
                 return
