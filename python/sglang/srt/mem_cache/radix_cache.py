@@ -26,7 +26,7 @@ import heapq
 import logging
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
@@ -202,6 +202,28 @@ def _key_match_paged(key0: RadixKey, key1: RadixKey, page_size: int):
         i += page_size
 
     return i
+
+
+def _shared_head_len(tree_slots: torch.Tensor, our_slots: torch.Tensor) -> int:
+    """How many leading slots of a block a tree node is holding *right now*.
+
+    Slot identity is the only honest test of "does the tree own this KV". A declined
+    block can carry a node's own slots at its head: the stitch took a plain hit at this
+    offset, and a later writer then displaced the namespace, so the block reaches finish
+    refused even though its head still belongs to a node. Those slots are neither this
+    request's to free nor its to rotate in place.
+
+    Compared against the tree at the moment it matters rather than tracked from
+    admission. The namespace can be inserted into, split, or evicted in between, and a
+    stale count is exactly the kind that hands a live node's KV back to the pool.
+    """
+    n = min(len(tree_slots), len(our_slots))
+    if n == 0:
+        return 0
+    same = tree_slots[:n] == our_slots[:n]
+    if bool(same.all()):
+        return n
+    return int(torch.argmin(same.to(torch.uint8)).item())
 
 
 def get_child_key(key: RadixKey, page_size: int = 1):
@@ -563,22 +585,13 @@ class RadixCache(BasePrefixCache):
             # `_finish_sub_contexts` clears these on its way out.
             owned_at_entry = list(req.sub_context_tree_owned or [])
             lens_at_entry = list(req.sub_context_owned_lens or [])
-            # Count frees exactly rather than reading them off the allocator: this runs
-            # inside a free_group, where they are batched and invisible until it closes.
-            alloc = self.token_to_kv_pool_allocator
-            real_free, freed = alloc.free, set()
-
-            def _counting_free(indices):
-                freed.update(indices.tolist())
-                return real_free(indices)
-
-            alloc.free = _counting_free
-            try:
-                self._finish_sub_contexts(req, token_ids, kv_indices, is_insert)
-            finally:
-                alloc.free = real_free
+            freed, freed_at = self._capture_frees(
+                lambda: self._finish_sub_contexts(
+                    req, token_ids, kv_indices, is_insert
+                )
+            )
             self._audit_sub_context_finish(
-                req, token_ids, held, freed, owned_at_entry, lens_at_entry
+                req, token_ids, held, freed, freed_at, owned_at_entry, lens_at_entry
             )
             return
 
@@ -610,12 +623,94 @@ class RadixCache(BasePrefixCache):
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
 
+    def _capture_frees(self, fn) -> Tuple[set, dict]:
+        """Run ``fn``, returning the exact slots it freed and the line that freed each.
+
+        Counted rather than read off the allocator: these paths run inside a
+        ``free_group`` (``scheduler_output_processor_mixin.py:385``), where frees are
+        batched and ``available_size`` does not move until the group closes -- an
+        earlier version of this audit inferred frees that way and reported ``released=0``
+        for every request.
+        """
+        alloc = self.token_to_kv_pool_allocator
+        real_free, freed, freed_at = alloc.free, set(), {}
+
+        def _counting_free(indices):
+            # The caller's line number, so a doubly-owned slot names the free that
+            # released it instead of leaving several candidate sites to reason about.
+            site = sys._getframe(1).f_lineno
+            slots = indices.tolist()
+            freed.update(slots)
+            for slot in slots:
+                freed_at.setdefault(slot, set()).add(site)
+            return real_free(indices)
+
+        alloc.free = _counting_free
+        try:
+            fn()
+        finally:
+            alloc.free = real_free
+        return freed, freed_at
+
+    def _tree_owned_slots(self, req: Req, token_ids: List[int]) -> set:
+        """Every slot reachable from a namespace node for this request's blocks."""
+        owned = set()
+        segs = list(req.iter_sub_contexts())
+        for seg_ids, seg_key, offset in segs:
+            end = min(offset + len(seg_ids), len(token_ids))
+            if end > offset:
+                owned.update(
+                    self.match_prefix(
+                        MatchPrefixParams(key=RadixKey(token_ids[offset:end], seg_key))
+                    ).device_indices.tolist()
+                )
+        if segs:
+            # The last namespace may also hold the generated tail.
+            _ids, last_key, last_off = segs[-1]
+            owned.update(
+                self.match_prefix(
+                    MatchPrefixParams(key=RadixKey(token_ids[last_off:], last_key))
+                ).device_indices.tolist()
+            )
+        return owned
+
+    def _audit_sub_context_chunk(
+        self, req: Req, token_ids: List[int], freed: set, freed_at: dict
+    ) -> None:
+        """The per-chunk half of the conservation check.
+
+        Only the ``double`` side is checkable here: a chunked request legitimately holds
+        slots that are neither freed nor tree-owned yet, so ``lost`` is meaningless
+        mid-prefill. Freeing a slot a node still points at is wrong at any point, and
+        this is the one free site the finish audit cannot see -- without it a corruption
+        that starts here only ever shows up on its victims.
+        """
+        double = freed & self._tree_owned_slots(req, token_ids)
+        if not double:
+            return
+        logger.error(
+            "SUBCTX-AUDIT-CHUNK rid=%s double_owned=%d freed=%d covered=%d "
+            "tree_owned=%s owned_lens=%s double_at=%s",
+            req.rid,
+            len(double),
+            len(freed),
+            len(token_ids),
+            req.sub_context_tree_owned,
+            req.sub_context_owned_lens,
+            sorted(
+                Counter(
+                    site for slot in double for site in freed_at.get(slot, ())
+                ).items()
+            ),
+        )
+
     def _audit_sub_context_finish(
         self,
         req: Req,
         token_ids: List[int],
         held: List[int],
         freed: set,
+        freed_at: dict,
         owned_at_entry: List[bool],
         lens_at_entry: List[int],
     ) -> None:
@@ -637,25 +732,14 @@ class RadixCache(BasePrefixCache):
             lost    in neither the pool nor a namespace
             double  in BOTH: freed while a node still points at them, so the pool will
                     hand them out again while the tree still serves them as cache
+
+        ``dup`` counts positions in req_to_token sharing a slot with another position.
+        It is a *downstream* symptom, not a cause: once the pool has reissued a live
+        slot, later requests hold it twice over, so a run with dup > 0 on its first
+        audited request means the damage started before this request.
         """
-        owned = set()
         segs = list(req.iter_sub_contexts())
-        for seg_ids, seg_key, offset in segs:
-            end = min(offset + len(seg_ids), len(token_ids))
-            if end > offset:
-                owned.update(
-                    self.match_prefix(
-                        MatchPrefixParams(key=RadixKey(token_ids[offset:end], seg_key))
-                    ).device_indices.tolist()
-                )
-        if segs:
-            # The last namespace may also hold the generated tail.
-            _ids, last_key, last_off = segs[-1]
-            owned.update(
-                self.match_prefix(
-                    MatchPrefixParams(key=RadixKey(token_ids[last_off:], last_key))
-                ).device_indices.tolist()
-            )
+        owned = self._tree_owned_slots(req, token_ids)
 
         held_set = set(held)
         lost = held_set - freed - owned
@@ -663,13 +747,14 @@ class RadixCache(BasePrefixCache):
         if not lost and not double:
             return
         logger.error(
-            "SUBCTX-AUDIT rid=%s lost=%d double_owned=%d held=%d freed=%d kept=%d "
-            "prompt=%d committed=%d tree_owned=%s owned_lens=%s blocks=%s "
-            "reinserted=%d rotated=%d moved=%d lost_at=%s",
+            "SUBCTX-AUDIT rid=%s lost=%d double_owned=%d held=%d dup=%d freed=%d "
+            "kept=%d prompt=%d committed=%d tree_owned=%s owned_lens=%s blocks=%s "
+            "reinserted=%d rotated=%d moved=%d lost_at=%s double_at=%s double_in=%s",
             req.rid,
             len(lost),
             len(double),
             len(held_set),
+            len(held) - len(held_set),
             len(freed),
             len(held_set & owned),
             sum(len(i) for i, _, _ in segs),
@@ -693,6 +778,21 @@ class RadixCache(BasePrefixCache):
                     for slot in held[sum(len(i) for i, _, _ in segs):]
                 ) else set())
             ) if lost else [],
+            # Which free released the doubly-owned slots, by source line, and which
+            # block they sit in. Between them these name the defect outright.
+            sorted(
+                Counter(
+                    site for slot in double for site in freed_at.get(slot, ())
+                ).items()
+            ) if double else [],
+            sorted(
+                {
+                    k
+                    for i, k, o in segs
+                    for pos, slot in enumerate(held)
+                    if slot in double and o <= pos < o + len(i)
+                }
+            ) if double else [],
         )
 
     def _finish_sub_contexts(
@@ -724,13 +824,24 @@ class RadixCache(BasePrefixCache):
         # freeing from the first hole onwards would free slots the tree now owns.
         prompt_len = 0
         if req.sub_context_tree_owned is not None:
-            for i, (seg_ids, _seg_key, offset) in enumerate(req.iter_sub_contexts()):
+            for i, (seg_ids, seg_key, offset) in enumerate(req.iter_sub_contexts()):
                 end = min(offset + len(seg_ids), len(kv_indices))
                 if end <= offset:
                     break
                 prompt_len = end
-                if not req.sub_context_tree_owned[i]:
-                    self.token_to_kv_pool_allocator.free(kv_indices[offset:end])
+                if req.sub_context_tree_owned[i]:
+                    continue
+                # A declined block is not wholly this request's either: its head can be
+                # a node's own slots (see `_shared_head_len`). Freeing from the block's
+                # start would give those to the pool while the tree still serves them.
+                match = self.match_prefix(
+                    MatchPrefixParams(key=RadixKey(token_ids[offset:end], seg_key))
+                )
+                shared = _shared_head_len(match.device_indices, kv_indices[offset:end])
+                if end > offset + shared:
+                    self.token_to_kv_pool_allocator.free(
+                        kv_indices[offset + shared : end]
+                    )
         else:
             prompt_len = req.cache_protected_len
 
@@ -789,17 +900,28 @@ class RadixCache(BasePrefixCache):
             canonical = self.matched_canonical_position(
                 probe.last_device_node, len(probe.device_indices)
             )
+            # What of this block the tree is already holding, by slot identity.
+            shared = _shared_head_len(probe.device_indices, kv_indices[offset:end])
             if canonical is None:
                 # Whatever conflicted has since been evicted: the namespace is free to
                 # take this block where it actually sits.
                 canonical = offset
             delta = canonical - offset
             if delta != 0:
+                if shared:
+                    # The head of this block IS a node's KV. Rotating in place would
+                    # re-rotate slots other requests match against, while the node goes
+                    # on advertising its old canonical position -- silent cross-request
+                    # corruption, the worst failure this mechanism can produce. Copying
+                    # the whole block instead costs more than the re-file is worth, so
+                    # this block keeps today's drop behaviour.
+                    continue
                 if not self.kv_rotator.can_rotate(delta):
                     continue  # out of the cos_sin_cache's range; drop as before
                 seg_slots = kv_indices[offset:end]
-                # In place: these slots are this request's own (freshly computed, or a
-                # rotated copy it owns), never a node other requests hold a lock on.
+                # In place, and safe only because `shared` is 0: every slot here was
+                # allocated by this request (freshly computed, or a rotated copy it
+                # owns), so no node other requests hold a lock on is touched.
                 self.kv_rotator.rotate_into(seg_slots, seg_slots, delta)
 
             result = self.insert(
@@ -810,22 +932,18 @@ class RadixCache(BasePrefixCache):
                     canonical_position=canonical,
                 )
             )
-            # Give back only what is genuinely this request's. The stitch may have
-            # taken the head of this block STRAIGHT FROM THE TREE -- a plain hit at
-            # this offset, which a later writer then displaced, so the block reached
-            # finish declined even though its first `from_tree` slots belong to a node.
-            # Freeing those hands the same KV to the pool and the tree at once: the
-            # allocator reissues them while the tree still serves them as cache.
+            # Give back only what is genuinely this request's: the duplicates it
+            # computed for a region the tree already covered. `shared` is where its own
+            # slots begin -- freeing below that hands the same KV to the pool and the
+            # tree at once, so the allocator reissues it while the tree still serves it
+            # as cache.
             #
-            # `sub_context_owned_lens` cannot stand in for this: it counts the same
-            # head as reused whether it came from the tree or from a rotated copy this
-            # request allocated, and a rotated copy IS this request's to free.
-            from_tree = (
-                req.sub_context_tree_reused[i] if req.sub_context_tree_reused else 0
-            )
-            if result.prefix_len > from_tree:
+            # `sub_context_owned_lens` cannot stand in for `shared`: it counts a head as
+            # reused whether it came from the tree or from a rotated copy this request
+            # allocated, and a rotated copy IS this request's to free.
+            if result.prefix_len > shared:
                 self.token_to_kv_pool_allocator.free(
-                    kv_indices[offset + from_tree : offset + result.prefix_len]
+                    kv_indices[offset + shared : offset + result.prefix_len]
                 )
             seg_match = self.match_prefix(MatchPrefixParams(key=radix_key))
             self.req_to_token_pool.write(
@@ -996,7 +1114,15 @@ class RadixCache(BasePrefixCache):
             and self.supports_sub_contexts()
             and len(token_ids) <= sum(len(s) for s in req.sub_context_ids)
         ):
-            self._cache_unfinished_sub_contexts(req, token_ids, kv_indices)
+            if not AUDIT_ON:
+                self._cache_unfinished_sub_contexts(req, token_ids, kv_indices)
+                return
+            freed, freed_at = self._capture_frees(
+                lambda: self._cache_unfinished_sub_contexts(
+                    req, token_ids, kv_indices
+                )
+            )
+            self._audit_sub_context_chunk(req, token_ids, freed, freed_at)
             return
 
         # Maybe convert to bigram keys for EAGLE

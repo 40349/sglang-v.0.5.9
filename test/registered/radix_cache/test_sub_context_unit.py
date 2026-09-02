@@ -788,18 +788,20 @@ class TestReverseRotateInsert(unittest.TestCase):
         self.assertEqual(len(m.device_indices), 4)
         self.assertEqual(cache.matched_canonical_position(m.last_device_node, 4), 3)
 
-    def test_a_tree_reused_head_is_never_handed_back(self):
-        """The head of a declined block can belong to the TREE, not this request.
+    def _declined_block_with_shared_head(self):
+        """A block the write path refused whose head is the TREE's own slots.
 
         Seen on H200 job 429: `tree_owned=[True, False]` with `owned_lens=[259, 2197]`
-        -- the stitch took 2197 slots of the messages block straight from the tree at a
-        plain hit, and only afterwards did another writer move that namespace, so the
-        write path declined the block. Freeing from the block's start then returns the
-        tree's own slots to the pool while its node still points at them: the allocator
-        reissues them and the tree keeps serving them, which is how the KV cache ends
-        up claiming more tokens than the pool holds.
+        -- the stitch took the messages block's head straight from the tree at a plain
+        hit, and only afterwards did another writer move that namespace, so the write
+        path declined the block. From finish's point of view the block is "not tree
+        owned", yet part of it is, and that is the whole trap.
+
+        Returns the pieces both regressions need, with the request stitched, written to
+        req_to_token, and already through `cache_unfinished_req`.
         """
-        cache, pool, allocator = make_cache(rotator=FakeRotator())
+        rotator = FakeRotator()
+        cache, pool, allocator = make_cache(rotator=rotator)
         first = make_req("r1", [[1, 2, 3], [90, 91, 92, 93]], [SYS_KEY, MSG_KEY])
         prefill(cache, pool, first, first_slot=100)
         decode_and_finish(cache, pool, first, [], first_slot=200)
@@ -809,7 +811,6 @@ class TestReverseRotateInsert(unittest.TestCase):
             "r2", [[1, 2, 3], [90, 91, 92, 93]], [SYS_KEY, MSG_KEY], req_pool_idx=1
         )
         second.init_next_round_input(cache)
-        self.assertEqual(second.sub_context_tree_reused, [3, 3])
         n = len(second.origin_input_ids)
         reused = len(second.prefix_indices)
         pool.req_to_token[1, :reused] = second.prefix_indices
@@ -828,7 +829,18 @@ class TestReverseRotateInsert(unittest.TestCase):
         node.canonical_position = 99
         cache.cache_unfinished_req(second)
         self.assertEqual(second.sub_context_tree_owned, [True, False])
+        return cache, pool, allocator, rotator, second, tree_slots
 
+    def test_a_tree_reused_head_is_never_handed_back(self):
+        """Freeing a declined block from its start returns the tree's own slots.
+
+        Its node still points at them, so the allocator reissues them while the tree
+        goes on serving them as cache -- which is how the KV cache ends up claiming
+        more tokens than the pool holds.
+        """
+        cache, pool, allocator, _rot, second, tree_slots = (
+            self._declined_block_with_shared_head()
+        )
         allocator.freed.clear()
         decode_and_finish(cache, pool, second, [9], first_slot=400)
         self.assertEqual(
@@ -836,6 +848,31 @@ class TestReverseRotateInsert(unittest.TestCase):
             [],
             "handed the tree's own slots back to the pool",
         )
+
+    def test_a_shared_head_is_never_rotated_in_place(self):
+        """In-place rotation is only ever safe on slots this request allocated.
+
+        The re-file rotates a block where it lies, which is sound for KV this request
+        computed and catastrophic for KV it merely borrowed: the shared node would come
+        away rotated for somewhere else while still advertising its old canonical
+        position, so every later hit on it reads K rotated for nowhere. Unlike a double
+        free this leaves the accounting perfect -- nothing but output quality shows it,
+        which is why it gets its own test rather than riding on the free assertion.
+        """
+        cache, pool, allocator, rotator, second, tree_slots = (
+            self._declined_block_with_shared_head()
+        )
+        rotator.calls.clear()
+        decode_and_finish(cache, pool, second, [9], first_slot=400)
+
+        touched = [
+            (src, delta)
+            for src, _dst, delta in rotator.calls
+            if delta and set(src) & set(tree_slots)
+        ]
+        self.assertEqual(touched, [], "rotated KV the tree still owns")
+        # And the block stays out of the tree rather than being filed half-rotated.
+        self.assertEqual(second.sub_context_reinserted, 0)
 
     def test_an_unrotatable_delta_keeps_the_old_behaviour(self):
         rotator = FakeRotator()
