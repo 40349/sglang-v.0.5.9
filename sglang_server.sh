@@ -73,6 +73,21 @@ case "$ARM" in
 esac
 
 NODE_IP=$(hostname -I | awk '{print $1}')
+
+# Refuse if something already answers on this port. uvicorn does NOT treat a failed
+# bind as fatal: it logs "address already in use", shuts the HTTP layer down, and the
+# job stays alive holding a GPU and serving nothing -- while a "fired up and ready"
+# line from the warm-up path races into the log and makes it look healthy. A client
+# then reaches the OTHER server, passes the /server_info arm check because that one is
+# the same arm, and quietly measures whatever binary it happens to be running.
+if curl -sf --max-time 5 "http://127.0.0.1:${PORT}/health" > /dev/null 2>&1; then
+  echo "REFUSING: something is already serving 127.0.0.1:${PORT} on $(hostname)."
+  echo "  A previous sglang job is still up. Its server would take this run's traffic"
+  echo "  and this job would hold a GPU for nothing. Check with: squeue -u \$USER"
+  echo "  then scancel the old job before resubmitting."
+  exit 1
+fi
+
 cat <<EOF
 ==========================================
 sglang server -- arm: $ARM

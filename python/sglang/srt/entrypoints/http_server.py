@@ -607,6 +607,7 @@ async def server_info():
     # show up here otherwise -- and a client on another machine cannot read the server
     # log to find out which arm it is talking to. Reporting it is what lets a remote
     # `run_mas.sh record` refuse an arm that is not the one it was asked for.
+    from sglang.srt.mem_cache import radix_cache
     from sglang.srt.utils import subctx_config
 
     return {
@@ -619,6 +620,12 @@ async def server_info():
             "rotate": subctx_config.ROTATE_SUBCONTEXT,
             "rotate_across_recompute": subctx_config.ROTATE_ACROSS_RECOMPUTE,
             "cache_output": subctx_config.CACHE_SUBCONTEXT_OUTPUT,
+            # Lets a client tell a stale server apart from the one it just started.
+            # A job whose port bind failed leaves the PREVIOUS job serving; the arm
+            # flags match, so only something that changed between the two builds can
+            # distinguish them.
+            "audit": radix_cache.AUDIT_ON,
+            "pid": os.getpid(),
         },
     }
 

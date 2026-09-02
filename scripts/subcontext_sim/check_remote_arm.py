@@ -37,6 +37,14 @@ def main() -> int:
     ap.add_argument("url", help="server base URL, e.g. http://140.118.202.100:30000")
     ap.add_argument("--split", type=_bool, required=True)
     ap.add_argument("--rotate", type=_bool, required=True)
+    ap.add_argument(
+        "--audit",
+        type=_bool,
+        default=None,
+        help="require the server to report the finish-path audit as on/off. The arm "
+        "flags alone cannot tell a freshly started server from a previous job that "
+        "still owns the port -- they match either way.",
+    )
     ap.add_argument("--maslab-config")
     ap.add_argument("--model")
     args = ap.parse_args()
@@ -64,6 +72,18 @@ def main() -> int:
         print(
             f"REFUSING: asked for split={args.split} rotate={args.rotate}, but the "
             f"server reports {sub}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.audit is not None and bool(sub.get("audit")) != args.audit:
+        print(
+            f"REFUSING: asked for audit={args.audit} but the server reports "
+            f"audit={sub.get('audit')!r} (pid {sub.get('pid')}). The usual cause is a "
+            "previous job still holding the port: the new job's bind fails, uvicorn "
+            "shuts its HTTP layer down without failing the job, and this client "
+            "reaches the OLD server -- same arm, different build. `squeue -u $USER`, "
+            "scancel the old job, resubmit.",
             file=sys.stderr,
         )
         return 1

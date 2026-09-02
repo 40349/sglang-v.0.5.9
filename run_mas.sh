@@ -90,6 +90,7 @@ remote_check() {
   python "$REPO/scripts/subcontext_sim/check_remote_arm.py" "$SERVER_URL" \
     --split "$( [ -n "${SUBCTX_OFF:-}" ] && echo false || echo true )" \
     --rotate "$( [ -n "${SUBCTX_ROTATE:-}" ] && echo true || echo false )" \
+    ${SUBCTX_AUDIT:+--audit true} \
     --maslab-config "$MASLAB/model_api_configs/model_api_config.json" \
     --model "$MAS_MODEL"
 }
