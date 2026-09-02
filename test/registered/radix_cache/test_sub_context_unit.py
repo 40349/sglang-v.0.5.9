@@ -849,6 +849,34 @@ class TestReverseRotateInsert(unittest.TestCase):
             "handed the tree's own slots back to the pool",
         )
 
+    def test_a_tree_held_slot_is_kept_wherever_it_sits(self):
+        """The overlap with the tree is not a prefix, so a leading run cannot find it.
+
+        Job 432: `double_pos` began one slot AFTER the block's offset -- the first slot
+        differed and the ~2000 behind it did not. Counting the leading run of agreement
+        gave 0, and the whole matched prefix went back to the pool while the tree went
+        on serving it; three different requests handed back the same slots (212, 213,
+        214 ...) that way, and the pool then issued live KV.
+
+        The head is diverged here directly rather than through whatever produced it on
+        the H200 -- a recomputed first token, a node another writer replaced. What has
+        to hold is the response to the shape, not the shape's provenance.
+        """
+        cache, pool, allocator, _rot, second, tree_slots = (
+            self._declined_block_with_shared_head()
+        )
+        pool.req_to_token[1, 3] = 999  # first slot of the block no longer the tree's
+        still_the_trees = pool.req_to_token[1, 4:6].tolist()
+
+        allocator.freed.clear()
+        decode_and_finish(cache, pool, second, [9], first_slot=400)
+        self.assertEqual(
+            [s for s in still_the_trees if s in allocator.freed],
+            [],
+            "a leading-run test missed slots the tree holds behind a diverged head",
+        )
+        self.assertIn(999, allocator.freed, "this request's own slot was not freed")
+
     def test_a_shared_head_is_never_rotated_in_place(self):
         """In-place rotation is only ever safe on slots this request allocated.
 

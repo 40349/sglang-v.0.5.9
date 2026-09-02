@@ -204,26 +204,38 @@ def _key_match_paged(key0: RadixKey, key1: RadixKey, page_size: int):
     return i
 
 
-def _shared_head_len(tree_slots: torch.Tensor, our_slots: torch.Tensor) -> int:
-    """How many leading slots of a block a tree node is holding *right now*.
+def _tree_held_mask(tree_slots: torch.Tensor, our_slots: torch.Tensor) -> torch.Tensor:
+    """Which slots of a block the tree is holding right now -- position by position.
 
     Slot identity is the only honest test of "does the tree own this KV". A declined
-    block can carry a node's own slots at its head: the stitch took a plain hit at this
-    offset, and a later writer then displaced the namespace, so the block reaches finish
-    refused even though its head still belongs to a node. Those slots are neither this
+    block can carry a node's own slots: the stitch took a plain hit at this offset, and
+    a later writer then displaced the namespace, so the block reaches finish refused
+    even though most of it still belongs to nodes. Those slots are neither this
     request's to free nor its to rotate in place.
 
-    Compared against the tree at the moment it matters rather than tracked from
-    admission. The namespace can be inserted into, split, or evicted in between, and a
-    stale count is exactly the kind that hands a live node's KV back to the pool.
+    **The overlap is not a prefix.** This counted the leading run of agreement once, on
+    the assumption that a block is reused front-to-back, and job 432 showed what that
+    misses: `double_pos` began one slot *after* the block's offset -- the first slot
+    differed and the ~2000 behind it did not -- so the run came out 0 and the whole
+    matched prefix went back to the pool while the tree went on serving it. Compare
+    every position and believe the answer.
+
+    Computed against the tree at the moment it matters rather than tracked from
+    admission: the namespace can be inserted into, split, or evicted in between, and a
+    stale answer is exactly the kind that hands a live node's KV back to the pool.
     """
+    mask = torch.zeros(len(our_slots), dtype=torch.bool, device=our_slots.device)
     n = min(len(tree_slots), len(our_slots))
-    if n == 0:
-        return 0
-    same = tree_slots[:n] == our_slots[:n]
-    if bool(same.all()):
-        return n
-    return int(torch.argmin(same.to(torch.uint8)).item())
+    if n:
+        mask[:n] = tree_slots[:n] == our_slots[:n]
+    return mask
+
+
+def _free_only_ours(allocator, slots: torch.Tensor, tree_held: torch.Tensor) -> None:
+    """Hand back every slot in ``slots`` the tree is not holding."""
+    ours = slots[~tree_held[: len(slots)]]
+    if len(ours):
+        allocator.free(ours)
 
 
 def get_child_key(key: RadixKey, page_size: int = 1):
@@ -862,17 +874,19 @@ class RadixCache(BasePrefixCache):
                 prompt_len = end
                 if req.sub_context_tree_owned[i]:
                     continue
-                # A declined block is not wholly this request's either: its head can be
-                # a node's own slots (see `_shared_head_len`). Freeing from the block's
-                # start would give those to the pool while the tree still serves them.
+                # A declined block is not wholly this request's either: any of its
+                # slots can be a node's own (see `_tree_held_mask`). Freeing the block
+                # wholesale would give those to the pool while the tree still serves
+                # them.
+                block = kv_indices[offset:end]
                 match = self.match_prefix(
                     MatchPrefixParams(key=RadixKey(token_ids[offset:end], seg_key))
                 )
-                shared = _shared_head_len(match.device_indices, kv_indices[offset:end])
-                if end > offset + shared:
-                    self.token_to_kv_pool_allocator.free(
-                        kv_indices[offset + shared : end]
-                    )
+                _free_only_ours(
+                    self.token_to_kv_pool_allocator,
+                    block,
+                    _tree_held_mask(match.device_indices, block),
+                )
         else:
             prompt_len = req.cache_protected_len
 
@@ -932,15 +946,15 @@ class RadixCache(BasePrefixCache):
                 probe.last_device_node, len(probe.device_indices)
             )
             # What of this block the tree is already holding, by slot identity.
-            shared = _shared_head_len(probe.device_indices, kv_indices[offset:end])
+            tree_held = _tree_held_mask(probe.device_indices, kv_indices[offset:end])
             if canonical is None:
                 # Whatever conflicted has since been evicted: the namespace is free to
                 # take this block where it actually sits.
                 canonical = offset
             delta = canonical - offset
             if delta != 0:
-                if shared:
-                    # The head of this block IS a node's KV. Rotating in place would
+                if bool(tree_held.any()):
+                    # Part of this block IS a node's KV. Rotating in place would
                     # re-rotate slots other requests match against, while the node goes
                     # on advertising its old canonical position -- silent cross-request
                     # corruption, the worst failure this mechanism can produce. Copying
@@ -950,9 +964,9 @@ class RadixCache(BasePrefixCache):
                 if not self.kv_rotator.can_rotate(delta):
                     continue  # out of the cos_sin_cache's range; drop as before
                 seg_slots = kv_indices[offset:end]
-                # In place, and safe only because `shared` is 0: every slot here was
-                # allocated by this request (freshly computed, or a rotated copy it
-                # owns), so no node other requests hold a lock on is touched.
+                # In place, and safe only because `tree_held` is all False: every slot
+                # here was allocated by this request (freshly computed, or a rotated
+                # copy it owns), so no node other requests hold a lock on is touched.
                 self.kv_rotator.rotate_into(seg_slots, seg_slots, delta)
 
             result = self.insert(
@@ -964,18 +978,19 @@ class RadixCache(BasePrefixCache):
                 )
             )
             # Give back only what is genuinely this request's: the duplicates it
-            # computed for a region the tree already covered. `shared` is where its own
-            # slots begin -- freeing below that hands the same KV to the pool and the
-            # tree at once, so the allocator reissues it while the tree still serves it
-            # as cache.
+            # computed for a region the tree already covered. Anything `tree_held`
+            # marks belongs to a node -- freeing it hands the same KV to the pool and
+            # the tree at once, so the allocator reissues it while the tree still
+            # serves it as cache.
             #
-            # `sub_context_owned_lens` cannot stand in for `shared`: it counts a head as
-            # reused whether it came from the tree or from a rotated copy this request
-            # allocated, and a rotated copy IS this request's to free.
-            if result.prefix_len > shared:
-                self.token_to_kv_pool_allocator.free(
-                    kv_indices[offset + shared : offset + result.prefix_len]
-                )
+            # `sub_context_owned_lens` cannot stand in for `tree_held`: it counts a
+            # block as reused whether it came from the tree or from a rotated copy this
+            # request allocated, and a rotated copy IS this request's to free.
+            _free_only_ours(
+                self.token_to_kv_pool_allocator,
+                kv_indices[offset : offset + result.prefix_len],
+                tree_held,
+            )
             seg_match = self.match_prefix(MatchPrefixParams(key=radix_key))
             self.req_to_token_pool.write(
                 (req.req_pool_idx, slice(offset, end)), seg_match.device_indices
@@ -1100,8 +1115,16 @@ class RadixCache(BasePrefixCache):
                 owned - result.prefix_len,
             )
         if result.prefix_len > owned:
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[offset + owned : offset + result.prefix_len]
+            # Same rule as the block frees: the tail's duplicates are only this
+            # request's where the tree is not already pointing at the very same slots.
+            tail = kv_indices[offset + owned : offset + result.prefix_len]
+            tree_tail = self.match_prefix(
+                MatchPrefixParams(key=radix_key)
+            ).device_indices[owned : result.prefix_len]
+            _free_only_ours(
+                self.token_to_kv_pool_allocator,
+                tail,
+                _tree_held_mask(tree_tail, tail),
             )
 
         if TRACE_ON:
