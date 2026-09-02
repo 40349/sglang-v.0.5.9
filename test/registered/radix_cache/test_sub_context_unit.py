@@ -788,6 +788,55 @@ class TestReverseRotateInsert(unittest.TestCase):
         self.assertEqual(len(m.device_indices), 4)
         self.assertEqual(cache.matched_canonical_position(m.last_device_node, 4), 3)
 
+    def test_a_tree_reused_head_is_never_handed_back(self):
+        """The head of a declined block can belong to the TREE, not this request.
+
+        Seen on H200 job 429: `tree_owned=[True, False]` with `owned_lens=[259, 2197]`
+        -- the stitch took 2197 slots of the messages block straight from the tree at a
+        plain hit, and only afterwards did another writer move that namespace, so the
+        write path declined the block. Freeing from the block's start then returns the
+        tree's own slots to the pool while its node still points at them: the allocator
+        reissues them and the tree keeps serving them, which is how the KV cache ends
+        up claiming more tokens than the pool holds.
+        """
+        cache, pool, allocator = make_cache(rotator=FakeRotator())
+        first = make_req("r1", [[1, 2, 3], [90, 91, 92, 93]], [SYS_KEY, MSG_KEY])
+        prefill(cache, pool, first, first_slot=100)
+        decode_and_finish(cache, pool, first, [], first_slot=200)
+
+        # Same offset, so the stitch reuses the tree's slots for the block's head.
+        second = make_req(
+            "r2", [[1, 2, 3], [90, 91, 92, 93]], [SYS_KEY, MSG_KEY], req_pool_idx=1
+        )
+        second.init_next_round_input(cache)
+        self.assertEqual(second.sub_context_tree_reused, [3, 3])
+        n = len(second.origin_input_ids)
+        reused = len(second.prefix_indices)
+        pool.req_to_token[1, :reused] = second.prefix_indices
+        pool.req_to_token[1, reused:n] = torch.arange(
+            300, 300 + n - reused, dtype=torch.int64
+        )
+        second.sub_context_rotated_slots = None
+        second.fill_ids = list(second.origin_input_ids)
+        tree_slots = pool.req_to_token[1, 3:6].tolist()
+
+        # Another writer moves the namespace between the match and the insert, which is
+        # what makes the block get declined even though its head is the tree's.
+        node = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey([90, 91, 92, 93], MSG_KEY))
+        ).last_device_node
+        node.canonical_position = 99
+        cache.cache_unfinished_req(second)
+        self.assertEqual(second.sub_context_tree_owned, [True, False])
+
+        allocator.freed.clear()
+        decode_and_finish(cache, pool, second, [9], first_slot=400)
+        self.assertEqual(
+            [s for s in tree_slots if s in allocator.freed],
+            [],
+            "handed the tree's own slots back to the pool",
+        )
+
     def test_an_unrotatable_delta_keeps_the_old_behaviour(self):
         rotator = FakeRotator()
         cache, pool, allocator = self._seed(rotator)

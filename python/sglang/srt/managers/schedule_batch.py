@@ -694,6 +694,13 @@ class Req(ReqDllmMixin):
         # has to be rotated by the same delta to continue that chain. Parallel to
         # sub_context_ids; None until the first insert pass.
         self.sub_context_tree_canonical: Optional[List[Optional[int]]] = None
+        # Per block, how many of its leading slots the stitch took *straight from the
+        # tree*. Those belong to a node, not to this request, and freeing them while
+        # that node still points at them hands the same KV to two owners. Distinct from
+        # `sub_context_owned_lens`, which counts the same head as reused whether it came
+        # from the tree or from a rotated copy this request allocated -- and a rotated
+        # copy is the request's to free. Parallel to sub_context_ids.
+        self.sub_context_tree_reused: Optional[List[int]] = None
         # Tokens of a declined block rotated *back* to the tree's position at finish and
         # inserted there. Drained by the forward trace like `sub_context_rotated`.
         self.sub_context_reinserted: int = 0
@@ -1227,10 +1234,12 @@ class Req(ReqDllmMixin):
         rotated = 0
         total = 0
         contiguous = True
+        tree_reused: List[int] = []
         for seg_ids, seg_key, _offset in self.iter_sub_contexts():
             if len(seg_ids) == 0:
                 match_lens.append(0)
                 owned.append(0)
+                tree_reused.append(0)
                 match_indices.append(None)
                 match_nodes.append(None)
                 match_positions.append(None)
@@ -1269,6 +1278,7 @@ class Req(ReqDllmMixin):
                     f"hit_tokens={_preview(seg_ids[:hit])}"
                 )
             take = 0
+            from_tree = 0
             if contiguous:
                 if hit == 0:
                     contiguous = False
@@ -1304,6 +1314,8 @@ class Req(ReqDllmMixin):
                         rotated += take
                         if take < len(seg_ids):
                             contiguous = False
+                        # Fresh slots this request allocated, not the tree's.
+                        from_tree = 0
                 else:
                     take = min(hit, max_prefix_len - total)
                     if take <= 0:
@@ -1314,10 +1326,13 @@ class Req(ReqDllmMixin):
                         total += take
                         if take < len(seg_ids):
                             contiguous = False
+                        from_tree = take
             owned.append(take)
+            tree_reused.append(from_tree)
 
         self.sub_context_match_lens = match_lens
         self.sub_context_owned_lens = owned
+        self.sub_context_tree_reused = tree_reused
         # Rebuilt from scratch by the next insert pass. A re-scheduled request (after
         # retraction) has had its KV freed, so last time's ownership is stale -- and a
         # stale True means the finish path leaves this request's own slots unfreed.

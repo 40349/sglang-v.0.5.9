@@ -810,11 +810,22 @@ class RadixCache(BasePrefixCache):
                     canonical_position=canonical,
                 )
             )
-            # Nothing of this block was ever tree-owned, so everything the namespace
-            # already had is a duplicate this request must give back.
-            if result.prefix_len > 0:
+            # Give back only what is genuinely this request's. The stitch may have
+            # taken the head of this block STRAIGHT FROM THE TREE -- a plain hit at
+            # this offset, which a later writer then displaced, so the block reached
+            # finish declined even though its first `from_tree` slots belong to a node.
+            # Freeing those hands the same KV to the pool and the tree at once: the
+            # allocator reissues them while the tree still serves them as cache.
+            #
+            # `sub_context_owned_lens` cannot stand in for this: it counts the same
+            # head as reused whether it came from the tree or from a rotated copy this
+            # request allocated, and a rotated copy IS this request's to free.
+            from_tree = (
+                req.sub_context_tree_reused[i] if req.sub_context_tree_reused else 0
+            )
+            if result.prefix_len > from_tree:
                 self.token_to_kv_pool_allocator.free(
-                    kv_indices[offset : offset + result.prefix_len]
+                    kv_indices[offset + from_tree : offset + result.prefix_len]
                 )
             seg_match = self.match_prefix(MatchPrefixParams(key=radix_key))
             self.req_to_token_pool.write(
