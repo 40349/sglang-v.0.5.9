@@ -20,6 +20,9 @@ Page-aligned memory pool.
 """
 
 import abc
+import logging
+import os
+import sys
 from typing import TYPE_CHECKING
 
 import torch
@@ -114,6 +117,32 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         raise NotImplementedError()
 
 
+# Slot-level double-free detection, on under SGLANG_SUBCTX_AUDIT.
+#
+# `check_memory` only compares available+evictable against the pool size, and it only
+# runs when the scheduler goes idle -- which under a real workload may not happen until
+# the run is over. Job 439 saw its first idle sixteen minutes in, by which point the
+# free list was 19 slots too long and nothing recorded where they came from. Catch the
+# offending free instead, with the line that made it.
+#
+# Only the page_size=1 allocator is instrumented; that is the one the sub-context paths
+# require and so the only one that can reach the code under test.
+_AUDIT_FREES = get_bool_env_var("SGLANG_SUBCTX_AUDIT")
+_AUDIT_REPORT_LIMIT = 20
+
+logger = logging.getLogger(__name__)
+
+
+def _audit_caller() -> str:
+    """The first frame outside this file -- whoever asked for the free."""
+    f = sys._getframe(1)
+    while f is not None and f.f_code.co_filename == __file__:
+        f = f.f_back
+    if f is None:
+        return "?"
+    return f"{os.path.basename(f.f_code.co_filename)}:{f.f_lineno} in {f.f_code.co_name}"
+
+
 class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """An allocator managing the indices to kv cache data."""
 
@@ -136,6 +165,15 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        if _AUDIT_FREES:
+            # mask[i] is True while slot i sits in the free list. Slot 0 is the padded
+            # dummy, never handed out and so never ours to give back.
+            # backup_state/restore_state are not tracked: nothing here uses them.
+            self._audit_free_mask = torch.ones(
+                self.size + 1, dtype=torch.bool, device=self.device
+            )
+            self._audit_free_mask[0] = False
+            self._audit_reports = 0
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
@@ -150,6 +188,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         select_index = self.free_pages[:need_size]
         self.free_pages = self.free_pages[need_size:]
+        if _AUDIT_FREES:
+            self._audit_free_mask[select_index] = False
         return select_index
 
     def free(self, free_index: torch.Tensor):
@@ -157,12 +197,43 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
+            # Audit only where the free lands. `free_group_end` re-enters this method
+            # with the whole group concatenated, so auditing the deferred branch too
+            # would report every grouped free as a duplicate of itself.
+            if _AUDIT_FREES:
+                self._audit_check_free(free_index)
             if self.need_sort:
                 self.release_pages = torch.cat((self.release_pages, free_index))
             else:
                 self.free_pages = torch.cat((self.free_pages, free_index))
         else:
             self.free_group.append(free_index)
+
+    def _audit_check_free(self, free_index: torch.Tensor) -> None:
+        """Report slots this free hands back that the pool already holds.
+
+        Two ways to give a slot back twice, and they need telling apart: the same slot
+        twice within one call (`repeated`), which is a caller that built its list wrong,
+        and a slot an earlier call already returned (`already_free`), which is two
+        owners that both believe the slot is theirs.
+        """
+        if self._audit_reports >= _AUDIT_REPORT_LIMIT:
+            self._audit_free_mask[free_index] = True
+            return
+        uniq = torch.unique(free_index)
+        repeated = free_index.numel() - uniq.numel()
+        already = uniq[self._audit_free_mask[uniq]]
+        if repeated or already.numel():
+            self._audit_reports += 1
+            logger.error(
+                "SUBCTX-DOUBLE-FREE from %s: n=%d repeated=%d already_free=%d slots=%s",
+                _audit_caller(),
+                free_index.numel(),
+                repeated,
+                already.numel(),
+                already[:16].tolist(),
+            )
+        self._audit_free_mask[free_index] = True
 
     def get_cpu_copy(self, indices):
         return self._kvcache.get_cpu_copy(indices)
