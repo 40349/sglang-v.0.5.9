@@ -445,7 +445,7 @@ NESTED = {"subctx_split": "tpl_render"}
 
 
 def load_stages(prefix: str) -> tuple[Dict[str, Dict[str, float]], bool]:
-    """Merge the per-process stage files a run wrote (<prefix>.http, .scheduler).
+    """Merge the per-process stage files a run wrote (<prefix>.http.json, .scheduler.json).
 
     Returns the merged stages and whether they came from the post-warm-up
     window. ``measured`` is preferred but only when *every* process has it: a

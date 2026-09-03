@@ -1,11 +1,14 @@
 #!/bin/bash
 # MASLab arm of the sub-context A/B.
 #
-#   TAG=ag_he_on  ./run_mas.sh record   run MASLab end to end and record its traffic
-#   TAG=ag_he_ab  ./run_mas.sh toggle   replay a capture, split OFF then ON
-#   TAG=ag_he_on  ./run_mas.sh eval     pass@1 for a record run's results
+#   ARM=on TAG=ag_he  ./run_mas.sh record   run MASLab end to end and record its traffic
+#   TAG=ag_he_ab      ./run_mas.sh toggle   replay a capture, split OFF then ON
+#   ARM=on TAG=ag_he  ./run_mas.sh eval     pass@1 for a record run's results
 #
-# Everything lands in ab_out/maslab. SWE-bench is run_swe.sh.
+# An arm's results land in ab_out/maslab/<arm>/, named ..._<tag>_<arm>. Both halves
+# come from $ARM, never from anything typed, so the arm a file claims is the arm that
+# produced it. `toggle` drives all three arms itself and writes at the top of
+# ab_out/maslab. SWE-bench is run_swe.sh.
 #
 # REMOTE SERVER. Set SERVER_URL to run MASLab here against a server on another box
 # (the H200): `record` then drives it over HTTP and `eval` scores the local results,
@@ -14,7 +17,7 @@
 # own disk -- so run `toggle` on the server box, where the capture already is.
 #
 #   SERVER_URL=http://140.118.202.100:30000 ARM=rot \
-#     METHOD=agentverse MAS_CONFIG= DATASET=humaneval TAG=av_he_rot ./run_mas.sh record
+#     METHOD=agentverse MAS_CONFIG= DATASET=humaneval TAG=av_he ./run_mas.sh record
 #
 # ARM must match how the remote server was started (`ARM=... sbatch sglang_server.sh`);
 # `record` reads /server_info and refuses if it does not.
@@ -45,9 +48,6 @@ METHOD=${METHOD:-autogen}
 MAS_CONFIG=${MAS_CONFIG-config_code}
 DATASET=${DATASET:-humaneval}
 TAG=${TAG:-}
-SUF=${TAG:+_$TAG}
-REQUESTS=${REQUESTS:-$OUT/requests$SUF.jsonl}
-INFER=${INFER:-$OUT/infer$SUF.jsonl}   # overridable so a pre-split run can still be scored
 
 # Empty => this box runs the server too (the original single-machine setup).
 SERVER_URL=${SERVER_URL:-}
@@ -66,6 +66,18 @@ case "$ARM" in
   rot) SUBCTX_OFF=""; SUBCTX_ROTATE="1"; SUBCTX_ROTATE_ACROSS="1" ;;
   *)   echo "REFUSING: unknown ARM='$ARM' (want on|off|rot)"; exit 1 ;;
 esac
+
+# Where an arm's results live. sglang_server.sh:64 builds its filenames out of $ARM
+# for a reason -- a name that disagrees with the run it describes is worse than no
+# name -- and this side did not, which is how an `ARM=on` run with a `TAG=av_he_rot`
+# left over from the previous one wrote the on arm over the rot results and left no
+# evidence but an mtime. Take both the directory and the suffix from $ARM, so nothing
+# typed can put an arm's results anywhere but its own directory. `toggle` refuses ARM
+# (it drives all three itself), so its artifacts stay at the top of $OUT.
+[ -z "$ARM" ] || OUT=$OUT/$ARM
+SUF=${TAG:+_$TAG}${ARM:+_$ARM}
+REQUESTS=${REQUESTS:-$OUT/requests$SUF.jsonl}
+INFER=${INFER:-$OUT/infer$SUF.jsonl}   # overridable so a pre-split run can still be scored
 
 mkdir -p "$OUT"
 source "$CONDA_SH"
@@ -302,6 +314,7 @@ EOF
     # freely.
     : "${TAG:?set TAG to the run you want scored}"
     [ -s "$INFER" ] || { echo "no results at $INFER; run '$0 record' first"; exit 1; }
+    echo ">> scoring $INFER${ARM:+ (arm $ARM)}"
     ( unset PYTHONPATH; cd $MASLAB && python evaluate.py \
         --eval_protocol code \
         --model_name $MAS_MODEL \
@@ -327,10 +340,10 @@ EOF
     ;;
 
   *)
-    echo "usage: METHOD=.. DATASET=.. TAG=.. $0 {record|toggle|eval}"
-    echo "  record  METHOD=autogen MAS_CONFIG=config_code DATASET=humaneval TAG=ag_he_on $0 record"
-    echo "  toggle  REQUESTS=$OUT/requests_ag_he_on.jsonl TAG=ag_he_ab $0 toggle"
-    echo "  eval    TAG=ag_he_on DATASET=humaneval $0 eval"
-    echo "  add ARM=off|rot to run any of them on another arm (default: on)"
+    echo "usage: ARM=on|off|rot METHOD=.. DATASET=.. TAG=.. $0 {record|toggle|eval}"
+    echo "  record  ARM=on METHOD=autogen MAS_CONFIG=config_code DATASET=humaneval TAG=ag_he $0 record"
+    echo "  eval    ARM=on TAG=ag_he DATASET=humaneval $0 eval"
+    echo "  toggle  REQUESTS=<capture> TAG=ag_he_ab $0 toggle   (no ARM: it runs all three)"
+    echo "  an arm's files live in ab_out/maslab/<arm>/ and are suffixed _<tag>_<arm>"
     exit 1;;
 esac

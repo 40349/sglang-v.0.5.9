@@ -4,10 +4,12 @@ What the split *adds* is not on the GPU: re-rendering the template to find block
 boundaries, one ``match_prefix`` and one insert per namespace instead of per
 request. None of it shows up in a forward-pass trace.
 
-Set ``SGLANG_STAGE_TRACE`` to an output path. Each process writes ``<path>.<proc>``
--- the template split happens in the HTTP/tokenizer process, matching and insertion
-in the scheduler. Stages are named identically in both arms and placed at the branch
-point, so subtracting per stage across an A/B gives the added cost directly.
+Set ``SGLANG_STAGE_TRACE`` to an output path. Each process writes
+``<path>.<proc>.json`` -- the template split happens in the HTTP/tokenizer process,
+matching and insertion in the scheduler, and the process name stays in the filename
+because the two are written side by side. The payload is one JSON object, not JSONL.
+Stages are named identically in both arms and placed at the branch point, so
+subtracting per stage across an A/B gives the added cost directly.
 
 Counters accumulate from process start, which includes the replay client's warm-up.
 Once that client creates ``<SGLANG_STAGE_TRACE>.mark`` a second accumulator opens and
@@ -37,7 +39,7 @@ _DUMP_EVERY_N = 20
 
 class HostTimer:
     def __init__(self, path: str, proc: str):
-        self._path = f"{path}.{proc}"
+        self._path = f"{path}.{proc}.json"
         self._proc = proc
         # stage -> [count, total_ns, max_ns]
         self._stages: Dict[str, List[int]] = {}
