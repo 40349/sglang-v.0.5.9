@@ -327,6 +327,9 @@ class RadixCache(BasePrefixCache):
         # forward trace. Kept on the cache rather than the request because the re-file
         # happens at finish, after that request's last forward pass.
         self.sub_context_reinserted_tokens = 0
+        # Highest number of doubly-owned tree slots reported so far, so
+        # `_audit_tree_duplicates` fires on the transition and not once per pass.
+        self._audit_dup_seen = 0
 
         self.kv_event_queue = []
 
@@ -605,6 +608,7 @@ class RadixCache(BasePrefixCache):
             self._audit_sub_context_finish(
                 req, token_ids, held, freed, freed_at, owned_at_entry, lens_at_entry
             )
+            self._audit_tree_duplicates("finish", req)
             return
 
         # Maybe convert to bigram keys for EAGLE
@@ -1184,6 +1188,7 @@ class RadixCache(BasePrefixCache):
                 )
             )
             self._audit_sub_context_chunk(req, token_ids, freed, freed_at)
+            self._audit_tree_duplicates("chunk", req)
             return
 
         # Maybe convert to bigram keys for EAGLE
@@ -1543,10 +1548,8 @@ class RadixCache(BasePrefixCache):
         not depend on SGLANG_SUBCTX_AUDIT: the moment it is needed is the moment
         nobody remembered to turn the flag on.
         """
-        import torch as _torch
-
         alloc = self.token_to_kv_pool_allocator
-        free = _torch.cat(
+        free = torch.cat(
             [
                 t
                 for t in (
@@ -1555,9 +1558,31 @@ class RadixCache(BasePrefixCache):
                 )
                 if t is not None and t.numel()
             ]
-            or [_torch.empty(0, dtype=_torch.int64)]
+            or [torch.empty(0, dtype=torch.int64)]
         )
 
+        nodes, slots, keyed_unlocked = self._walk_tree_slots()
+        uniq, counts = torch.unique(slots, return_counts=True)
+        dup_slots = uniq[counts > 1]
+        # A slot the tree serves that the pool also considers free.
+        both = uniq[torch.isin(uniq, free.to(uniq.device))] if uniq.numel() else uniq
+
+        return (
+            f"tree walk: nodes={nodes} slots={slots.numel()} distinct={uniq.numel()} "
+            f"dup_within_tree={slots.numel() - uniq.numel()} "
+            f"dup_owners={self._double_owners(set(dup_slots.tolist()))} "
+            f"dup_slots={dup_slots[:16].tolist()} "
+            f"evictable_counter={self.evictable_size_} keyed_unlocked={keyed_unlocked} "
+            f"counter_minus_walk={self.evictable_size_ - keyed_unlocked} "
+            f"IN_TREE_AND_FREE={both.numel()} {both[:16].tolist()}"
+        )
+
+    def _walk_tree_slots(self) -> Tuple[int, torch.Tensor, int]:
+        """Every slot the tree points at, one entry per (node, position).
+
+        Deliberately not de-duplicated: whether a slot appears twice is the thing the
+        callers are asking about.
+        """
         held, keyed_unlocked, nodes = [], 0, 0
         stack = [self.root_node]
         while stack:
@@ -1569,22 +1594,38 @@ class RadixCache(BasePrefixCache):
             held.append(node.value)
             if node.lock_ref == 0:
                 keyed_unlocked += len(node.key)
-        slots = (
-            _torch.cat(held) if held else _torch.empty(0, dtype=_torch.int64)
-        )
+        slots = torch.cat(held) if held else torch.empty(0, dtype=torch.int64)
+        return nodes, slots, keyed_unlocked
 
-        uniq = _torch.unique(slots)
-        dup_in_tree = slots.numel() - uniq.numel()
-        # A slot the tree serves that the pool also considers free.
-        both = uniq[_torch.isin(uniq, free.to(uniq.device))] if uniq.numel() else uniq
+    def _audit_tree_duplicates(self, where: str, req: Req) -> None:
+        """Name the pass that first gives one slot two owners inside the tree.
 
-        return (
-            f"tree walk: nodes={nodes} slots={slots.numel()} distinct={uniq.numel()} "
-            f"dup_within_tree={dup_in_tree} "
-            f"evictable_counter={self.evictable_size_} keyed_unlocked={keyed_unlocked} "
-            f"counter_minus_walk={self.evictable_size_ - keyed_unlocked} "
-            f"IN_TREE_AND_FREE={both.numel()} {both[:16].tolist()}"
-        )
+        Job 441 ended with ``dup_within_tree=14`` and nothing else wrong: no slot lost,
+        no slot in the tree and the free list at once, no double free, and the pool
+        partitioned exactly (741553 distinct + 2952 free == 744505). That is the latent
+        form of the worst failure this mechanism can produce -- evict either owner and
+        the survivor goes on serving a slot the pool has reissued -- but the walk at
+        idle happens tens of thousands of passes too late to say who made it.
+
+        So walk after every sub-context insert and report the *transition*. Frees retire
+        duplicates too, hence tracking a level rather than a flag: only a rise is news.
+        Under SGLANG_SUBCTX_AUDIT only -- this is a full tree walk per pass.
+        """
+        _nodes, slots, _keyed = self._walk_tree_slots()
+        uniq, counts = torch.unique(slots, return_counts=True)
+        dup = int(slots.numel() - uniq.numel())
+        if dup > self._audit_dup_seen:
+            dup_slots = uniq[counts > 1]
+            logger.error(
+                "SUBCTX-TREE-DUP at=%s rid=%s dup=%d (was %d) owners=%s slots=%s",
+                where,
+                req.rid,
+                dup,
+                self._audit_dup_seen,
+                self._double_owners(set(dup_slots.tolist())),
+                dup_slots[:16].tolist(),
+            )
+        self._audit_dup_seen = dup
 
     def protected_size(self):
         # protected size refers to the size of the cache that is locked
