@@ -174,6 +174,12 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
             self._audit_free_mask[0] = False
             self._audit_reports = 0
+            # Say so. A detector that reports nothing is indistinguishable from
+            # one that was never switched on, and job 440 spent a whole run in
+            # exactly that ambiguity.
+            logger.info(
+                "SUBCTX-DOUBLE-FREE detector armed over %d slots", self.size
+            )
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead

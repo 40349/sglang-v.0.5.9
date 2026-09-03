@@ -158,6 +158,14 @@ class SchedulerRuntimeCheckerMixin:
             - protected_size
         )
         token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+        if memory_leak and hasattr(self.tree_cache, "audit_pool_invariant"):
+            # The inequality alone cannot say whether the tree is serving slots
+            # the pool has already handed back (corruption) or merely miscounting
+            # them (accounting). Ask the tree, once, now that it matters.
+            try:
+                token_msg += self.tree_cache.audit_pool_invariant() + "\n"
+            except Exception as e:  # a diagnostic must never mask the real error
+                token_msg += f"(audit_pool_invariant failed: {e!r})\n"
         return memory_leak, token_msg
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:

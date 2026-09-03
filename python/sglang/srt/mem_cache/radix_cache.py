@@ -1527,6 +1527,65 @@ class RadixCache(BasePrefixCache):
     def evictable_size(self):
         return self.evictable_size_
 
+    def audit_pool_invariant(self) -> str:
+        """Say why available + evictable stopped adding up to the pool size.
+
+        Two failures produce that same inequality and they need opposite fixes,
+        so guessing between them is worthless:
+
+        * a slot sits in the tree *and* in the free list -- real corruption, and
+          the next request handed that slot reads someone else's KV;
+        * ``evictable_size_`` counts more than the tree holds -- an accounting
+          slip, ugly but harmless to the output.
+
+        Walk the tree and say which. Runs only when the invariant has already
+        failed, so it costs nothing in the normal case, and it deliberately does
+        not depend on SGLANG_SUBCTX_AUDIT: the moment it is needed is the moment
+        nobody remembered to turn the flag on.
+        """
+        import torch as _torch
+
+        alloc = self.token_to_kv_pool_allocator
+        free = _torch.cat(
+            [
+                t
+                for t in (
+                    getattr(alloc, "free_pages", None),
+                    getattr(alloc, "release_pages", None),
+                )
+                if t is not None and t.numel()
+            ]
+            or [_torch.empty(0, dtype=_torch.int64)]
+        )
+
+        held, keyed_unlocked, nodes = [], 0, 0
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children.values())
+            if node is self.root_node or node.value is None:
+                continue
+            nodes += 1
+            held.append(node.value)
+            if node.lock_ref == 0:
+                keyed_unlocked += len(node.key)
+        slots = (
+            _torch.cat(held) if held else _torch.empty(0, dtype=_torch.int64)
+        )
+
+        uniq = _torch.unique(slots)
+        dup_in_tree = slots.numel() - uniq.numel()
+        # A slot the tree serves that the pool also considers free.
+        both = uniq[_torch.isin(uniq, free.to(uniq.device))] if uniq.numel() else uniq
+
+        return (
+            f"tree walk: nodes={nodes} slots={slots.numel()} distinct={uniq.numel()} "
+            f"dup_within_tree={dup_in_tree} "
+            f"evictable_counter={self.evictable_size_} keyed_unlocked={keyed_unlocked} "
+            f"counter_minus_walk={self.evictable_size_ - keyed_unlocked} "
+            f"IN_TREE_AND_FREE={both.numel()} {both[:16].tolist()}"
+        )
+
     def protected_size(self):
         # protected size refers to the size of the cache that is locked
         return self.protected_size_
