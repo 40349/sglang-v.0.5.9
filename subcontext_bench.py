@@ -368,7 +368,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         ("moved_tokens", "     ...dropped as MOVED", "tok"),
         ("rotated_tokens", "  ...MOVED but ROTATED in", "tok"),
         ("reinserted_tokens", "REVERSE-ROTATED into tree", "tok"),
-        ("hit_rate", "cache hit rate (reuse only)", "%"),
+        ("hit_rate", "hit rate (of tokens SEEN)", "%"),
         ("prefill_gpu_ms", "PREFILL GPU time", "ms"),
         ("prefill_ms_median", "  median pass", "ms"),
         ("us_per_new_token", "  us / computed token", "us"),
@@ -416,11 +416,40 @@ def cmd_report(args: argparse.Namespace) -> int:
             "continuation pass reads one chunk short. Re-run to get a real number;\n"
             "the other rows are unaffected."
         )
+    # `prefill tokens seen` is per PASS, so chunked prefill counts a request's
+    # already-covered prefix once per continuation: the same capture reads 921,205
+    # tokens unchunked and 1,092,928 when Stage 2 cuts at block boundaries. Anything
+    # divided by it -- the hit rate above -- moves with the chunking regime and not
+    # with how much was reused. `actually computed` does not: every token is computed
+    # exactly once whatever the pass count.
+    #
+    # So state the reuse against a denominator that cannot move. The prompt total is a
+    # property of the capture, which this command does not have, but chunking can only
+    # inflate `seen`, so the smaller of the two arms bounds it from above and is exact
+    # whenever that arm ran one pass per request.
     if a["prefill_passes"] != b["prefill_passes"]:
+        prompt = min(a["prefill_total_tokens"], b["prefill_total_tokens"])
         print(
-            "\nWARNING: the two runs did not execute the same number of prefill\n"
-            "passes, so they probably did not see the same request sequence.\n"
-            "Compare only replays of one captured trace."
+            f"\nNOTE: pass counts differ ({a['prefill_passes']:,} vs "
+            f"{b['prefill_passes']:,}), so the two arms did NOT chunk the same way.\n"
+            "That is expected when one arm cuts chunks at block boundaries; it does\n"
+            "not by itself mean the request sequences differed. But it does mean\n"
+            "'tokens seen' and the hit rate above are NOT comparable between the two\n"
+            "columns -- a continuation pass re-counts the prefix it inherits.\n"
+            "Compare 'actually computed', which is one entry per token either way:"
+        )
+        for label, arm in ((label_a, a), (label_b, b)):
+            print(
+                f"  {label:>20}: computed {arm['prefill_new_tokens']:,} of "
+                f"{prompt:,} prompt tokens -> reuse "
+                f"{100.0 * (prompt - arm['prefill_new_tokens']) / prompt:.1f}%"
+            )
+        print(
+            "  (denominator is the smaller 'seen' total: chunking only inflates it,\n"
+            "   so this is exact when that arm ran one pass per request. It assumes\n"
+            "   BOTH arms replayed the same capture, which `toggle` guarantees and\n"
+            "   two `record` runs do not -- there the streams differ and only each\n"
+            "   arm's own 'seen' total is its denominator.)"
         )
     return 0
 
