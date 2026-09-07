@@ -563,6 +563,64 @@ class TestRotatedBlocks(unittest.TestCase):
 class TestSubContextLifecycle(unittest.TestCase):
     """Match -> per-namespace insert -> finish, and the reuse it enables."""
 
+    def test_finishing_without_an_unfinished_pass_files_nothing_by_default_key(self):
+        """A split request can reach finish without ever running an unfinished pass --
+        it emitted its stop token during prefill, or was aborted while queued.
+
+        `cache_finished_req` used to gate the sub-context branch on
+        `sub_context_last_nodes`, which only that pass sets, so such a request fell
+        through to the default branch and filed whatever `req_to_token` held under
+        `req.extra_key` -- None. The stitch had just pointed that prefix at the
+        namespace nodes' own slots, so the tree served them under two keys at once and
+        evicting either handed a live slot back to the pool. Job 441's
+        `dup_within_tree`, and a replay with ignore_eos cannot produce it because no
+        request can finish at prefill.
+        """
+        cache, pool, allocator = make_cache()
+        seed = make_req("r1", [[1, 2, 3], [7, 8]], [SYS_KEY, MSG_KEY])
+        prefill(cache, pool, seed, first_slot=100)
+        decode_and_finish(cache, pool, seed, [50], first_slot=200)
+
+        req = make_req("r2", [[1, 2, 3], [7, 8]], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        req.init_next_round_input(cache)
+        n = len(req.origin_input_ids)
+        reused = len(req.prefix_indices)
+        self.assertGreater(reused, 0, "the stitch must have reused namespace slots")
+        pool.req_to_token[req.req_pool_idx, :reused] = req.prefix_indices
+        pool.req_to_token[req.req_pool_idx, reused:n] = torch.arange(
+            300, 300 + (n - reused), dtype=torch.int64
+        )
+        req.sub_context_rotated_slots = None
+        req.fill_ids = list(req.origin_input_ids)
+        req.output_ids = []
+        req.kv_committed_len = n
+        self.assertIsNone(req.sub_context_last_nodes)
+
+        freed_before = set(allocator.freed)
+        cache.cache_finished_req(req)
+
+        owners = {}
+        stack = [cache.root_node]
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children.values())
+            if node is cache.root_node or node.value is None:
+                continue
+            for slot in node.value.tolist():
+                owners.setdefault(slot, []).append(node.key.extra_key)
+
+        self.assertNotIn(
+            None,
+            {k for keys in owners.values() for k in keys},
+            "a split request must never file its slots under the default namespace",
+        )
+        self.assertEqual(
+            {s: k for s, k in owners.items() if len(k) > 1}, {}, "no slot has two owners"
+        )
+        freed = set(allocator.freed) - freed_before
+        self.assertEqual(freed & set(owners), set(), "no tree-owned slot was freed")
+        self.assertEqual(freed, {300}, "only its own freshly computed slot goes back")
+
     def test_blocks_are_inserted_in_their_own_namespaces(self):
         cache, pool, _ = make_cache()
         req = make_req("r1", [[1, 2, 3], [4, 5]], [SYS_KEY, MSG_KEY])

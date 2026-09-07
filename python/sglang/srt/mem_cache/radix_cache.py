@@ -592,7 +592,19 @@ class RadixCache(BasePrefixCache):
         # The prompt was already inserted per-namespace in `cache_unfinished_req`, so
         # this unlocks those leaves rather than re-inserting, and hands the generated
         # continuation to the last block's namespace.
-        if req.sub_context_last_nodes is not None:
+        #
+        # Gate on the SAME condition `cache_unfinished_req` uses. Gating on
+        # `sub_context_last_nodes` instead looks equivalent -- the unfinished pass is
+        # what sets it -- but it is not: a request that never ran that pass, because it
+        # emitted its stop token during prefill or was aborted while queued, arrives
+        # here with the stitched prefix in `req_to_token` and no nodes of its own. It
+        # then fell through to the branch below, which files whatever `req_to_token`
+        # holds under `req.extra_key` -- None for a split request. Those slots are
+        # already owned by the namespace nodes the stitch matched, so the tree ended up
+        # serving them from two keys at once, and evicting either one hands a live slot
+        # back to the pool. That is job 441's `dup_within_tree`; a replay with
+        # `ignore_eos` can never produce it, because no request can finish at prefill.
+        if req.has_sub_contexts and self.supports_sub_contexts():
             if not AUDIT_ON:
                 self._finish_sub_contexts(req, token_ids, kv_indices, is_insert)
                 return
@@ -869,14 +881,23 @@ class RadixCache(BasePrefixCache):
         # `cache_protected_len`: a block the tree declined (a rotated copy, or a
         # position conflict) leaves a hole that later tree-owned blocks sit after, and
         # freeing from the first hole onwards would free slots the tree now owns.
+        # No unfinished pass ran => this request owns nothing in the tree, and every
+        # block is in exactly the position of a declined one: the stitch may have
+        # reused namespace-owned slots for part of it, the rest it computed itself.
+        # Saying so here is what lets the loop below free its own slots and only its
+        # own, which is the whole job the default branch could not do.
+        tree_owned = req.sub_context_tree_owned
+        if tree_owned is None and req.sub_context_extra_keys:
+            tree_owned = [False] * len(req.sub_context_extra_keys)
+
         prompt_len = 0
-        if req.sub_context_tree_owned is not None:
+        if tree_owned is not None:
             for i, (seg_ids, seg_key, offset) in enumerate(req.iter_sub_contexts()):
                 end = min(offset + len(seg_ids), len(kv_indices))
                 if end <= offset:
                     break
                 prompt_len = end
-                if req.sub_context_tree_owned[i]:
+                if tree_owned[i]:
                     continue
                 # A declined block is not wholly this request's either: any of its
                 # slots can be a node's own (see `_tree_held_mask`). Freeing the block
@@ -901,8 +922,10 @@ class RadixCache(BasePrefixCache):
             if prompt_len < len(kv_indices):
                 self.token_to_kv_pool_allocator.free(kv_indices[prompt_len:])
 
-        # Release the per-namespace prompt locks taken in cache_unfinished_req.
-        for node in req.sub_context_last_nodes:
+        # Release the per-namespace prompt locks taken in cache_unfinished_req. None
+        # when no such pass ran; the scheduling-time match locks that request does hold
+        # were already released by `release_sub_context_match_locks` in the caller.
+        for node in req.sub_context_last_nodes or []:
             self.dec_lock_ref(node)
         req.sub_context_last_nodes = None
         req.sub_context_owned_lens = None
