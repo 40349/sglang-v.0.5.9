@@ -1036,11 +1036,7 @@ class Req(ReqDllmMixin):
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
 
-        if (
-            tree_cache is not None
-            and self.has_sub_contexts
-            and tree_cache.supports_sub_contexts()
-        ):
+        if tree_cache is not None and tree_cache.serves_sub_contexts(self):
             # Matched per-namespace, never against the default one (which would share
             # a KV slot -- e.g. the warmup BOS -- with a namespace node and trip the
             # leak checker). The contiguous prefix is stitched from those hits.

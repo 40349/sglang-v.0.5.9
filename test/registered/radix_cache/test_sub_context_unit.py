@@ -563,6 +563,43 @@ class TestRotatedBlocks(unittest.TestCase):
 class TestSubContextLifecycle(unittest.TestCase):
     """Match -> per-namespace insert -> finish, and the reuse it enables."""
 
+    def test_read_and_write_gates_agree(self):
+        """The read path and the write paths must answer "is this request split?"
+        identically, in every state that has ever pulled them apart.
+
+        Both times this failed, the write gate carried a condition the read gate did
+        not -- a length clause, then a `sub_context_last_nodes` check -- and the request
+        was stitched out of the namespaces by one and filed under the DEFAULT namespace
+        by the other. `serves_sub_contexts` is now the single gate; this holds the three
+        call sites to it.
+        """
+        for label, page_size, mutate in (
+            ("fresh request", 1, lambda r: None),
+            # `fill_ids = origin_input_ids + output_ids`, so a retracted request comes
+            # back longer than the prompt its blocks describe. That is what the write
+            # gate's old length clause tripped on.
+            ("retracted, fill_ids past the split prompt", 1,
+             lambda r: r.output_ids.extend([61, 62, 63])),
+            # No unfinished pass ran: the state a request finishing during prefill
+            # arrives in.
+            ("no unfinished pass ran", 1,
+             lambda r: setattr(r, "sub_context_last_nodes", None)),
+            # A cache that cannot serve the split must turn BOTH paths off, or matches
+            # land in namespaces that nothing ever inserts into.
+            ("cache does not support the split", 4, lambda r: None),
+        ):
+            with self.subTest(label):
+                cache, pool, _ = make_cache(page_size=page_size)
+                req = make_req("r1", [[1, 2, 3], [4, 5]], [SYS_KEY, MSG_KEY])
+                mutate(req)
+                req.init_next_round_input(cache)
+                read_took_split = req.sub_context_match_lens is not None
+                self.assertEqual(
+                    read_took_split,
+                    cache.serves_sub_contexts(req),
+                    f"{label}: read path and write gate disagree",
+                )
+
     def test_finishing_without_an_unfinished_pass_files_nothing_by_default_key(self):
         """A split request can reach finish without ever running an unfinished pass --
         it emitted its stop token during prefill, or was aborted while queued.

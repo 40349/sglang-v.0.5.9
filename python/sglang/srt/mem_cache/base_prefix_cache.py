@@ -232,6 +232,24 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         return False
 
+    def serves_sub_contexts(self, req: Any) -> bool:
+        """The one gate: is THIS request served through the per-namespace paths?
+
+        Read (`Req.init_next_round_input`) and write (`cache_unfinished_req`,
+        `cache_finished_req`) must answer this identically. When they do not, the read
+        path stitches a request out of the namespaces and the write path files what it
+        holds under the DEFAULT namespace -- so slots the namespace nodes own get a
+        second, key-less owner, and evicting either hands a live slot back to the pool.
+
+        That failure has now arrived twice, by two conditions that look nothing alike:
+        a length clause the read path did not have (a retracted request comes back with
+        `fill_ids = origin_input_ids + output_ids`), and a `sub_context_last_nodes`
+        check that a request finishing during prefill never satisfies. Both ended in
+        the same branch. So the gate lives in one place and the call sites read it,
+        rather than three copies that have to be kept in step by hand.
+        """
+        return bool(getattr(req, "has_sub_contexts", False)) and self.supports_sub_contexts()
+
     def matched_canonical_position(self, last_node: Any, hit_len: int) -> Optional[int]:
         """Where the KV behind a match was computed, or None if not tracked.
 

@@ -604,7 +604,7 @@ class RadixCache(BasePrefixCache):
         # serving them from two keys at once, and evicting either one hands a live slot
         # back to the pool. That is job 441's `dup_within_tree`; a replay with
         # `ignore_eos` can never produce it, because no request can finish at prefill.
-        if req.has_sub_contexts and self.supports_sub_contexts():
+        if self.serves_sub_contexts(req):
             if not AUDIT_ON:
                 self._finish_sub_contexts(req, token_ids, kv_indices, is_insert)
                 return
@@ -1187,21 +1187,13 @@ class RadixCache(BasePrefixCache):
         # approximation (no cross-namespace attention correction), and the generated
         # continuation is added at finish time, not here.
         #
-        # This gate must stay equivalent to the read path's in
-        # `Req.init_next_round_input`, or matches and inserts land in different
-        # namespaces; `supports_sub_contexts` is what both consult.
-        # Exactly the read path's gate in `Req.init_next_round_input`, and it has to
-        # stay that way. It once also required `len(token_ids)` to fit inside the split
-        # prompt, which looks harmless and is not: a retracted request comes back with
-        # `fill_ids = origin_input_ids + output_ids` (`schedule_batch.py:1029`), so it
-        # failed that clause while the read path -- which never looked at the length --
-        # had already stitched it out of the namespaces. It was then written to the
-        # DEFAULT namespace, filing slots the namespace nodes own under a second owner,
-        # and finished through the branch the conservation check does not cover. The
+        # `serves_sub_contexts` is the gate, shared with the read path -- see its
+        # docstring for why this must not be spelled out a second time here. The
         # per-block insert below clamps every block to what this pass covers, so a
-        # longer `token_ids` needs no gate: the generated tail simply belongs to no
-        # block, and `_cache_sub_context_output` is what offers it to the tree.
-        if req.has_sub_contexts and self.supports_sub_contexts():
+        # `token_ids` longer than the split prompt needs no gate of its own: the
+        # generated tail simply belongs to no block, and `_cache_sub_context_output`
+        # is what offers it to the tree.
+        if self.serves_sub_contexts(req):
             if not AUDIT_ON:
                 self._cache_unfinished_sub_contexts(req, token_ids, kv_indices)
                 return
