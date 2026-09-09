@@ -76,14 +76,25 @@ def unsupported_reason(tree_cache) -> Optional[str]:
 def rotation_unsupported_reason(model_runner, tree_cache) -> Optional[str]:
     """Return why cached K cannot be re-rotated here, or None if it can.
 
-    Rotating by a delta is only valid when RoPE's angle is linear in the position and
-    the cache row for that delta is a unit rotation. That is true for the plain
-    ``RotaryEmbedding`` and false for most of its subclasses, so the check is on the
-    exact type rather than ``isinstance`` -- a YaRN cache row carries an ``mscale``
-    factor and would quietly scale K by ``mscale**2`` on every reuse.
+    Rotating by a delta is only valid when the cache row for a position is a rotation
+    through an angle linear in that position. Which RoPEs have that property is
+    *measured* here (``rope_delta_composable_reason`` runs the identity on the model's
+    own module at startup) rather than listed by class name, so a scaled RoPE that does
+    compose -- llama3's remap, dynamic NTK, YaRN once its ``mscale`` is divided out --
+    is admitted on evidence instead of being refused on a guess.
+
+    Two exclusions still come first, because they are invisible to a measurement that
+    can only feed the model scalar positions from one cache.
     """
+    from sglang.srt.layers.rotary_embedding import (
+        LinearScalingRotaryEmbedding,
+        MRotaryEmbedding,
+    )
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-    from sglang.srt.mem_cache.rotate_kv import find_rotary_embedding
+    from sglang.srt.mem_cache.rotate_kv import (
+        find_rotary_embedding,
+        rope_delta_composable_reason,
+    )
 
     sub_context = unsupported_reason(tree_cache)
     if sub_context is not None:
@@ -92,6 +103,19 @@ def rotation_unsupported_reason(model_runner, tree_cache) -> Optional[str]:
     rotary, why = find_rotary_embedding(model_runner.model)
     if rotary is None:
         return why
+
+    if isinstance(rotary, MRotaryEmbedding):
+        return (
+            "mrope addresses a position with a 3-vector (text/height/width); the "
+            "sub-context offsets are scalars, so there is no one delta to rotate by"
+        )
+    if isinstance(rotary, LinearScalingRotaryEmbedding):
+        return (
+            "linear scaling concatenates one cos_sin_cache per LoRA scaling factor "
+            "(rotary_embedding.py:471-504), so a row index is a position plus a "
+            "per-request offset and a delta can cross into a different cache"
+        )
+
     if not rotary.is_neox_style:
         return "the model uses GPT-J interleaved RoPE, not the neox pairing"
     if rotary.rotary_dim != rotary.head_size:
@@ -110,4 +134,7 @@ def rotation_unsupported_reason(model_runner, tree_cache) -> Optional[str]:
         )
     if pool.head_dim != rotary.head_size:
         return f"pool head_dim {pool.head_dim} != rope head_size {rotary.head_size}"
-    return None
+
+    # Last, because it runs the model's own RoPE: everything above is a cheap structural
+    # veto, and none of it should be reached through a forward pass.
+    return rope_delta_composable_reason(rotary)

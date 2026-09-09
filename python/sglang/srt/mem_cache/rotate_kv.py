@@ -103,6 +103,47 @@ def _rotate_copy_kv_kernel(
     )
 
 
+def delta_cos_sin(
+    cos_sin_cache: torch.Tensor, rotary_dim: int, delta: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """cos/sin of ``R(delta)`` as a *unit* rotation, read off the model's own cache.
+
+    A negative delta indexes the cache at ``|delta|`` with the sine negated -- the same
+    rotation run backwards, since the cache only holds non-negative rows.
+
+    The row is then normalised per dimension. A plain cache already has unit rows (the
+    division is a no-op within fp32 noise), but the YaRN family stores ``mscale * cos``
+    and ``mscale * sin`` (``rotary_embedding.py:662-663``). That scalar is already baked
+    into the cached K we are about to rotate, so using the row as stored would multiply
+    K by ``mscale`` again on every hop. Dividing it out is exact rather than a
+    correction: mscale is a scalar, it commutes with the rotation, and it belongs to the
+    stored key, not to the delta.
+    """
+    half = rotary_dim // 2
+    row = cos_sin_cache[abs(delta)].float()
+    cos = row[:half]
+    sin = row[half:rotary_dim]
+    if delta < 0:
+        sin = -sin
+    scale = torch.sqrt(cos * cos + sin * sin)
+    return (cos / scale).contiguous(), (sin / scale).contiguous()
+
+
+def apply_delta_rows(
+    rows: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    """``R(delta)`` applied to the trailing dim of ``rows``, in fp32. Neox pairing."""
+    half = cos.numel()
+    src = rows.to(torch.float32)
+    x1, x2 = src[..., :half], src[..., half : 2 * half]
+    out = torch.empty_like(src)
+    out[..., :half] = x1 * cos - x2 * sin
+    out[..., half : 2 * half] = x2 * cos + x1 * sin
+    if src.shape[-1] > 2 * half:  # untouched tail when rotary_dim < head_dim
+        out[..., 2 * half :] = src[..., 2 * half :]
+    return out
+
+
 def rotate_copy_kv_native(
     k_buffer,
     v_buffer,
@@ -116,15 +157,8 @@ def rotate_copy_kv_native(
     Kept because it is the oracle the Triton kernel is tested against, and it is the
     only path that runs on CPU (where the sub-context unit tests live).
     """
-    half = cos.numel()
     for k_cache, v_cache in zip(k_buffer, v_buffer):
-        src = k_cache[src_loc].to(torch.float32)
-        x1, x2 = src[..., :half], src[..., half : 2 * half]
-        out = torch.empty_like(src)
-        out[..., :half] = x1 * cos - x2 * sin
-        out[..., half : 2 * half] = x2 * cos + x1 * sin
-        if src.shape[-1] > 2 * half:  # untouched tail when rotary_dim < head_dim
-            out[..., 2 * half :] = src[..., 2 * half :]
+        out = apply_delta_rows(k_cache[src_loc], cos, sin)
         k_cache[dst_loc] = out.to(k_cache.dtype)
         v_cache[dst_loc] = v_cache[src_loc]
 
@@ -157,17 +191,8 @@ class KVRotator:
         return delta != 0 and abs(delta) <= self.max_delta
 
     def _cos_sin(self, delta: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """cos/sin for ``delta``, reusing the model's own fp32 cos_sin_cache.
-
-        Negative deltas index the cache at ``|delta|`` with the sine negated, which is
-        the same rotation run backwards -- the cache only holds non-negative rows.
-        """
-        row = self.cos_sin_cache[abs(delta)]
-        cos = row[: self.half].contiguous()
-        sin = row[self.half : self.rotary_dim].contiguous()
-        if delta < 0:
-            sin = -sin
-        return cos, sin
+        """cos/sin for ``delta``, reusing the model's own fp32 cos_sin_cache."""
+        return delta_cos_sin(self.cos_sin_cache, self.rotary_dim, delta)
 
     def rotate_into(
         self, dst_loc: torch.Tensor, src_loc: torch.Tensor, delta: int
@@ -218,27 +243,24 @@ class KVRotator:
 
 
 def find_rotary_embedding(model) -> Tuple[Optional[object], Optional[str]]:
-    """Return the model's single plain ``RotaryEmbedding``, or why there isn't one.
+    """Return the model's single ``RotaryEmbedding``, or why there isn't one.
 
     Walks the live model rather than ``rotary_embedding._ROPE_DICT`` because that dict
     is process-global and would also hold a draft model's entry under speculative
     decoding. All layers share one instance via the ``_ROPE_DICT`` memo, so finding
     more than one distinct object means the model mixes rotations and a single delta
     would be wrong for some layer.
+
+    Subclasses are deliberately *not* filtered here. Whether a particular RoPE composes
+    under a delta is measured at startup by :func:`rope_delta_composable_reason`, which
+    is both stricter than a class name and still right for classes that did not exist
+    when this was written.
     """
     from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 
     found = []
     for module in model.modules():
         if isinstance(module, RotaryEmbedding):
-            if type(module) is not RotaryEmbedding:
-                # Subclasses are not delta-composable in general: YaRN scales cos/sin
-                # by mscale so cache[delta] is not a unit rotation, mrope's delta is a
-                # 3-vector, Phi3LongRoPE switches inv_freq at a position threshold.
-                return None, (
-                    f"{type(module).__name__} is a scaled/variant RoPE whose "
-                    "cos_sin_cache[delta] is not a plain rotation"
-                )
             if not any(module is f for f in found):
                 found.append(module)
     if not found:
@@ -246,3 +268,101 @@ def find_rotary_embedding(model) -> Tuple[Optional[object], Optional[str]]:
     if len(found) > 1:
         return None, f"the model uses {len(found)} distinct RotaryEmbedding instances"
     return found[0], None
+
+
+# (position, delta) samples for the startup self-test. Spread on purpose, and not only
+# near the origin: a cache that is merely *locally* linear -- one that switches inv_freq
+# past a threshold, or is several caches concatenated -- matches close to 0 and fails
+# far from it. Pairs outside a short cache are skipped, not failed.
+_SELFTEST_PAIRS = (
+    (0, 1),
+    (1, -1),
+    (17, 37),
+    (600, -400),
+    (4096, 4096),
+    (8192, -8000),
+    (30000, 1000),
+    (1000, 30000),
+)
+
+
+def rope_delta_composable_reason(rotary, tol: float = 1e-5) -> Optional[str]:
+    """Measure ``R(p + d) . k == R(d) . (R(p) . k)`` on the model's own RoPE.
+
+    This is a measurement standing in for a list of class names. The identity is the
+    one thing the whole reuse rests on; it holds for reasons a class name only
+    approximates (a per-dimension angle linear in the position, and a unit rotation once
+    mscale is divided out), and a name says nothing about a subclass added later. So:
+    RoPE a random key at ``p`` through the model's own ``forward_native``, apply our
+    delta rotation to the result, and compare against the same key RoPE'd directly at
+    ``p + d``.
+
+    The budget is ``tol`` plus a position term, not a flat number. ``cos_sin_cache``
+    holds ``position * inv_freq`` in fp32, so its row at position P already carries
+    ~``P * 2**-24`` rad of rounding; the identity reads three such rows and cannot hold
+    tighter than that. Measured: a plain RoPE with a *float64* cache matches to 8e-8 at
+    every sample, and the same law with the shipped fp32 cache drifts to 6e-4 by
+    position 30000 -- noise, not a broken law, and the position term is what tells the
+    two apart. What is left over is wide: the smallest real breakage is a YaRN mscale
+    left in the row, a 13.9% error at scaling factor 4.
+
+    Returns None when every sample fits its budget, else a string naming the worst.
+    """
+    cache = rotary.cos_sin_cache
+    max_pos = cache.shape[0]
+    head_size, rotary_dim = rotary.head_size, rotary.rotary_dim
+    heads = 2
+
+    pairs = [
+        (p, d)
+        for p, d in _SELFTEST_PAIRS
+        if 0 <= p < max_pos and 0 <= p + d < max_pos and abs(d) < max_pos
+    ]
+    if not pairs:
+        return f"the cos_sin_cache is only {max_pos} rows; too short to self-test"
+
+    device = cache.device
+    gen = torch.Generator(device=device).manual_seed(0)
+    key = torch.randn(
+        len(pairs),
+        heads * head_size,
+        generator=gen,
+        dtype=torch.float32,
+        device=device,
+    )
+    at = torch.tensor([p for p, _ in pairs], dtype=torch.long, device=device)
+    shifted = torch.tensor([p + d for p, d in pairs], dtype=torch.long, device=device)
+
+    with torch.no_grad():
+        _, cached = rotary.forward_native(at, key.clone(), key.clone())
+        _, target = rotary.forward_native(shifted, key.clone(), key.clone())
+
+    worst_ratio, worst = 0.0, (pairs[0], 0.0, 0.0)
+    for i, (p, d) in enumerate(pairs):
+        cos, sin = delta_cos_sin(cache, rotary_dim, d)
+        got = apply_delta_rows(cached[i].view(heads, head_size), cos, sin)
+        want = target[i].view(heads, head_size).float()
+        err = float((got - want).abs().max()) / max(float(want.abs().max()), 1e-3)
+        budget = tol + 4.0 * max(abs(p), abs(p + d)) * 2**-24
+        if err / budget > worst_ratio:
+            worst_ratio, worst = err / budget, ((p, d), err, budget)
+
+    (p, d), err, budget = worst
+    if worst_ratio > 1.0:
+        return (
+            f"{type(rotary).__name__} is not delta-composable: a key cached at "
+            f"position {p} and rotated by {d} differs from RoPE at {p + d} by "
+            f"{err:.2e} relative, over a budget of {budget:.2e}"
+        )
+    logger.info(
+        "RoPE delta self-test passed for %s on %d (position, delta) samples; worst was "
+        "position %d delta %d at %.2e relative, %.0f%% of its %.2e budget",
+        type(rotary).__name__,
+        len(pairs),
+        p,
+        d,
+        err,
+        100.0 * worst_ratio,
+        budget,
+    )
+    return None

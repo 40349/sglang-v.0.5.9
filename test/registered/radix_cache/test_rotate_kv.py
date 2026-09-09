@@ -36,7 +36,11 @@ except ValueError:
     set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
-from sglang.srt.mem_cache.rotate_kv import KVRotator
+from sglang.srt.mem_cache.rotate_kv import (
+    KVRotator,
+    delta_cos_sin,
+    rope_delta_composable_reason,
+)
 
 
 class FakePool:
@@ -83,7 +87,8 @@ class TestRotateKV(unittest.TestCase):
             rope_scaling=None,
             dtype=dtype,
         ).to(device)
-        # A subclass here would mean the delta identity does not hold.
+        # The kernel is tested against the plain law; whether a *subclass* composes
+        # under a delta is a separate question, measured in TestDeltaComposableSelfTest.
         self.assertIs(type(rope), RotaryEmbedding)
 
         pool = FakePool(4 * n + 8, layers, head_num, head_dim, dtype, device)
@@ -212,6 +217,119 @@ class TestRotateKV(unittest.TestCase):
         self.assertTrue(rotator.can_rotate(-5))
         self.assertTrue(rotator.can_rotate(rotator.max_delta))
         self.assertFalse(rotator.can_rotate(rotator.max_delta + 1))
+
+
+class TestDeltaComposableSelfTest(unittest.TestCase):
+    """The startup gate that decides which RoPEs may be rotated at all.
+
+    It replaced a list of class names, so what has to be shown is that it is a real
+    discriminator and not a rubber stamp: the ropes that do compose pass, and two
+    ropes that do not are rejected -- one whose law changes with the position, and
+    one with a scale factor left in the row.
+    """
+
+    HEAD = 128
+
+    def rope(self, scaling, max_position=40960):
+        return get_rope(
+            head_size=self.HEAD,
+            rotary_dim=self.HEAD,
+            max_position=max_position,
+            base=1000000,
+            is_neox_style=True,
+            rope_scaling=scaling,
+            dtype=torch.float32,
+        )
+
+    # Every one of these was refused by the old `type(rope) is RotaryEmbedding` check.
+    COMPOSABLE = {
+        "default": None,
+        "llama3": {
+            "rope_type": "llama3",
+            "factor": 8.0,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8192,
+        },
+        "yarn": {
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 32768,
+        },
+        "dynamic": {"rope_type": "dynamic", "factor": 2.0},
+    }
+
+    def test_scaled_ropes_that_compose_are_admitted(self):
+        for name, scaling in self.COMPOSABLE.items():
+            with self.subTest(rope_type=name):
+                self.assertIsNone(rope_delta_composable_reason(self.rope(scaling)))
+
+    def test_a_law_that_changes_with_position_is_rejected(self):
+        """Phi3LongRoPE's shape: one inv_freq below a threshold, another above it.
+
+        Near the origin such a cache is indistinguishable from a plain one, which is
+        why the samples reach past 8192 -- a self-test that only probed small deltas
+        would wave this through.
+        """
+        rope = RotaryEmbedding(self.HEAD, self.HEAD, 40960, 1000000, True, torch.float32)
+        other = RotaryEmbedding(self.HEAD, self.HEAD, 40960, 10000, True, torch.float32)
+        rope.cos_sin_cache = torch.cat(
+            [rope.cos_sin_cache[:8192], other.cos_sin_cache[8192:]], dim=0
+        )
+        reason = rope_delta_composable_reason(rope)
+        self.assertIsNotNone(reason)
+        self.assertIn("not delta-composable", reason)
+
+    def test_yarn_row_carries_mscale_and_the_read_divides_it_out(self):
+        rope = self.rope(self.COMPOSABLE["yarn"])
+        self.assertGreater(rope.mscale, 1.0)  # or there would be nothing to divide
+
+        half = self.HEAD // 2
+        row = rope.cos_sin_cache[37]
+        stored = torch.sqrt(row[:half] ** 2 + row[half:] ** 2)
+        torch.testing.assert_close(
+            stored, torch.full_like(stored, rope.mscale), rtol=1e-6, atol=1e-6
+        )
+
+        cos, sin = delta_cos_sin(rope.cos_sin_cache, self.HEAD, 37)
+        unit = torch.sqrt(cos**2 + sin**2)
+        torch.testing.assert_close(unit, torch.ones_like(unit), rtol=1e-6, atol=1e-6)
+
+    def test_the_self_test_catches_an_undivided_mscale(self):
+        """The negative control for the line above: skip the division, get rejected.
+
+        Without it every reuse would multiply K by mscale -- 1.14x per hop here, and
+        silently, since nothing else in the system inspects the cached values.
+        """
+        import sglang.srt.mem_cache.rotate_kv as rotate_kv
+
+        def raw_row(cache, rotary_dim, delta):
+            row = cache[abs(delta)].float()
+            half = rotary_dim // 2
+            sin = row[half:rotary_dim]
+            return row[:half].contiguous(), (-sin if delta < 0 else sin).contiguous()
+
+        original = rotate_kv.delta_cos_sin
+        rotate_kv.delta_cos_sin = raw_row
+        try:
+            reason = rope_delta_composable_reason(self.rope(self.COMPOSABLE["yarn"]))
+        finally:
+            rotate_kv.delta_cos_sin = original
+        self.assertIsNotNone(reason)
+        self.assertIn("not delta-composable", reason)
+
+    def test_mrope_passes_numerically_and_is_excluded_structurally(self):
+        """Why ``rotation_unsupported_reason`` still names mrope by class.
+
+        Fed scalar positions, mrope *is* plain RoPE and passes -- the self-test never
+        sees the case that breaks it, a 3-vector position from an image. A measurement
+        can only refuse what it can reach, so that one stays a structural veto.
+        """
+        mrope = self.rope({"rope_type": "default", "mrope_section": [16, 24, 24]})
+        self.assertIsNone(rope_delta_composable_reason(mrope))
+        from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+
+        self.assertIsInstance(mrope, MRotaryEmbedding)
 
 
 if __name__ == "__main__":
