@@ -945,10 +945,12 @@ _SUMMARY_METRICS = (
      lambda a, b, n: _gpu_stat(a, "prefill_new_tokens"), "pct"),
     ("prefill tokens from the cache", "tok",
      lambda a, b, n: _gpu_stat(a, "prefill_cached_tokens"), "pct"),
-    ("  matched but dropped", "tok",
-     lambda a, b, n: _gpu_stat(a, "discarded_tokens"), "pct"),
-    ("  dropped as MOVED", "tok",
-     lambda a, b, n: _gpu_stat(a, "moved_tokens"), "pct"),
+    # The one rotation row this table carries, and the only one whose indent is
+    # true: a rotated-in hit IS part of the line above it. `matched but dropped`
+    # and `dropped as MOVED` sat here at the same indent and are the opposite side
+    # of the ledger -- tokens NOT served -- which reads as a breakdown and is not
+    # one. They stay in `report`'s ROTATE vs BASELINE table, where the whole
+    # partition is laid out and the reader is looking for it.
     ("  MOVED but rotated in", "tok",
      lambda a, b, n: _gpu_stat(a, "rotated_tokens"), "pct"),
 
