@@ -46,6 +46,7 @@ conda activate $ENV 2>/dev/null || {
   exit 1
 }
 export PYTHONNOUSERSITE=1        # ~/.local has a broken torch dist-info ahead of the env
+export PYTHONUNBUFFERED=1        # stdout is a pipe once the console is teed; see run_mas.sh
 export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
 
 # The server command lives here, once. Callers set LOG, and optionally

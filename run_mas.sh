@@ -134,6 +134,11 @@ conda activate $ENV 2>/dev/null || {
   exit 1
 }
 export PYTHONNOUSERSITE=1        # ~/.local has a broken torch dist-info ahead of the env
+# Teeing the console made stdout a pipe, and Python block-buffers on a pipe where it
+# line-buffers on a tty. The replay's per-request line is the only sign a 4-minute arm
+# is alive, and it went silent for the whole arm. The server was already launched with
+# `python -u`; this is the same fix for every client the script runs.
+export PYTHONUNBUFFERED=1
 export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
 
 # Wait for a server on another box and refuse if it is not the arm we asked for.
