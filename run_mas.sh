@@ -131,14 +131,103 @@ remote_check() {
     --model "$MAS_MODEL"
 }
 
+# Every process the server spawns, not just the one that was exec'd. The scheduler
+# renames itself to `sglang::scheduler` (scheduler.py:3183) and the detokenizer to
+# `sglang::detokenizer`, so after setproctitle their /proc cmdline no longer contains
+# "sglang.launch_server" -- which is all the old pattern matched. The scheduler is
+# the process holding the weights AND the KV pool, so killing only the HTTP parent
+# left the VRAM behind and three arms of one toggle run stacked three pools on one
+# card. Same pattern scripts/killall_sglang.sh uses. The `[s]` keeps the pattern from
+# matching whatever shell is carrying it.
+SGLANG_PROCS='[s]glang::|[s]glang\.launch_server|[s]glang\.bench|[s]glang\.srt'
+
+# TERM first and then wait, because the host timers dump on SIGTERM: killing the
+# scheduler outright throws away the stage trace this run is being measured with.
+kill_servers() {
+  pkill -TERM -f "$SGLANG_PROCS" 2>/dev/null || true
+  for _ in $(seq 1 40); do
+    pgrep -f "$SGLANG_PROCS" > /dev/null 2>&1 || return 0
+    sleep 1
+  done
+  echo "  WARNING: sglang processes outlived SIGTERM; escalating to KILL."
+  echo "  Their stage counters stop at whatever was last flushed."
+  pkill -KILL -f "$SGLANG_PROCS" 2>/dev/null || true
+  sleep 5
+}
+
+# Refuse to start on a card that is not ours to fill. Two different failures land
+# here and both ruin the run: our own leftover server still holding a pool, where
+# the launch simply OOMs; and somebody else's job, where the launch may well fit but
+# their load moves our latency -- and TTFT and throughput then describe the pair of
+# jobs, not this experiment.
+# The UUID of the card this run will actually get. Not the node's GPU 0: Slurm hands
+# out devices through CUDA_VISIBLE_DEVICES, so on a four-card box the free GPU we were
+# given and the stuffed GPU 0 we would otherwise inspect are different cards -- and
+# checking the wrong one both refuses good runs and waves through doomed ones. Slurm
+# may put either an index or a UUID in that variable, so handle both.
+target_gpu_uuid() {
+  local first
+  first=${CUDA_VISIBLE_DEVICES:-0}
+  first=${first%%,*}
+  case "$first" in
+    GPU-*|MIG-*) echo "$first"; return 0 ;;
+    ""|*[!0-9]*) return 0 ;;
+  esac
+  nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits 2>/dev/null \
+    | awk -F', *' -v i="$first" '$1 == i {print $2; exit}'
+}
+
+require_free_vram() {
+  command -v nvidia-smi > /dev/null 2>&1 || return 0
+  local uuid row total free need
+  uuid=$(target_gpu_uuid)
+  [ -n "$uuid" ] || return 0
+  row=$(nvidia-smi --query-gpu=uuid,memory.total,memory.free \
+          --format=csv,noheader,nounits 2>/dev/null \
+        | awk -F', *' -v u="$uuid" '$1 == u {print $2, $3; exit}')
+  [ -n "$row" ] || return 0
+  total=${row%% *}; free=${row##* }
+  case "$total$free" in *[!0-9]*|"") return 0 ;; esac   # not a number: say nothing
+  need=$(awk -v t="$total" -v f="$MEMFRAC" 'BEGIN{printf "%d", t * f}')
+  [ "$free" -ge "$need" ] && return 0
+  echo "REFUSING: the GPU this job was given (${uuid}) has ${free} MiB free, but"
+  echo "  --mem-fraction-static $MEMFRAC wants ${need} MiB of its ${total} MiB."
+  if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    # The likeliest way to be told a card is full when a free one exists on the
+    # same node: nothing scheduled this run onto a card at all, so it defaulted to
+    # index 0 -- which on a shared box is the one everyone else defaulted onto too.
+    echo "  CUDA_VISIBLE_DEVICES is unset, so this fell back to the node's GPU 0."
+    echo "  If you meant to run inside a Slurm allocation, you are not in one"
+    echo "  (SLURM_JOB_ID=${SLURM_JOB_ID:-unset}); get one, or name a free card"
+    echo "  yourself with CUDA_VISIBLE_DEVICES=<n>."
+  fi
+  echo "  Holding it now:"
+  nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader \
+      2>/dev/null \
+    | awk -F', *' -v u="$uuid" '$1 == u {print $2", "$3}' \
+    | while IFS= read -r row; do
+        pid=$(echo "${row%%,*}" | tr -d ' ')
+        echo "    pid ${row}   owner=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')" \
+             "cmd=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d ' ')"
+      done
+  echo "  If they are yours:      bash $REPO/scripts/killall_sglang.sh   (or scancel"
+  echo "                          the job holding them -- a Slurm job that ended"
+  echo "                          badly leaves its scheduler behind)"
+  echo "  If they are not:        this card is shared -- the timings would be a"
+  echo "                          property of both jobs. Get a node to yourself, or"
+  echo "                          lower MEMFRAC and accept that only the reuse"
+  echo "                          numbers survive, not the latency ones."
+  exit 1
+}
+
 # The server command lives here, once. Callers set LOG, and optionally CAPTURE /
 # TRACE / STAGE / SUBCTX_OFF / SUBCTX_TRACE / SUBCTX_ROTATE / SUBCTX_ROTATE_ACROSS /
 # ROTATE_GPU before calling. ROTATE_GPU=1 adds CUDA-event timing around the rotation
 # kernel and fills the summary's [GPU] row; it costs an event pair per rotation, so
 # take the host overhead numbers from a run without it.
 launch() {
-  pkill -f "[s]glang\.launch_server" 2>/dev/null || true
-  sleep 6
+  kill_servers
+  require_free_vram
   if [ -n "${TRACE:-}" ]; then rm -f "$TRACE"; fi
   if [ -n "${STAGE:-}" ]; then rm -f "$STAGE".*; fi
   SGLANG_CAPTURE_REQUESTS=${CAPTURE:-} \
@@ -170,8 +259,7 @@ launch() {
 }
 
 stop() {
-  pkill -TERM -f "[s]glang\.launch_server" 2>/dev/null || true   # TERM so timers flush
-  sleep 8
+  kill_servers
 }
 
 # Replay the capture against whatever server is up. Callers set CLIENT (+ TRACE/STAGE).

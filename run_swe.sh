@@ -30,9 +30,13 @@ export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
 
 # The server command lives here, once. Callers set LOG, and optionally
 # CAPTURE / TRACE / STAGE / SUBCTX_OFF / SUBCTX_TRACE before calling.
+# `sglang::scheduler` is where the weights and the KV pool live, and setproctitle
+# renames it out of reach of a "sglang.launch_server" match -- see run_mas.sh.
+SGLANG_PROCS='[s]glang::|[s]glang\.launch_server|[s]glang\.bench|[s]glang\.srt'
+
 launch() {
-  pkill -f "[s]glang\.launch_server" 2>/dev/null || true
-  sleep 6
+  pkill -TERM -f "$SGLANG_PROCS" 2>/dev/null || true
+  sleep 10
   if [ -n "${TRACE:-}" ]; then rm -f "$TRACE"; fi
   if [ -n "${STAGE:-}" ]; then rm -f "$STAGE".*; fi
   SGLANG_CAPTURE_REQUESTS=${CAPTURE:-} \
@@ -61,8 +65,8 @@ launch() {
 }
 
 stop() {
-  pkill -TERM -f "[s]glang\.launch_server" 2>/dev/null || true   # TERM so timers flush
-  sleep 8
+  pkill -TERM -f "$SGLANG_PROCS" 2>/dev/null || true   # TERM so timers flush
+  sleep 10
 }
 
 # Replay the capture against whatever server is up. Callers set CLIENT (+ TRACE/STAGE).

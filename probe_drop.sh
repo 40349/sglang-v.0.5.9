@@ -20,8 +20,10 @@ PORT=${PORT:-30000}
 MODEL=${MODEL:-QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ}
 
 source /home/t2503-3090/miniconda3/etc/profile.d/conda.sh
-pkill -f "sglang\.launch_server" 2>/dev/null || true
-sleep 6
+# `[s]` so this script's own command line cannot match; `sglang::` because the
+# scheduler renames itself and is the process holding the pool. See run_mas.sh.
+pkill -TERM -f '[s]glang::|[s]glang\.launch_server' 2>/dev/null || true
+sleep 10
 conda activate sglangv59
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="$REPO/python"
@@ -44,7 +46,7 @@ python "$REPO/subcontext_bench.py" replay "$REQUESTS" \
   --url "http://127.0.0.1:$PORT" --model "$MODEL" \
   --gen-tokens 32 --out "$OUT/client_probe_${TAG}.json" > /dev/null
 
-pkill -TERM -f "sglang\.launch_server" 2>/dev/null || true
-sleep 8
+pkill -TERM -f '[s]glang::|[s]glang\.launch_server' 2>/dev/null || true
+sleep 10
 echo "trace written to $LOG"
 grep -c "sub-context match" "$LOG" || true

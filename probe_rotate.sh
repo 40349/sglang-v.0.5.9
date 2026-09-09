@@ -34,7 +34,8 @@ source /home/t2503-3090/miniconda3/etc/profile.d/conda.sh
 conda activate $ENV
 export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
 
-stop() { pkill -f "[s]glang\.launch_server" 2>/dev/null || true; sleep 5; }
+# See run_mas.sh: the scheduler renames itself and holds the pool.
+stop() { pkill -TERM -f '[s]glang::|[s]glang\.launch_server' 2>/dev/null || true; sleep 10; }
 trap stop EXIT
 
 stop
