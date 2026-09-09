@@ -78,6 +78,17 @@ replay() {
     --model $MODEL --gen-tokens $GEN_TOKENS --concurrency $CONC --save-text
 }
 
+# Console to a file as well as the terminal, same reasoning as run_mas.sh: the tables
+# at the end of a toggle are the result and are written nowhere else. CONSOLE= disables.
+CONSOLE=${CONSOLE-$OUT/${1:-run}.txt}
+if [ -n "$CONSOLE" ]; then
+  echo "### $(date -Is)  $0 ${*:-}  CONC=$CONC GEN_TOKENS=$GEN_TOKENS" >> "$CONSOLE"
+  exec > >(tee -a "$CONSOLE") 2>&1
+  TEE_PID=$!
+  trap 'exec 1>&- 2>&-; wait $TEE_PID 2>/dev/null || true' EXIT
+  echo "console -> $CONSOLE"
+fi
+
 case "${1:-}" in
   record)
     rm -f "$REQUESTS"

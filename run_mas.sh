@@ -20,6 +20,9 @@
 # and expect the rotation arm to stop reproducing exactly -- with several requests
 # in flight, what each one finds in the tree depends on how they interleave.
 #
+# Everything printed is also appended to $OUT/<mode><suffix>.txt, so the summary
+# tables survive the terminal. CONSOLE=path puts it elsewhere, CONSOLE= turns it off.
+#
 # An arm's results land in ab_out/maslab/<arm>/, named ..._<tag>_<arm>. Both halves
 # come from $ARM, never from anything typed, so the arm a file claims is the arm that
 # produced it. `toggle` drives all three arms itself and writes at the top of
@@ -220,6 +223,30 @@ require_free_vram() {
   exit 1
 }
 
+# Say which physical card the server actually got, once, in the run's own output.
+# Worth a line because the failure it catches is silent and expensive: with no Slurm
+# allocation and no CUDA_VISIBLE_DEVICES, sglang falls back to `str(gpu_id)` --
+# device 0 of the NODE (utils/common.py:3822) -- which on a shared box is the card
+# everyone else without an allocation also defaulted onto. `record` never hits this
+# because its server is started by sbatch and Slurm sets the variable itself; this
+# script starts its own server in whatever shell you are in, and inherits whatever
+# that shell has.
+report_gpu() {
+  command -v nvidia-smi > /dev/null 2>&1 || return 0
+  local pid cvd uuid index
+  pid=$(pgrep -f '[s]glang::scheduler' | head -1)
+  [ -n "$pid" ] || return 0
+  cvd=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
+        | sed -n 's/^CUDA_VISIBLE_DEVICES=//p')
+  uuid=$(nvidia-smi --query-compute-apps=pid,gpu_uuid --format=csv,noheader 2>/dev/null \
+         | awk -F', *' -v p="$pid" '$1 == p {print $2; exit}')
+  index=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits 2>/dev/null \
+          | awk -F', *' -v u="$uuid" '$2 == u {print $1; exit}')
+  echo "  scheduler pid $pid on physical GPU ${index:-?} (${uuid:-unknown})," \
+       "CUDA_VISIBLE_DEVICES=${cvd:-<unset>}"
+  [ -n "$cvd" ] || echo "  NOTE: unset, so this fell back to the node's device 0."
+}
+
 # The server command lives here, once. Callers set LOG, and optionally CAPTURE /
 # TRACE / STAGE / SUBCTX_OFF / SUBCTX_TRACE / SUBCTX_ROTATE / SUBCTX_ROTATE_ACROSS /
 # ROTATE_GPU before calling. ROTATE_GPU=1 adds CUDA-event timing around the rotation
@@ -249,7 +276,7 @@ launch() {
     > "$LOG" 2>&1 &
   echo -n "  waiting"
   for _ in $(seq 1 300); do
-    if grep -q "fired up and ready" "$LOG"; then echo " ready"; return 0; fi
+    if grep -q "fired up and ready" "$LOG"; then echo " ready"; report_gpu; return 0; fi
     if ! pgrep -f "[s]glang\.launch_server" > /dev/null; then
       echo " DIED"; tail -30 "$LOG"; exit 1
     fi
@@ -269,6 +296,27 @@ replay() {
     --trace "${TRACE:-}" --stage-trace "${STAGE:-}" --out "$CLIENT" \
     --model $MODEL --gen-tokens $GEN_TOKENS --concurrency $CONC --save-text
 }
+
+# Everything from here on goes to a file as well as the terminal. A `toggle` costs an
+# hour and its result IS the console output -- the tables at the end are not written
+# anywhere else -- so losing them to a closed terminal or a full scrollback loses the
+# run. Appended, not truncated: a second run on the same tag is usually a re-run to
+# check something against the first, and the header line says which is which.
+# CONSOLE= disables it.
+CONSOLE=${CONSOLE-$OUT/${1:-run}$SUF.txt}
+if [ -n "$CONSOLE" ]; then
+  {
+    echo "### $(date -Is)  $0 ${*:-}"
+    echo "### ARM=${ARM:-} TAG=${TAG:-} ROTATE=${ROTATE:-} ACROSS=${ACROSS:-}" \
+         "CONC=$CONC MEMFRAC=$MEMFRAC GEN_TOKENS=$GEN_TOKENS MODEL=$MODEL"
+  } >> "$CONSOLE"
+  exec > >(tee -a "$CONSOLE") 2>&1
+  # `tee` outlives the shell's last write, so wait for it or the tail of the run is
+  # missing from the file exactly when it matters -- the summary tables.
+  TEE_PID=$!
+  trap 'exec 1>&- 2>&-; wait $TEE_PID 2>/dev/null || true' EXIT
+  echo "console -> $CONSOLE"
+fi
 
 case "${1:-}" in
   record)
@@ -392,6 +440,16 @@ EOF
       # rotation it is named for is worse than no arm at all.
       grep -q "Sub-context KV rotation ENABLED" $OUT/server_rot$SUF.log \
         || { echo "REFUSING: rotation did not report itself enabled"; exit 1; }
+      # And assert Stage 2 is in the state that was asked for. ACROSS decides whether
+      # prefill gets cut at block edges, which moves the hit rate by ~4.5 pp and the
+      # prefill GPU time by ~10% -- two runs that differ only in it are not comparable,
+      # and a set of numbers with no record of which way it was set cannot be read at
+      # all. That is not hypothetical: it is what made the 45.9%-vs-31.4% comparison
+      # unreadable until the pass counts gave it away.
+      want_across=$([ -n "${ACROSS:-}" ] && echo True || echo False)
+      grep -q "across-recompute=$want_across" $OUT/server_rot$SUF.log \
+        || { echo "REFUSING: asked for ACROSS=${ACROSS:-<unset>} but the server reported"; \
+             grep -o "across-recompute=[A-Za-z]*" $OUT/server_rot$SUF.log | head -1; exit 1; }
       TRACE=$OUT/trace_rot$SUF.jsonl STAGE=$OUT/stage_rot$SUF \
         CLIENT=$OUT/client_rot$SUF.json replay
     fi
