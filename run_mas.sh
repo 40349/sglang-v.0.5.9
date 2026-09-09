@@ -284,6 +284,12 @@ report_gpu() {
 launch() {
   kill_servers
   require_free_vram
+  # The server is started with `nohup ... &`, so it outlives this shell -- including a
+  # Ctrl-C, and including the end of the salloc that owns the GPU. That is how an
+  # abandoned toggle left a scheduler holding 129 GB on a card Slurm had already handed
+  # back. Arm the cleanup from here, so only a run that actually started a server tears
+  # one down: a REMOTE `record` drives a server on another box and must not.
+  LAUNCHED=1
   if [ -n "${TRACE:-}" ]; then rm -f "$TRACE"; fi
   if [ -n "${STAGE:-}" ]; then rm -f "$STAGE".*; fi
   SGLANG_CAPTURE_REQUESTS=${CAPTURE:-} \
@@ -326,6 +332,23 @@ replay() {
     --model $MODEL --gen-tokens $GEN_TOKENS --concurrency $CONC --save-text
 }
 
+# A server this script started must not survive it. `launch` sets LAUNCHED, and the
+# trap is installed unconditionally -- an interrupted run is exactly the case that
+# leaks, and it is also the case where the console file is least likely to be enabled.
+LAUNCHED=0
+TEE_PID=
+on_exit() {
+  if [ "$LAUNCHED" = 1 ]; then
+    echo; echo "cleaning up the server this run started"
+    kill_servers
+  fi
+  # Last, and only then: closing stdout is what lets `tee` see EOF and flush.
+  exec 1>&- 2>&- || true
+  [ -n "$TEE_PID" ] && wait "$TEE_PID" 2>/dev/null
+  return 0
+}
+trap on_exit EXIT
+
 # Everything from here on goes to a file as well as the terminal. A `toggle` costs an
 # hour and its result IS the console output -- the tables at the end are not written
 # anywhere else -- so losing them to a closed terminal or a full scrollback loses the
@@ -340,10 +363,9 @@ if [ -n "$CONSOLE" ]; then
          "CONC=$CONC MEMFRAC=$MEMFRAC GEN_TOKENS=$GEN_TOKENS MODEL=$MODEL"
   } >> "$CONSOLE"
   exec > >(tee -a "$CONSOLE") 2>&1
-  # `tee` outlives the shell's last write, so wait for it or the tail of the run is
-  # missing from the file exactly when it matters -- the summary tables.
+  # `tee` outlives the shell's last write, so on_exit waits for it or the tail of the
+  # run is missing from the file exactly when it matters -- the summary tables.
   TEE_PID=$!
-  trap 'exec 1>&- 2>&-; wait $TEE_PID 2>/dev/null || true' EXIT
   echo "console -> $CONSOLE"
 fi
 
