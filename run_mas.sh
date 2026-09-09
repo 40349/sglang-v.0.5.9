@@ -212,11 +212,14 @@ target_gpu_uuid() {
 require_free_vram() {
   command -v nvidia-smi > /dev/null 2>&1 || return 0
   local uuid row total free need
-  uuid=$(target_gpu_uuid)
+  # `|| true` for the same reason as report_gpu: these are pipelines inside command
+  # substitutions, and a guard on the empty value is unreachable if a non-zero status
+  # aborts the assignment first. Failing to probe means "say nothing", never "refuse".
+  uuid=$(target_gpu_uuid) || true
   [ -n "$uuid" ] || return 0
   row=$(nvidia-smi --query-gpu=uuid,memory.total,memory.free \
           --format=csv,noheader,nounits 2>/dev/null \
-        | awk -F', *' -v u="$uuid" '$1 == u {print $2, $3; exit}')
+        | awk -F', *' -v u="$uuid" '$1 == u {print $2, $3; exit}') || true
   [ -n "$row" ] || return 0
   total=${row%% *}; free=${row##* }
   case "$total$free" in *[!0-9]*|"") return 0 ;; esac   # not a number: say nothing
@@ -261,19 +264,28 @@ require_free_vram() {
 # script starts its own server in whatever shell you are in, and inherits whatever
 # that shell has.
 report_gpu() {
-  command -v nvidia-smi > /dev/null 2>&1 || return 0
+  # Every value below is a pipeline inside a command substitution, and under
+  # `set -e -o pipefail` any of them returning non-zero ends the SCRIPT -- pgrep
+  # matching nothing, nvidia-smi declining --query-compute-apps (process enumeration is
+  # restricted on some nodes), an unreadable /proc/<pid>/environ. It ends it silently,
+  # between "ready" and the replay, and the `[ -n ... ] || return 0` guards written to
+  # handle an empty value never run, because the assignment aborts first. A diagnostic
+  # must not be able to kill the run it is describing, so every probe may fail and says
+  # so instead of vanishing.
+  command -v nvidia-smi > /dev/null 2>&1 || { echo "  (no nvidia-smi; GPU not reported)"; return 0; }
   local pid cvd uuid index
-  pid=$(pgrep -f '[s]glang::scheduler' | head -1)
-  [ -n "$pid" ] || return 0
+  pid=$(pgrep -f '[s]glang::scheduler' | head -1) || true
+  [ -n "$pid" ] || { echo "  (no sglang::scheduler process; GPU not reported)"; return 0; }
   cvd=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
-        | sed -n 's/^CUDA_VISIBLE_DEVICES=//p')
+        | sed -n 's/^CUDA_VISIBLE_DEVICES=//p') || true
   uuid=$(nvidia-smi --query-compute-apps=pid,gpu_uuid --format=csv,noheader 2>/dev/null \
-         | awk -F', *' -v p="$pid" '$1 == p {print $2; exit}')
+         | awk -F', *' -v p="$pid" '$1 == p {print $2; exit}') || true
   index=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits 2>/dev/null \
-          | awk -F', *' -v u="$uuid" '$2 == u {print $1; exit}')
+          | awk -F', *' -v u="$uuid" '$2 == u {print $1; exit}') || true
   echo "  scheduler pid $pid on physical GPU ${index:-?} (${uuid:-unknown})," \
        "CUDA_VISIBLE_DEVICES=${cvd:-<unset>}"
   [ -n "$cvd" ] || echo "  NOTE: unset, so this fell back to the node's device 0."
+  return 0
 }
 
 # The server command lives here, once. Callers set LOG, and optionally CAPTURE /
