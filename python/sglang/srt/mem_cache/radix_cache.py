@@ -932,6 +932,7 @@ class RadixCache(BasePrefixCache):
         req.sub_context_tree_owned = None
         req.sub_context_tree_canonical = None
 
+    @host_timer.timed("subctx_rev_rotate")
     def _reverse_rotate_insert_sub_contexts(
         self, req: Req, token_ids: List[int], kv_indices: torch.Tensor
     ) -> int:
@@ -994,7 +995,9 @@ class RadixCache(BasePrefixCache):
                 # In place, and safe only because `tree_held` is all False: every slot
                 # here was allocated by this request (freshly computed, or a rotated
                 # copy it owns), so no node other requests hold a lock on is touched.
-                self.kv_rotator.rotate_into(seg_slots, seg_slots, delta)
+                self.kv_rotator.rotate_into(
+                    seg_slots, seg_slots, delta, stage="subctx_rotate_finish"
+                )
 
             result = self.insert(
                 InsertParams(
@@ -1103,7 +1106,10 @@ class RadixCache(BasePrefixCache):
             if self.kv_rotator is None or not self.kv_rotator.can_rotate(delta):
                 return False
             self.kv_rotator.rotate_into(
-                kv_indices[prompt_len:], kv_indices[prompt_len:], delta
+                kv_indices[prompt_len:],
+                kv_indices[prompt_len:],
+                delta,
+                stage="subctx_rotate_finish",
             )
 
         radix_key = RadixKey(token_ids[offset:], seg_key)

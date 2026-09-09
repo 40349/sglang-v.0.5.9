@@ -1179,6 +1179,7 @@ class Req(ReqDllmMixin):
         self.sub_context_rotated_slots.append(dst)
         return dst
 
+    @host_timer.timed("subctx_stitch")
     def _stitch_sub_contexts(self, tree_cache: BasePrefixCache) -> None:
         """Match each sub-context in its own namespace and stitch the contiguous
         cached prefix so prefill reuses those KV slots.
@@ -1237,9 +1238,10 @@ class Req(ReqDllmMixin):
                 match_nodes.append(None)
                 match_positions.append(None)
                 continue
-            seg_match = tree_cache.match_prefix(
-                MatchPrefixParams(key=RadixKey(token_ids=seg_ids, extra_key=seg_key))
-            )
+            with host_timer.record("subctx_lookup"):
+                seg_match = tree_cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(token_ids=seg_ids, extra_key=seg_key))
+                )
             hit = len(seg_match.device_indices)
             match_lens.append(hit)
             canonical = tree_cache.matched_canonical_position(

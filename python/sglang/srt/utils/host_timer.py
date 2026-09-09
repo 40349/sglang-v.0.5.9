@@ -159,6 +159,19 @@ def init_host_timer(proc: str) -> None:
         _timer = HostTimer(path, proc)
 
 
+def armed() -> bool:
+    """Whether this process is recording. Lets a caller skip building a probe
+    (a CUDA event pair, say) that would cost more than the stage it measures."""
+    return _timer is not None
+
+
+def add(stage: str, ns: int) -> None:
+    """Record a duration measured elsewhere -- a CUDA event pair, whose elapsed
+    time is only readable long after the region it covers has returned."""
+    if _timer is not None:
+        _timer.add(stage, ns)
+
+
 @contextmanager
 def record(stage: str):
     if _timer is None:

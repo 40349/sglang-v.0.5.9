@@ -23,13 +23,25 @@ silently corrupt every request that hits the same node at its canonical position
 from __future__ import annotations
 
 import logging
+import os
+from contextlib import nullcontext
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import host_timer
+from sglang.srt.utils.device_timer import DeviceTimer
+
 logger = logging.getLogger(__name__)
+
+# GPU time for the rotation kernel, reported as the ``subctx_rotate_gpu`` stage.
+# Off by default and deliberately: it costs a CUDA event pair per call, which lands
+# inside the ``subctx_rotate`` host stage measured right beside it. Turn it on for a
+# run whose question is what the rotation costs on the GPU, and read the host numbers
+# from a run with it off.
+_TIME_ROTATE_GPU = bool(os.environ.get("SGLANG_SUBCTX_ROTATE_GPU", ""))
 
 
 @triton.jit
@@ -185,6 +197,19 @@ class KVRotator:
         self.max_delta = cos_sin_cache.shape[0] - 1
         self.use_native = use_native or not cos_sin_cache.is_cuda
         self.rotated_tokens = 0
+        # Elapsed time is read on a later call, once the end event has completed --
+        # never by synchronising, which would stall the very path being priced. The
+        # last few calls of a run therefore go unreported; over a run of thousands
+        # that is noise, and a blocking read would not be.
+        self._gpu_timer = (
+            DeviceTimer(reporter=self._report_gpu)
+            if _TIME_ROTATE_GPU and host_timer.armed() and not self.use_native
+            else None
+        )
+
+    @staticmethod
+    def _report_gpu(t: float, **metadata) -> None:
+        host_timer.add("subctx_rotate_gpu", int(t * 1e9))
 
     def can_rotate(self, delta: int) -> bool:
         """Whether ``delta`` is representable. delta == 0 needs no rotation at all."""
@@ -195,12 +220,21 @@ class KVRotator:
         return delta_cos_sin(self.cos_sin_cache, self.rotary_dim, delta)
 
     def rotate_into(
-        self, dst_loc: torch.Tensor, src_loc: torch.Tensor, delta: int
+        self,
+        dst_loc: torch.Tensor,
+        src_loc: torch.Tensor,
+        delta: int,
+        stage: str = "subctx_rotate",
     ) -> None:
         """Write ``R(delta)`` applied to the K at ``src_loc`` (and V verbatim) to ``dst_loc``.
 
         ``dst_loc`` must come from the allocator: the caller owns those slots and is
         responsible for freeing them. ``src_loc`` is tree-owned and is never written.
+
+        ``stage`` names the host timer this call is charged to. It exists because the
+        two call families answer different questions: rotating on the read path is
+        latency a request pays before its own prefill, while rotating at finish is
+        book-keeping for whoever comes next. Summing them would hide which.
         """
         assert dst_loc.numel() == src_loc.numel(), (
             f"{dst_loc.numel()=} != {src_loc.numel()=}"
@@ -211,34 +245,44 @@ class KVRotator:
         assert delta != 0, "delta == 0 must take the zero-cost path, not the kernel"
 
         pool = self.pool
-        cos, sin = self._cos_sin(delta)
 
-        if self.use_native:
-            rotate_copy_kv_native(
-                pool.k_buffer, pool.v_buffer, dst_loc, src_loc, cos, sin
-            )
-        else:
-            head_num = pool.head_num
-            head_dim = pool.head_dim
-            v_row_elems = head_num * pool.v_head_dim
-            _rotate_copy_kv_kernel[(n, len(pool.k_buffer))](
-                pool.k_data_ptrs,
-                pool.v_data_ptrs,
-                pool.k_buffer[0],
-                pool.v_buffer[0],
-                src_loc,
-                dst_loc,
-                cos,
-                sin,
-                head_num,
-                self.half,
-                v_row_elems,
-                K_ROW=head_num * head_dim,
-                HEAD_DIM=head_dim,
-                HEADS_P2=triton.next_power_of_2(head_num),
-                HALF_P2=triton.next_power_of_2(self.half),
-                VROW_P2=triton.next_power_of_2(v_row_elems),
-            )
+        # Timed here rather than at the call sites: every path that rotates goes
+        # through this method, so one probe prices the whole mechanism and no caller
+        # can be added later that quietly escapes it.
+        gpu = (
+            self._gpu_timer.wrap(metadata={"tokens": n})
+            if self._gpu_timer is not None
+            else nullcontext()
+        )
+        with host_timer.record(stage), gpu:
+            cos, sin = self._cos_sin(delta)
+
+            if self.use_native:
+                rotate_copy_kv_native(
+                    pool.k_buffer, pool.v_buffer, dst_loc, src_loc, cos, sin
+                )
+            else:
+                head_num = pool.head_num
+                head_dim = pool.head_dim
+                v_row_elems = head_num * pool.v_head_dim
+                _rotate_copy_kv_kernel[(n, len(pool.k_buffer))](
+                    pool.k_data_ptrs,
+                    pool.v_data_ptrs,
+                    pool.k_buffer[0],
+                    pool.v_buffer[0],
+                    src_loc,
+                    dst_loc,
+                    cos,
+                    sin,
+                    head_num,
+                    self.half,
+                    v_row_elems,
+                    K_ROW=head_num * head_dim,
+                    HEAD_DIM=head_dim,
+                    HEADS_P2=triton.next_power_of_2(head_num),
+                    HALF_P2=triton.next_power_of_2(self.half),
+                    VROW_P2=triton.next_power_of_2(v_row_elems),
+                )
         self.rotated_tokens += n
 
 

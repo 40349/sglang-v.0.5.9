@@ -15,6 +15,9 @@ MODEL=QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
 PORT=30000
 CTXLEN=32768          # 16384 讓 astropy 那題在 16393 tokens 撞牆；KV pool 放得下 32k
 GEN_TOKENS=32          # replay generates a fixed length so both arms do equal work
+# Requests in flight during a replay. 1 keeps the arms reproducible; raise it when
+# the question is serving capacity rather than what the split does to one request.
+CONC=${CONC:-1}
 ENV=sglangv59
 REQUESTS=$OUT/requests.jsonl
 SWE_TEST=/home/t2503-3090/Desktop/MiaoChen/swe_bench/swe_test.sh
@@ -68,7 +71,7 @@ replay() {
   python $REPO/subcontext_bench.py replay "$REQUESTS" \
     --url http://127.0.0.1:$PORT \
     --trace "${TRACE:-}" --stage-trace "${STAGE:-}" --out "$CLIENT" \
-    --model $MODEL --gen-tokens $GEN_TOKENS --save-text
+    --model $MODEL --gen-tokens $GEN_TOKENS --concurrency $CONC --save-text
 }
 
 case "${1:-}" in
@@ -114,6 +117,8 @@ TXT
       python $REPO/subcontext_bench.py stages $OUT/stage_base $OUT/stage_sub
       echo; echo "======== PARITY (generated text) ========"
       python $REPO/subcontext_bench.py parity $OUT/client_base.json $OUT/client_sub.json || true
+      echo; echo "======== SUMMARY (all arms) ========"
+      python $REPO/subcontext_bench.py summary "$OUT"
     } | tee $OUT/tables.txt
     ;;
 

@@ -88,12 +88,16 @@ class FakeRotator:
     def __init__(self, max_delta: int = 10**6):
         self.max_delta = max_delta
         self.calls = []
+        self.stages = []
 
     def can_rotate(self, delta: int) -> bool:
         return delta != 0 and abs(delta) <= self.max_delta
 
-    def rotate_into(self, dst_loc, src_loc, delta):
+    def rotate_into(self, dst_loc, src_loc, delta, stage="subctx_rotate"):
+        # `stage` only names the host timer the real rotator charges the call to.
+        # Recorded so a test can tell a read-path rotation from a finish-path one.
         self.calls.append((src_loc.tolist(), dst_loc.tolist(), delta))
+        self.stages.append(stage)
 
 
 def make_cache(

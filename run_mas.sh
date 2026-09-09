@@ -5,6 +5,21 @@
 #   TAG=ag_he_ab      ./run_mas.sh toggle   replay a capture, split OFF then ON
 #   ARM=on TAG=ag_he  ./run_mas.sh eval     pass@1 for a record run's results
 #
+# `toggle` ends with a SUMMARY table -- hit rate, TTFT, end-to-end latency,
+# throughput and what the split costs to run. With ROTATE set it shows baseline vs
+# rotation; the plain-split control stays in the per-section tables above it.
+# Re-print the table without re-running anything, and choose the columns:
+#
+#   python subcontext_bench.py summary ab_out/maslab --suffix _ag_he_ab \
+#     --arms base,rot          # or base,sub,rot to see the control as a column too
+#
+# For a serving-capacity number rather than a per-request one, set CONC:
+#
+#   CONC=8 TAG=ag_he_ab ./run_mas.sh toggle
+#
+# and expect the rotation arm to stop reproducing exactly -- with several requests
+# in flight, what each one finds in the tree depends on how they interleave.
+#
 # An arm's results land in ab_out/maslab/<arm>/, named ..._<tag>_<arm>. Both halves
 # come from $ARM, never from anything typed, so the arm a file claims is the arm that
 # produced it. `toggle` drives all three arms itself and writes at the top of
@@ -34,7 +49,16 @@ MODEL=${MODEL:-QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ}
 QUANT=${QUANT-moe_wna16}   # set empty on a box with the VRAM for bf16 weights
 PORT=${PORT:-30000}
 CTXLEN=${CTXLEN:-16384}
+# How much VRAM the KV pool gets. Overridable because it decides whether an A/B
+# measures the split or the eviction policy, and the right value is a property of
+# the box: 0.85 leaves a 30B AWQ workable on a 24GB card, an H200 can take 0.9.
+MEMFRAC=${MEMFRAC:-0.85}
 GEN_TOKENS=${GEN_TOKENS:-32}   # replay generates a fixed length so both arms do equal work
+# Requests in flight during a replay. 1 keeps every arm reproducible (reuse then
+# depends only on the capture's order) and makes the throughput row 1/latency by
+# construction. Raise it for a serving-capacity run, and expect the rotation arm to
+# stop agreeing with itself run to run when you do.
+CONC=${CONC:-1}
 ENV=${ENV:-sglangv59}
 CONDA_SH=${CONDA_SH:-/home/t2503-3090/miniconda3/etc/profile.d/conda.sh}
 MASLAB=${MASLAB:-/home/t2503-3090/Desktop/MiaoChen/MASLab}
@@ -108,8 +132,10 @@ remote_check() {
 }
 
 # The server command lives here, once. Callers set LOG, and optionally CAPTURE /
-# TRACE / STAGE / SUBCTX_OFF / SUBCTX_TRACE / SUBCTX_ROTATE / SUBCTX_ROTATE_ACROSS
-# before calling.
+# TRACE / STAGE / SUBCTX_OFF / SUBCTX_TRACE / SUBCTX_ROTATE / SUBCTX_ROTATE_ACROSS /
+# ROTATE_GPU before calling. ROTATE_GPU=1 adds CUDA-event timing around the rotation
+# kernel and fills the summary's [GPU] row; it costs an event pair per rotation, so
+# take the host overhead numbers from a run without it.
 launch() {
   pkill -f "[s]glang\.launch_server" 2>/dev/null || true
   sleep 6
@@ -121,6 +147,7 @@ launch() {
   SGLANG_DISABLE_SUBCONTEXT=${SUBCTX_OFF:-} \
   SGLANG_SUBCTX_TRACE=${SUBCTX_TRACE:-} \
   SGLANG_SUBCONTEXT_ROTATE=${SUBCTX_ROTATE:-} \
+  SGLANG_SUBCTX_ROTATE_GPU=${ROTATE_GPU:-} \
   SGLANG_SUBCONTEXT_ROTATE_ACROSS=${SUBCTX_ROTATE_ACROSS:-} \
   nohup python -u -m sglang.launch_server \
     --model-path $MODEL \
@@ -129,7 +156,7 @@ launch() {
     --tool-call-parser qwen3_coder \
     --enable-cache-report \
     --port $PORT \
-    --mem-fraction-static 0.85 \
+    --mem-fraction-static $MEMFRAC \
     > "$LOG" 2>&1 &
   echo -n "  waiting"
   for _ in $(seq 1 300); do
@@ -152,7 +179,7 @@ replay() {
   python $REPO/subcontext_bench.py replay "$REQUESTS" \
     --url http://127.0.0.1:$PORT \
     --trace "${TRACE:-}" --stage-trace "${STAGE:-}" --out "$CLIENT" \
-    --model $MODEL --gen-tokens $GEN_TOKENS --save-text
+    --model $MODEL --gen-tokens $GEN_TOKENS --concurrency $CONC --save-text
 }
 
 case "${1:-}" in
@@ -291,6 +318,17 @@ EOF
     python $REPO/subcontext_bench.py parity \
       $OUT/client_base$SUF.json $OUT/client_sub$SUF.json || true
 
+    # The headline table: hit rate, TTFT, end-to-end latency, throughput and what
+    # the split costs to run, every arm in one place. The sections above stay --
+    # they are where a number that looks wrong gets taken apart.
+    # With rotation in the run, the headline comparison is baseline vs rotation:
+    # the plain split is the control that separates the plumbing's cost from the
+    # rotation's benefit, and it lives in the per-section tables above. Add
+    # `--arms base,sub,rot` to put its column back.
+    echo; echo "======== SUMMARY ========"
+    python $REPO/subcontext_bench.py summary "$OUT" --suffix "$SUF" \
+      ${ROTATE:+--arms base,rot}
+
     if [ -n "${ROTATE:-}" ]; then
       echo; echo "======== ROTATE vs SPLIT (GPU) ========"
       python $REPO/subcontext_bench.py report $OUT/trace_sub$SUF.jsonl $OUT/trace_rot$SUF.jsonl
@@ -344,6 +382,8 @@ EOF
     echo "  record  ARM=on METHOD=autogen MAS_CONFIG=config_code DATASET=humaneval TAG=ag_he $0 record"
     echo "  eval    ARM=on TAG=ag_he DATASET=humaneval $0 eval"
     echo "  toggle  REQUESTS=<capture> TAG=ag_he_ab $0 toggle   (no ARM: it runs all three)"
+    echo "  CONC=N replays with N requests in flight; the summary's throughput row"
+    echo "  is 1/latency at the default CONC=1"
     echo "  an arm's files live in ab_out/maslab/<arm>/ and are suffixed _<tag>_<arm>"
     exit 1;;
 esac

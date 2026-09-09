@@ -25,6 +25,10 @@
 #                   pool nor a namespace (LOST) or in both (DOUBLE-OWNED). Costs a
 #                   match_prefix per block; goes through the logger, so no buffering.
 #   DUMP_TREE=1     print the whole radix tree after every extend pass
+#   ROTATE_GPU=1    CUDA-event timing around the rotation kernel, reported as the
+#                   subctx_rotate_gpu stage. Costs an event pair per rotation, which
+#                   lands inside the host stage measured beside it, so read host
+#                   overhead from a run without it.
 #
 # The arm is an env var read once at server start, so it cannot be changed without a
 # restart -- that is why each arm is a separate job.
@@ -108,6 +112,7 @@ SGLANG_DISABLE_SUBCONTEXT=$SUBCTX_OFF \
 SGLANG_SUBCONTEXT_ROTATE=$ROT \
 SGLANG_SUBCONTEXT_ROTATE_ACROSS=$ROT_ACROSS \
 SGLANG_SUBCTX_TRACE=${SUBCTX_TRACE:-} \
+SGLANG_SUBCTX_ROTATE_GPU=${ROTATE_GPU:-} \
 SGLANG_SUBCTX_AUDIT=${SUBCTX_AUDIT:-} \
 PYTHONUNBUFFERED=${SUBCTX_TRACE:+1} \
 SGLANG_DUMP_TREE=${DUMP_TREE:-} \
