@@ -525,7 +525,7 @@ def cmd_report(args: argparse.Namespace) -> int:
 
     keys = [
         ("prefill_passes", "prefill passes", ""),
-        ("prefill_total_tokens", "prefill tokens seen", "tok"),
+        ("prefill_total_tokens", "prefill prompt tokens", "tok"),
         ("prefill_new_tokens", "  ...actually computed", "tok"),
         ("prefill_cached_tokens", "  ...from radix cache", "tok"),
         ("matched_tokens", "matched in the tree", "tok"),
@@ -533,7 +533,7 @@ def cmd_report(args: argparse.Namespace) -> int:
         ("moved_tokens", "     ...dropped as MOVED", "tok"),
         ("rotated_tokens", "  ...MOVED but ROTATED in", "tok"),
         ("reinserted_tokens", "REVERSE-ROTATED into tree", "tok"),
-        ("hit_rate", "hit rate (of tokens SEEN)", "%"),
+        ("hit_rate", "hit rate (cached / prompt)", "%"),
         ("prefill_gpu_ms", "PREFILL GPU time", "ms"),
         ("prefill_ms_median", "  median pass", "ms"),
         ("us_per_new_token", "  us / computed token", "us"),
@@ -581,27 +581,27 @@ def cmd_report(args: argparse.Namespace) -> int:
             "continuation pass reads one chunk short. Re-run to get a real number;\n"
             "the other rows are unaffected."
         )
-    # `prefill tokens seen` is per PASS, so chunked prefill counts a request's
-    # already-covered prefix once per continuation: the same capture reads 921,205
-    # tokens unchunked and 1,092,928 when Stage 2 cuts at block boundaries. Anything
-    # divided by it -- the hit rate above -- moves with the chunking regime and not
-    # with how much was reused. `actually computed` does not: every token is computed
-    # exactly once whatever the pass count.
+    # Both token columns are per request: `actually computed` always was (a token is
+    # extended once however many chunks it takes), and `from radix cache` is now, via
+    # the `cached_tokens` watermark the client is served from. So the hit rate no
+    # longer moves with the chunking regime -- it used to read 46.1% against the
+    # client's 36.2% on this capture, purely because Stage 2 cut more chunks.
     #
-    # So state the reuse against a denominator that cannot move. The prompt total is a
-    # property of the capture, which this command does not have, but chunking can only
-    # inflate `seen`, so the smaller of the two arms bounds it from above and is exact
-    # whenever that arm ran one pass per request.
+    # The pass counts still differ, and that is worth saying: it is the whole cost
+    # side of Stage 2. Print the reuse against the prompt total as a cross-check that
+    # needs no denominator from the trace at all. The prompt total is a property of
+    # the capture, which this command does not have; retraction is the only thing that
+    # can still inflate a column (a retracted request recomputes), so the smaller arm
+    # bounds it from above.
     if a["prefill_passes"] != b["prefill_passes"]:
         prompt = min(a["prefill_total_tokens"], b["prefill_total_tokens"])
         print(
             f"\nNOTE: pass counts differ ({a['prefill_passes']:,} vs "
             f"{b['prefill_passes']:,}), so the two arms did NOT chunk the same way.\n"
             "That is expected when one arm cuts chunks at block boundaries; it does\n"
-            "not by itself mean the request sequences differed. But it does mean\n"
-            "'tokens seen' and the hit rate above are NOT comparable between the two\n"
-            "columns -- a continuation pass re-counts the prefix it inherits.\n"
-            "Compare 'actually computed', which is one entry per token either way:"
+            "not by itself mean the request sequences differed, and the token rows\n"
+            "above stay comparable -- each is counted once per request. Cross-check\n"
+            "against the prompt total, which no counter can move:"
         )
         for label, arm in ((label_a, a), (label_b, b)):
             print(
@@ -939,7 +939,7 @@ _SUMMARY_METRICS = (
     ("KV CACHE REUSE", None, None, None),
     ("hit rate (client, cached/prompt)", "%",
      lambda a, b, n: _client_stat(a, "hit_rate_pct"), "pp"),
-    ("hit rate (server, of tokens seen)", "%",
+    ("hit rate (server, cached/prompt)", "%",
      lambda a, b, n: _gpu_stat(a, "hit_rate"), "pp"),
     ("prefill tokens computed", "tok",
      lambda a, b, n: _gpu_stat(a, "prefill_new_tokens"), "pct"),

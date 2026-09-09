@@ -1454,7 +1454,12 @@ class RadixCache(BasePrefixCache):
         # not take is a real drop, reported now by the pass that gave up on it rather
         # than by the one that only intended to rotate it.
         if req.sub_context_deferred_moved:
-            req.sub_context_moved += max(req.sub_context_deferred_moved - appended, 0)
+            shortfall = max(req.sub_context_deferred_moved - appended, 0)
+            req.sub_context_moved += shortfall
+            # Both counters held these blocks back, so both settle them. `moved` is a
+            # subset of `discarded`; crediting one and not the other would leave the
+            # block on the wrong side of `matched = cached + discarded`.
+            req.sub_context_discarded += shortfall
             req.sub_context_deferred_moved = 0
 
         # Only now drop the scheduling-time match locks: the fresh per-namespace locks

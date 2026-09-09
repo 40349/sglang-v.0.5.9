@@ -858,6 +858,15 @@ class Req(ReqDllmMixin):
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
         self.already_computed = 0
+        # How much of `cached_tokens` the forward trace has already charged to a pass.
+        # `cached_tokens` is cumulative and counts each hit once -- `already_computed`
+        # above is what stops a chunked prefill from claiming its inherited prefix
+        # again on every continuation -- so the trace reports only the increment and
+        # each hit lands in exactly one row, including one Stage 2 rotates in a pass
+        # later. Deliberately NOT reset by `reset_for_retract`: `cached_tokens` keeps
+        # its value across a retraction and simply stops growing, so a reset here
+        # would re-report the whole cumulative count.
+        self.traced_cached_tokens = 0
 
         # Detailed breakdown of cached tokens by source (for HiCache)
         self.cached_tokens_device = 0  # Tokens from device cache (GPU)
@@ -1361,7 +1370,12 @@ class Req(ReqDllmMixin):
         # here because this is the only place both halves exist: subtracting
         # len(prefix_indices) downstream goes negative on chunked prefill, which
         # rewrites prefix_indices between passes.
-        self.sub_context_discarded = sum(match_lens) - sum(owned)
+        #
+        # `deferred` comes off for the same reason it comes off `moved` above: the
+        # append is about to try those blocks, and a drop reported here would have to
+        # be cancelled a pass later. Without this the row read as a final verdict on a
+        # block that the very next pass rotated in -- 45,559 of av_he's 49,243.
+        self.sub_context_discarded = sum(match_lens) - sum(owned) - deferred
         if stitched:
             self.prefix_indices = torch.cat(stitched)
         else:

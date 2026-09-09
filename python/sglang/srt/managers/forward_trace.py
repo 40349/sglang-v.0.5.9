@@ -56,8 +56,15 @@ class ForwardTracer:
         if batch.forward_mode.is_extend():
             # Tokens pushed through the model this pass vs. served from the radix
             # cache -- the quantity sub-context reuse is meant to move.
+            #
+            # `new_tokens` is already per request: a token is extended once however
+            # many chunks the prefill splits into. The cache side was not.
+            # `sum(len(req.prefix_indices))` re-counted a continuation's whole
+            # inherited prefix on every pass, so a run that chunks more looked like it
+            # cached more: on av_he with Stage 2 on, this read 46.1% where the client,
+            # counting each request once, read 36.2%. Accumulated per request below.
             new_tokens = batch.extend_num_tokens or 0
-            cached_tokens = sum(len(req.prefix_indices) for req in reqs)
+            cached_tokens = 0
             # Matching can find MORE than the contiguity rule stitches: after a
             # non-final segment misses, every later hit is dropped though matched and
             # locked, and prefix_indices keeps no trace of it. Taken from where
@@ -84,6 +91,16 @@ class ForwardTracer:
                 reinserted_tokens = cache.sub_context_reinserted_tokens
                 cache.sub_context_reinserted_tokens = 0
             for req in reqs:
+                # `req.cached_tokens` is the number the client is served, advanced by
+                # `pre_len - already_computed` in `prepare_for_extend` -- the watermark
+                # that makes it per request. Charging its increment to this pass makes
+                # the trace agree with the client by construction, and still credits a
+                # block Stage 2 rotates in on a pass after the one that matched it.
+                c = getattr(req, "cached_tokens", 0) or 0
+                charged = getattr(req, "traced_cached_tokens", 0) or 0
+                if c > charged:
+                    cached_tokens += c - charged
+                    req.traced_cached_tokens = c
                 d = getattr(req, "sub_context_discarded", 0) or 0
                 if d:
                     req.sub_context_discarded = 0
