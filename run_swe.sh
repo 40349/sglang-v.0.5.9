@@ -18,13 +18,33 @@ GEN_TOKENS=32          # replay generates a fixed length so both arms do equal w
 # Requests in flight during a replay. 1 keeps the arms reproducible; raise it when
 # the question is serving capacity rather than what the split does to one request.
 CONC=${CONC:-1}
-ENV=sglangv59
+ENV=${ENV:-sglangv59}
+# Resolved rather than hardcoded, same as run_mas.sh: on a box where conda came from a
+# module it is not under /home/t2503-3090.
+if [ -z "${CONDA_SH:-}" ]; then
+  _base=${CONDA_EXE:-}; _base=${_base%/bin/conda}
+  [ -n "$_base" ] || _base=$(conda info --base 2>/dev/null || true)
+  if [ -n "$_base" ] && [ -r "$_base/etc/profile.d/conda.sh" ]; then
+    CONDA_SH=$_base/etc/profile.d/conda.sh
+  else
+    CONDA_SH=/home/t2503-3090/miniconda3/etc/profile.d/conda.sh
+  fi
+fi
 REQUESTS=$OUT/requests.jsonl
 SWE_TEST=/home/t2503-3090/Desktop/MiaoChen/swe_bench/swe_test.sh
 
 mkdir -p "$OUT"
-source /home/t2503-3090/miniconda3/etc/profile.d/conda.sh
-conda activate $ENV
+[ -r "$CONDA_SH" ] || {
+  echo "no conda.sh at $CONDA_SH"
+  echo "set CONDA_SH=<conda base>/etc/profile.d/conda.sh   (conda info --base)"
+  exit 1
+}
+source "$CONDA_SH"
+conda activate $ENV 2>/dev/null || {
+  echo "no conda env '$ENV' under $CONDA_SH; set ENV=<name>. available:"
+  conda env list
+  exit 1
+}
 export PYTHONNOUSERSITE=1        # ~/.local has a broken torch dist-info ahead of the env
 export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
 

@@ -63,7 +63,19 @@ GEN_TOKENS=${GEN_TOKENS:-32}   # replay generates a fixed length so both arms do
 # stop agreeing with itself run to run when you do.
 CONC=${CONC:-1}
 ENV=${ENV:-sglangv59}
-CONDA_SH=${CONDA_SH:-/home/t2503-3090/miniconda3/etc/profile.d/conda.sh}
+# Where `conda activate` lives. This cannot be one hardcoded path: the same script
+# runs on the 3090 and on the H200, where conda arrives through `ml load miniconda3`
+# and sits somewhere else entirely. Ask conda itself, and keep the 3090 layout as the
+# fallback so the original single-machine setup still needs nothing set.
+if [ -z "${CONDA_SH:-}" ]; then
+  _base=${CONDA_EXE:-}; _base=${_base%/bin/conda}
+  [ -n "$_base" ] || _base=$(conda info --base 2>/dev/null || true)
+  if [ -n "$_base" ] && [ -r "$_base/etc/profile.d/conda.sh" ]; then
+    CONDA_SH=$_base/etc/profile.d/conda.sh
+  else
+    CONDA_SH=/home/t2503-3090/miniconda3/etc/profile.d/conda.sh
+  fi
+fi
 MASLAB=${MASLAB:-/home/t2503-3090/Desktop/MiaoChen/MASLab}
 MAS_MODEL=${MAS_MODEL:-Qwen3-Coder-30B-A3B}
 MAS_TEMP=${MAS_TEMP:-0.0}
@@ -107,8 +119,20 @@ REQUESTS=${REQUESTS:-$OUT/requests$SUF.jsonl}
 INFER=${INFER:-$OUT/infer$SUF.jsonl}   # overridable so a pre-split run can still be scored
 
 mkdir -p "$OUT"
+# Say which knob to turn. `source: No such file or directory` names a path but not the
+# variable that produced it, and on a box where conda came from a module the reader
+# has no reason to connect the two.
+[ -r "$CONDA_SH" ] || {
+  echo "no conda.sh at $CONDA_SH"
+  echo "set CONDA_SH=<conda base>/etc/profile.d/conda.sh   (conda info --base)"
+  exit 1
+}
 source "$CONDA_SH"
-conda activate $ENV
+conda activate $ENV 2>/dev/null || {
+  echo "no conda env '$ENV' under $CONDA_SH; set ENV=<name>. available:"
+  conda env list
+  exit 1
+}
 export PYTHONNOUSERSITE=1        # ~/.local has a broken torch dist-info ahead of the env
 export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
 
