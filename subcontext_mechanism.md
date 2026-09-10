@@ -138,6 +138,8 @@ mrope 餵純量位置時**會通過**自測（它就是 plain RoPE），真正�
 **情境**：明確開了旋轉但條件不成立 → **raise，不啟動**。因為不支援的 RoPE 不會失敗，
 它會用錯的律去轉，然後安靜地讓每個重用的塊都變差。
 
+哪些模型過得了這四道關卡，見第 12 節。
+
 ---
 
 ## 3. 生命週期總覽
@@ -695,3 +697,77 @@ append 省下的是重算，付出的是一趟 scheduler round-trip。用 Stage 
 - 未做：fp8 KV（需要 dequant → rotate → requant，會累積量化誤差）
 - 未做：MLA pool（DeepSeek 那條線；只有 `k_pe` 帶 RoPE，可能反而更便宜）
 - `page_size == 1` 可能是真實 serving 場景下更限制人的條件
+
+---
+
+## 12. 現在可用的模型
+
+以下是拿本機 HuggingFace cache 裡的 config 實際建出 rope、跑過 `rope_delta_composable_reason`
+的結果（2026-09-10），不是從架構名推論的。
+
+### 四道關卡
+
+| 關卡 | 條件 | 由什麼決定 |
+|---|---|---|
+| 切分能不能服務 | 原生 `RadixCache`、`page_size == 1`、非 EAGLE/hierarchical/SWA/mamba | 架構 + 啟動參數 |
+| RoPE 形狀 | neox 配對、`rotary_dim == head_dim` | 模型 config |
+| RoPE 律 | 性質自測通過 | **實測** |
+| KV pool | MHA（非 MLA）、`store_dtype == dtype` | 架構 + `--kv-cache-dtype` |
+
+### 通過
+
+| 家族 | rope_type | head_dim | 備註 |
+|---|---|---|---|
+| Qwen3 / Qwen3-MoE | default | 128 | 8B / 14B / 32B / 30B-A3B / Coder-30B / Coder-480B |
+| Qwen2.5 | default | 128 | Coder-7B 等 |
+| Llama 3.1 / 3.2 / 3.3 | **llama3** | 128 / 64 | 性質自測放行的 |
+| Llama 2 系 | default | 128 | vicuna-7b-v1.5 等 |
+| Mistral / Devstral | default | 128 | Devstral-Small-2505/2507、Mistral-Small-3.2 |
+| YaRN 長上下文變體 | yarn | — | 除 mscale 後放行；本機無 config，未實測 |
+| dynamic NTK | dynamic | — | 同上 |
+
+`Llama3RotaryEmbedding` 的自測最差樣本只用掉 8% 預算，跟 plain RoPE 一樣——它只改
+`_compute_inv_freq`（與位置無關的逐維重映射），cache 仍由基底類別建、沒有 mscale。
+
+**AWQ / GPTQ / FP8 權重量化不影響這裡。** 擋的是 `--kv-cache-dtype fp8_*`，也就是 KV
+本身被量化（`store_dtype != dtype`）。
+
+### 不通過
+
+| 模型 | 被哪一條擋 |
+|---|---|
+| **Qwen3-Coder-Next** | **partial rotary 64/256** |
+| Qwen3-VL / Qwen2-VL / Qwen2.5-VL / Omni | mrope（位置是 3-vector） |
+| Phi-3.5-vision | `su` / longrope（位置閾值換 inv_freq） |
+| DeepSeek-V2/V3/R1、MiniCPM3、LongCat、Kimi-Linear | MLA pool |
+| Llama 4、gpt-oss、MiMo-V2-Flash、Step3p5 | hybrid SWA → `SWARadixCache`，連切分都不支援 |
+| ChatGLM、GLM-4、Command-R、GPT-J、EXAONE-4、Hunyuan、Mistral-Large-3 | 非 neox 配對 |
+| Qwen3-Next、Falcon-H1 等 linear-attention 混合 | mamba pool → `MambaRadixCache` |
+
+**Qwen3-Coder-Next 只差部分旋轉那一項**：config 是 `head_dim=256,
+partial_rotary_factor=0.25`，rope 律本身沒問題。`rotate_copy_kv_native` 已經處理了
+未旋轉的 tail，只有 Triton kernel 還假設整個 head 都轉。要往新模型走的話這是最短的一步。
+
+### 從 config 判不出來的兩件事
+
+1. **多模態模型可能有第二顆 RoPE**（視覺塔一顆、文字一顆），`find_rotary_embedding`
+   會回 "2 distinct RotaryEmbedding instances" 而拒絕。所以 LLaVA、Mistral3、Qwen3.5
+   要當「需實測」。
+2. **`is_neox_style` 由模型檔決定**，不在 config 裡。上面的非 neox 名單是從
+   `python/sglang/srt/models/*.py` grep 出來的，不是自測的結果。
+
+### 最可靠的確認方式
+
+直接啟動。`rotation_unsupported_reason` 在啟動時就判，不通過會 raise 並說明原因：
+
+```
+Sub-context KV rotation is enabled but cannot be served: partial rotary (64 of 256
+dims); the rotation kernel assumes the whole head rotates
+```
+
+通過的話 log 裡會有帶實測數字的這一行：
+
+```
+RoPE delta self-test passed for Llama3RotaryEmbedding on 8 (position, delta) samples;
+worst was position 30000 delta 1000 at 6.18e-04 relative, 8% of its 7.40e-03 budget
+```
