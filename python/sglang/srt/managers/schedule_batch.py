@@ -637,8 +637,8 @@ class Req(ReqDllmMixin):
         # Tokens matched in the tree that the contiguity rule then refused to
         # stitch. Set by `_stitch_sub_contexts`, drained by whoever reports it.
         self.sub_context_discarded: int = 0
-        # WCA: the actual KV slots each block hit in its own namespace, and the nodes
-        # that own them (both parallel to sub_context_ids; entry is None where the block
+        # The actual KV slots each block hit in its own namespace, and the nodes that
+        # own them (both parallel to sub_context_ids; entry is None where the block
         # missed or is empty). Recorded by `_stitch_sub_contexts` for EVERY block, not
         # just the contiguously-reusable ones, so a later stage can adjust and reuse the
         # hits that contiguity currently forces us to drop. The nodes are lock-ref'd
@@ -647,14 +647,14 @@ class Req(ReqDllmMixin):
         # fields are always cleared together by `release_sub_context_match_locks`.
         self.sub_context_match_indices: Optional[List[Optional[torch.Tensor]]] = None
         self.sub_context_match_nodes: Optional[List[Optional[Any]]] = None
-        # Sub-context (Stage B): the per-namespace leaf nodes locked when the prompt
-        # was inserted in `cache_unfinished_req`. Non-None marks that this request's
-        # prompt lives under sub-context namespaces (not the default None namespace),
-        # so `cache_finished_req` unlocks these instead of re-inserting.
+        # The per-namespace leaf nodes locked when the prompt was inserted in
+        # `cache_unfinished_req`, released at finish. None until that pass runs -- which
+        # is NOT the same question as "is this a sub-context request": a request that
+        # finishes during prefill never runs it. `serves_sub_contexts` answers that one.
         self.sub_context_last_nodes: Optional[List] = None
-        # Sub-context (Stage B): how many tokens of each segment this request has already
-        # inserted into its namespace, accumulated across chunked-prefill chunks. Used to
-        # free only the freshly-computed duplicate slots (parallel to sub_context_ids).
+        # How many tokens of each segment this request has already inserted into its
+        # namespace, accumulated across chunked-prefill chunks. Used to free only the
+        # freshly-computed duplicate slots (parallel to sub_context_ids).
         self.sub_context_owned_lens: Optional[List[int]] = None
         # The absolute position each block's hit was *computed* at, parallel to
         # sub_context_ids (None on a miss). Equal to the block's own offset on the
@@ -694,21 +694,9 @@ class Req(ReqDllmMixin):
         # has to be rotated by the same delta to continue that chain. Parallel to
         # sub_context_ids; None until the first insert pass.
         self.sub_context_tree_canonical: Optional[List[Optional[int]]] = None
-        # Per block, how many of its leading slots the stitch took *straight from the
-        # tree*. Those belong to a node, not to this request, and freeing them while
-        # that node still points at them hands the same KV to two owners. Distinct from
-        # `sub_context_owned_lens`, which counts the same head as reused whether it came
-        # from the tree or from a rotated copy this request allocated -- and a rotated
-        # copy is the request's to free. Parallel to sub_context_ids.
         # Tokens of a declined block rotated *back* to the tree's position at finish and
         # inserted there. Drained by the forward trace like `sub_context_rotated`.
         self.sub_context_reinserted: int = 0
-
-        # # --- 強制攔截：只要是我們自訂的 subcontext，強制不生成任何新 token ---
-        # if self.extra_key in ["system_prompt_key", "tools_key", "messages_key"]:
-        #     if hasattr(self, "sampling_params") and self.sampling_params is not None:
-        #         self.sampling_params.max_new_tokens = 0
-        # # ----------------------------------------------------------------------
 
         self.lora_id = lora_id
         self.routing_key = routing_key
@@ -1266,10 +1254,10 @@ class Req(ReqDllmMixin):
             else:
                 match_nodes.append(None)
                 match_indices.append(None)
-            # A hit computed at another position is real content under the wrong
-            # rotation; stitching it would silently feed misrotated K into attention.
-            # Dropped, but kept locked and recorded: `_offset - canonical` is the
-            # rotation a later stage needs to turn this back into a reuse.
+            # Real content under the wrong rotation: stitching it as-is would feed
+            # misrotated K into attention. `_offset - canonical` is what turns it back
+            # into a reuse -- below if rotation is on, in `_rotate_append_sub_contexts`
+            # a chunk later if contiguity broke first, and nowhere if neither.
             displaced = canonical is not None and canonical != _offset
             if displaced:
                 moved += hit

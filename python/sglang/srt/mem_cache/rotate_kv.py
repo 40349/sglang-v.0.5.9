@@ -2,22 +2,29 @@
 
 RoPE is a rotation whose angle is linear in the position, so ``R(a) . R(b) == R(a+b)``
 and a key cached at ``p`` can be moved to ``p + delta`` by applying ``R(delta)`` to it.
-Qwen3 computes ``qkv_proj -> q_norm/k_norm -> RoPE -> write pool``
-(``models/qwen3.py:137-151``), so the pool holds ``R(p) . RMSNorm(k_raw)`` and
+Attention applies RoPE last, immediately before writing the pool, so the pool holds
+``R(p) . f(k_raw)`` for whatever normalisation ``f`` the model uses, and
 
-    R(p_new) . RMSNorm(k_raw) == R(p_new - p) . k_cached[loc]
+    R(p_new) . f(k_raw) == R(p_new - p) . k_cached[loc]
 
-*exactly* -- the norm sits before the rotation and RoPE preserves norms, so there is
-nothing to re-run. V carries no position at all and is copied unchanged.
+*exactly* -- ``f`` sits before the rotation and RoPE preserves norms, so there is
+nothing to re-run. V carries no position at all and is copied unchanged. Whether a
+given model's RoPE really composes like this is measured at startup by
+:func:`rope_delta_composable_reason`, not assumed.
 
 This fixes the *position*. It does not fix the *context*: the block's hidden states
 were produced under whatever prefix preceded it when it was computed, and no rotation
 can restore that. Reusing a rotated block therefore trades some output quality for the
 prefill it skips, which is what the pass@1 arm of the experiment measures.
 
-The rotation always writes to freshly allocated slots. The source slots belong to a
-radix tree node that other requests hold a ``lock_ref`` on; rotating in place would
-silently corrupt every request that hits the same node at its canonical position.
+Where the result lands follows one rule: **source owned by the tree, copy; source
+owned by this request, rotate in place.** The read paths (the stitch, and the Stage 2
+append) rotate a node's KV that other requests hold a ``lock_ref`` on, so they must
+allocate; rotating that in place would corrupt every request hitting the same node at
+its canonical position. The write paths (re-filing a declined block, and moving the
+generated tail to follow it) rotate slots the finished request allocated itself, and
+do so in place -- guarded by ``_tree_held_mask``, because a declined block can still
+carry a node's own slots.
 """
 
 from __future__ import annotations

@@ -7,6 +7,8 @@ CPU tensors -- match, insert, finish -- and cover its invariants:
 
 - read and write must agree on whether the cache can serve the split at all,
 - a namespace must stay pinned to one absolute position in the prompt,
+- a hit at another position is rotated to where it is reused, or dropped -- never
+  stitched as it is, and never freed while a node still points at it,
 - a finished request's generated tokens extend its last block's namespace.
 
 Usage:

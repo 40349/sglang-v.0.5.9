@@ -245,8 +245,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         a length clause the read path did not have (a retracted request comes back with
         `fill_ids = origin_input_ids + output_ids`), and a `sub_context_last_nodes`
         check that a request finishing during prefill never satisfies. Both ended in
-        the same branch. So the gate lives in one place and the call sites read it,
-        rather than three copies that have to be kept in step by hand.
+        the same branch, and neither is reachable by a replay -- `ignore_eos` means no
+        request can finish at prefill. So the gate lives in one place and the call sites
+        read it, rather than three copies that have to be kept in step by hand.
         """
         return bool(getattr(req, "has_sub_contexts", False)) and self.supports_sub_contexts()
 

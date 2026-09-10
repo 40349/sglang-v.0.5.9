@@ -518,13 +518,6 @@ class RadixCache(BasePrefixCache):
         )
 
     def insert(self, params: InsertParams) -> InsertResult:
-
-        # --- 追蹤 Radix Tree ---
-        if TRACE_ON:
-            trace(f"[TRACE-4 RadixCache] 準備插入節點")
-            trace(f"[TRACE-4 RadixCache] 插入的 key.extra_key={params.key.extra_key}")
-        # ----------------------
-
         if self.disable:
             return InsertResult(prefix_len=0)
 
@@ -591,19 +584,8 @@ class RadixCache(BasePrefixCache):
 
         # The prompt was already inserted per-namespace in `cache_unfinished_req`, so
         # this unlocks those leaves rather than re-inserting, and hands the generated
-        # continuation to the last block's namespace.
-        #
-        # Gate on the SAME condition `cache_unfinished_req` uses. Gating on
-        # `sub_context_last_nodes` instead looks equivalent -- the unfinished pass is
-        # what sets it -- but it is not: a request that never ran that pass, because it
-        # emitted its stop token during prefill or was aborted while queued, arrives
-        # here with the stitched prefix in `req_to_token` and no nodes of its own. It
-        # then fell through to the branch below, which files whatever `req_to_token`
-        # holds under `req.extra_key` -- None for a split request. Those slots are
-        # already owned by the namespace nodes the stitch matched, so the tree ended up
-        # serving them from two keys at once, and evicting either one hands a live slot
-        # back to the pool. That is job 441's `dup_within_tree`; a replay with
-        # `ignore_eos` can never produce it, because no request can finish at prefill.
+        # continuation to the last block's namespace. `serves_sub_contexts` is the gate,
+        # shared with the read path; its docstring says why it is not restated here.
         if self.serves_sub_contexts(req):
             if not AUDIT_ON:
                 self._finish_sub_contexts(req, token_ids, kv_indices, is_insert)
@@ -881,13 +863,12 @@ class RadixCache(BasePrefixCache):
         # `cache_protected_len`: a block the tree declined (a rotated copy, or a
         # position conflict) leaves a hole that later tree-owned blocks sit after, and
         # freeing from the first hole onwards would free slots the tree now owns.
-        # No unfinished pass ran => this request owns nothing in the tree, and every
-        # block is in exactly the position of a declined one: the stitch may have
-        # reused namespace-owned slots for part of it, the rest it computed itself.
-        # Saying so here is what lets the loop below free its own slots and only its
-        # own, which is the whole job the default branch could not do.
         tree_owned = req.sub_context_tree_owned
         if tree_owned is None and req.sub_context_extra_keys:
+            # No unfinished pass ran, so this request owns nothing in the tree and every
+            # block is exactly a declined one: partly slots the stitch reused from a
+            # namespace, partly slots it computed itself. Saying so is what lets the
+            # loop below free its own and only its own.
             tree_owned = [False] * len(req.sub_context_extra_keys)
 
         prompt_len = 0
@@ -1025,12 +1006,10 @@ class RadixCache(BasePrefixCache):
             self.req_to_token_pool.write(
                 (req.req_pool_idx, slice(offset, end)), seg_match.device_indices
             )
-            # Lock it, exactly as the unfinished path locks every block it inserts.
-            # Nothing can evict between here and the end of this call today, so this
-            # buys no safety now -- it keeps the invariant true, so that a later change
-            # that *can* evict in between does not silently pull the node out from
-            # under `_cache_sub_context_output`. Released by the dec_lock_ref loop at
-            # the end of `_finish_sub_contexts`, which walks this same list.
+            # Lock it, as the unfinished path locks every block it inserts. Nothing
+            # evicts between here and `_cache_sub_context_output` today, so this buys
+            # no safety yet; it keeps the invariant true for the change that alters
+            # that. Released by the dec_lock_ref loop at the end of the caller.
             self.inc_lock_ref(seg_match.last_device_node)
             req.sub_context_last_nodes.append(seg_match.last_device_node)
             req.sub_context_tree_owned[i] = True
@@ -1128,13 +1107,12 @@ class RadixCache(BasePrefixCache):
         # the insert did not match now belongs to the tree and must not be freed.
         owned = len(last_seg)
         # `kv_indices` is a view of req_to_token, and the block's entries may have been
-        # re-pointed at the tree's slots by `_reverse_rotate_insert_sub_contexts`. That
-        # is only safe while the tree really does hold the whole block, because then
-        # `insert` matches it and stores nothing from `value[:owned]`. If it ever did
-        # store part of it, those slots would be owned by two nodes at once and handed
-        # out again while still being served as cache. It cannot happen today -- the
-        # block was inserted a few lines ago and nothing evicts in between -- so say so
-        # out loud rather than leave it resting on that.
+        # re-pointed at the tree's slots by `_reverse_rotate_insert_sub_contexts`. Safe
+        # only while the tree holds the whole block: `insert` then matches it and stores
+        # nothing from `value[:owned]`. Storing part of it would give those slots two
+        # owners and hand them out again while still serving them as cache. Nothing
+        # evicts between that insert and here today, so the alarm below never fires --
+        # it is there for the change that makes it possible.
         if result.prefix_len < owned:
             logger.error(
                 "SUBCTX-OUTPUT-UNDERMATCH rid=%s extra_key=%r offset=%d "
