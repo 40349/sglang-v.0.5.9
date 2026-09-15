@@ -832,7 +832,12 @@ def cmd_parity(args: argparse.Namespace) -> int:
 
 # stem -> label, in the order run_mas.sh runs them. The stems are the filenames
 # `toggle` writes, so `summary` reads a completed A/B with no arguments but a suffix.
-ARM_STEMS = (("base", "baseline"), ("sub", "sub-context"), ("rot", "+ rotation"))
+ARM_STEMS = (
+    ("base", "baseline"),
+    ("sub", "sub-context"),
+    ("rot", "+ rotation"),
+    ("idx", "+ index"),
+)
 
 
 def _load_arm(dirname: str, suffix: str, stem: str) -> Optional[dict]:
@@ -1213,9 +1218,9 @@ def main() -> int:
                    help="directory holding client_/trace_/stage_ files (default .)")
     m.add_argument("--suffix", default="",
                    help="the _<tag>_ab suffix run_mas.sh gave the run's files")
-    m.add_argument("--arms", default="base,sub,rot",
+    m.add_argument("--arms", default="base,sub,rot,idx",
                    help="which arms to put in the table, comma separated "
-                        "(base, sub, rot). An arm whose files are missing is left "
+                        "(base, sub, rot, idx). An arm whose files are missing is left "
                         "out either way; this drops one that IS there. Deltas are "
                         "always against the leftmost column")
     m.set_defaults(func=cmd_summary)

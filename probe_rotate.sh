@@ -1,19 +1,13 @@
 #!/usr/bin/env bash
-# One-shot check that sub-context KV rotation is alive and doing what it claims.
-#
-# Launches a server with both rotation stages on, sends three requests built so that
-# one hits each rotation path (see scripts/subcontext_sim/probe_rotate_client.py), and
-# prints the per-pass forward trace.
-#
-# Diagnostic only -- do NOT read GPU or host timings out of this run: SGLANG_SUBCTX_TRACE
-# is on, and its probes sit inside the regions host_timer measures.
+# One-shot check that sub-context KV rotation is alive and doing what it claims: three
+# requests built so one hits each rotation path (scripts/subcontext_sim/
+# probe_rotate_client.py), plus the per-pass forward trace.
 #
 #   ./probe_rotate.sh            rotation on  (both stages)
 #   ROTATE=0 ./probe_rotate.sh   control: same requests, same binary, rotation off
 #
-# Run both. The control is what makes the numbers mean anything: it shows the same
-# three requests dropping the hits that the rotation arm wins back.
-#
+# Run both -- the control is what makes the numbers mean anything. Diagnostic only:
+# SGLANG_SUBCTX_TRACE sits inside the regions host_timer measures.
 set -euo pipefail
 
 REPO=/home/t2503-3090/Desktop/MiaoChen/sglang-v.0.5.9
@@ -64,8 +58,7 @@ for _ in $(seq 1 300); do
   echo -n .; sleep 2
 done
 
-# An arm that silently ran without the rotation it is named for is worse than no arm
-# at all -- and so is a control that silently ran with it.
+# An arm that silently ran without the rotation it is named for still produces numbers.
 if [ "$ROTATE" = "0" ]; then
   grep -q "Sub-context KV rotation ENABLED" "$LOG" \
     && { echo "REFUSING: the control arm has rotation enabled"; exit 1; }

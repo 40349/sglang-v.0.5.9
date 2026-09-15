@@ -124,6 +124,57 @@ def write_cache_indices(
             pt += extend_len
 
 
+def write_cache_indices_sparse(
+    out_cache_loc: torch.Tensor,
+    req_pool_indices_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    extend_lens_cpu: torch.Tensor,
+    prefix_tensors: list[torch.Tensor],
+    reqs: list,
+    fresh_positions: list[list[int]],
+    req_to_token_pool: ReqToTokenPool,
+):
+    """Place each reused run at the position it belongs to, and the new tokens in the gaps.
+
+    ``write_cache_indices`` writes two slices -- reused, then new -- because reuse used
+    to be a prefix by construction. Sub-context reuse is not: a block cached under an
+    earlier prompt can land anywhere this one puts it, with fresh tokens on both sides.
+
+    What does not change is that every position in ``[0, seq_len)`` ends up mapped, and
+    mapped exactly once. That is what attention reads, and it is the invariant the
+    ownership accounting is written against -- a position left unmapped reads whatever
+    slot the row held last, which is silent and wrong rather than loud.
+    """
+    pt = 0
+    for i in range(req_pool_indices_cpu.shape[0]):
+        req_idx = req_pool_indices_cpu[i].item()
+        seq_len = seq_lens_cpu[i].item()
+        extend_len = extend_lens_cpu[i].item()
+        fresh = out_cache_loc[pt : pt + extend_len]
+        pt += extend_len
+
+        layout = reqs[i].sub_context_layout
+        if layout is None:
+            # Sharing the batch with a sparse request, but ordinary itself.
+            prefix_len = seq_len - extend_len
+            req_to_token_pool.write((req_idx, slice(0, prefix_len)), prefix_tensors[i])
+            req_to_token_pool.write((req_idx, slice(prefix_len, seq_len)), fresh)
+            continue
+
+        for start, end, slots in layout:
+            req_to_token_pool.write((req_idx, slice(start, end)), slots)
+        positions = torch.tensor(
+            fresh_positions[i], dtype=torch.int64, device=fresh.device
+        )
+        # Scattering by an index tensor is index_put_, which will not cast: the pool
+        # holds int32 slot numbers and the allocator hands out int64. The contiguous
+        # writes above are ordinary slice assignment and do cast, which is why this is
+        # the only place that has to say so.
+        req_to_token_pool.write(
+            (req_idx, positions), fresh.to(req_to_token_pool.req_to_token.dtype)
+        )
+
+
 def get_last_loc(
     req_to_token: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
@@ -374,6 +425,19 @@ def alloc_for_extend(
         )
 
     # Write to req_to_token_pool
+    if batch.subctx_fresh_positions is not None:
+        write_cache_indices_sparse(
+            out_cache_loc,
+            req_pool_indices_cpu,
+            batch.seq_lens_cpu,
+            extend_lens_cpu,
+            prefix_tensors,
+            batch.reqs,
+            batch.subctx_fresh_positions,
+            batch.req_to_token_pool,
+        )
+        return out_cache_loc, req_pool_indices_device, req_pool_indices
+
     write_cache_indices(
         out_cache_loc,
         req_pool_indices_device,

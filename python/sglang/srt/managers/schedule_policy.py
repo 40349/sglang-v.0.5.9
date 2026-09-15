@@ -830,6 +830,13 @@ class PrefillAdder:
                         CLIP_MAX_NEW_TOKENS,
                     ),
                 )
+            elif req.sub_context_layout is not None:
+                # A sparse reuse cannot be chunked: chunking declares everything before
+                # a position to be the prefix, and this request's reuse has holes in it.
+                # Wait for a pass with room for the whole thing -- the scan already
+                # refused any request too big to ever fit, so this is a delay, not a
+                # deadlock.
+                return AddReqResult.OTHER
             else:
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size

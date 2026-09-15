@@ -771,6 +771,52 @@ class Scheduler(
                 "the single-namespace baseline."
             )
         self._init_sub_context_rotation()
+        self._init_sub_context_index()
+
+    def _init_sub_context_index(self):
+        """Attach the index that lets a scan find a block anywhere in a prompt.
+
+        Nothing is registered until a block is actually inserted, so a fresh server
+        finds nothing and prefills normally; the index fills from what it caches.
+
+        Rotation is a hard requirement rather than a nicety. Addressing blocks by
+        content is what lets a scan find one at a position other than the one it was
+        computed at, and the whole point of finding it there is to reuse it -- which is
+        exactly what needs the rotation. Without it every displaced hit is dropped and
+        the index buys nothing, so say so at launch instead of at the end of a run.
+        """
+        from sglang.srt.mem_cache.subctx_index import SubContextIndex
+        from sglang.srt.utils.subctx_config import (
+            INDEX_DRYRUN,
+            INDEX_SUBCONTEXTS,
+            MIN_CHUNK_TOKENS,
+            sparse_prefill_unsupported_reason,
+        )
+
+        if not (INDEX_SUBCONTEXTS or INDEX_DRYRUN):
+            return
+        if INDEX_SUBCONTEXTS:
+            reason = sparse_prefill_unsupported_reason(self.tp_worker.model_runner)
+            if reason is not None:
+                raise ValueError(
+                    "The sub-context index is enabled but its prefill cannot be "
+                    f"served: {reason}. Unset SGLANG_SUBCTX_INDEX, or set "
+                    "SGLANG_SUBCTX_INDEX_DRYRUN=1 to measure without it."
+                )
+        if self.tree_cache.kv_rotator is None:
+            raise ValueError(
+                "The sub-context index is enabled but KV rotation is not, so every "
+                "block found away from where it was computed would be dropped. Set "
+                "SGLANG_SUBCONTEXT_ROTATE=1, or unset SGLANG_SUBCTX_INDEX."
+            )
+        self.tree_cache.sub_context_index = SubContextIndex(
+            min_chunk_tokens=MIN_CHUNK_TOKENS
+        )
+        logger.info(
+            "Sub-context index ENABLED (min chunk %d tokens%s)",
+            self.tree_cache.sub_context_index.min_chunk_tokens,
+            ", dry run -- scanning and reporting only" if INDEX_DRYRUN else "",
+        )
 
     def _init_sub_context_rotation(self):
         """Attach the KV rotator to the tree cache, or say why there is none.

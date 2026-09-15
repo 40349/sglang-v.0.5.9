@@ -323,6 +323,10 @@ class RadixCache(BasePrefixCache):
         # delta-composable (see `subctx_config.rotation_unsupported_reason`). None
         # means displaced sub-context hits are dropped rather than rotated.
         self.kv_rotator = None
+        # Set by the scheduler when the sub-context index is on. Holds every chunk the
+        # tree has ever been handed, so a later request can find one anywhere in its
+        # prompt instead of only where a fixed role would have put it.
+        self.sub_context_index = None
         # Tokens re-filed by `_reverse_rotate_insert_sub_contexts`, drained by the
         # forward trace. Kept on the cache rather than the request because the re-file
         # happens at finish, after that request's last forward pass.
@@ -885,8 +889,16 @@ class RadixCache(BasePrefixCache):
                 # wholesale would give those to the pool while the tree still serves
                 # them.
                 block = kv_indices[offset:end]
+                # Ask under the namespace the slots actually live in. For a block
+                # reused only in part that is not its own address -- its tokens are a
+                # prefix of the chunk holding them -- and asking under its own would
+                # find nothing and free KV the tree is still serving.
+                held_key = seg_key
+                source_keys = getattr(req, "sub_context_source_key", None)
+                if source_keys is not None and source_keys[i] is not None:
+                    held_key = source_keys[i]
                 match = self.match_prefix(
-                    MatchPrefixParams(key=RadixKey(token_ids[offset:end], seg_key))
+                    MatchPrefixParams(key=RadixKey(token_ids[offset:end], held_key))
                 )
                 _free_only_ours(
                     self.token_to_kv_pool_allocator,
@@ -945,8 +957,15 @@ class RadixCache(BasePrefixCache):
             return 0  # aborted mid-prefill; nothing settled enough to re-file
 
         reinserted = 0
+        no_insert = getattr(req, "sub_context_no_insert", None)
         for i, (seg_ids, seg_key, offset) in enumerate(req.iter_sub_contexts()):
             if not seg_ids or req.sub_context_tree_owned[i]:
+                continue
+            if no_insert is not None and no_insert[i]:
+                # Refused at chunk time and refused here, for the same reason: these
+                # tokens address a namespace other than the one whose slots they are.
+                # The free loop below treats the block as this request's and gives back
+                # only the slots the tree is not already holding.
                 continue
             end = offset + len(seg_ids)
             radix_key = RadixKey(token_ids[offset:end], seg_key)
@@ -1355,6 +1374,7 @@ class RadixCache(BasePrefixCache):
             req.sub_context_tree_owned = [False] * len(req.sub_context_extra_keys)
         if req.sub_context_tree_canonical is None:
             req.sub_context_tree_canonical = [None] * len(req.sub_context_extra_keys)
+        no_insert = getattr(req, "sub_context_no_insert", None)
 
         seg_last_nodes = []
         for i, (seg_ids, seg_key, offset) in enumerate(req.iter_sub_contexts()):
@@ -1374,6 +1394,13 @@ class RadixCache(BasePrefixCache):
             # would keep the growing `messages` block out of the cache for the rest of
             # the conversation. The resulting hole is why ownership is tracked per
             # block instead of as one protected prefix length.
+            if no_insert is not None and no_insert[i]:
+                # A run reused only in part, or a fresh scrap too small to be worth a
+                # namespace. The first is the load-bearing one: its tokens are a prefix
+                # of the chunk that holds them, so they address a *different* namespace,
+                # and filing them there would leave one set of slots owned twice.
+                continue
+
             probe = self.match_prefix(MatchPrefixParams(key=radix_key))
             probe_hit = len(probe.device_indices)
             existing = self.matched_canonical_position(
@@ -1419,6 +1446,13 @@ class RadixCache(BasePrefixCache):
             req.sub_context_tree_owned[i] = True
             req.sub_context_tree_canonical[i] = offset
             req.sub_context_owned_lens[i] = covered_end - offset
+            if self.sub_context_index is not None:
+                # The whole block, even when this chunk only covered part of it: the
+                # namespace is addressed by the whole block's tokens either way, and a
+                # later request that scans it in will get however much of it the tree
+                # actually holds back from `match_prefix`. Registering the covered
+                # prefix instead would address a namespace that does not exist.
+                self.sub_context_index.register(seg_ids, req.extra_key)
 
         req.sub_context_last_nodes = seg_last_nodes
 
@@ -1488,7 +1522,18 @@ class RadixCache(BasePrefixCache):
 
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
+            was_namespace_root = x.parent is self.root_node
             self._delete_leaf(x)
+
+            if was_namespace_root and self.sub_context_index is not None:
+                # A content-addressed namespace holds one chunk, so all of it hangs off
+                # a single child of the root: losing that child is the whole chunk
+                # going. Telling the index keeps a scan from verifying, at every
+                # position, something no lookup can serve any more. Being wrong here
+                # costs reuse, never correctness -- the chunk is simply registered again
+                # the next time one is computed.
+                if x.key.extra_key is not None:
+                    self.sub_context_index.unregister(x.key.extra_key)
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
                 new_priority = self.eviction_strategy.get_priority(x.parent)

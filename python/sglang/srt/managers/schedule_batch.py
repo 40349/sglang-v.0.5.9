@@ -71,6 +71,9 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.subctx_index import Match as SubContextMatch
+from sglang.srt.mem_cache.subctx_index import chunk_id as sub_context_chunk_id
+from sglang.srt.utils import subctx_config
 from sglang.srt.utils.subctx_trace import TRACE_ON, trace
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.metrics.collector import (
@@ -632,6 +635,22 @@ class Req(ReqDllmMixin):
         # concat(sub_context_ids) == origin_input_ids. None for normal requests.
         self.sub_context_ids = sub_context_ids
         self.sub_context_extra_keys = sub_context_extra_keys
+        # The split as it arrived. `_scan_sub_contexts` re-cuts the prompt to match what
+        # it found, and has to start from the same place every time -- a retracted
+        # request scans again, and cutting an already-cut list would drift.
+        self.sub_context_ids_as_sent = sub_context_ids
+        if sub_context_ids and subctx_config.hash_subcontext_keys():
+            # Address each block by its own tokens, discarding whatever namespaces the
+            # caller named: the role a block played says nothing about whether two
+            # requests hold the same tokens, and a role name is one namespace for every
+            # content, which pins it to the first position anyone inserted it at.
+            #
+            # Derived here rather than where the split is made because `extra_key` only
+            # becomes final a few lines above, once lora_id has been folded into it --
+            # and an adapter's KV must not be found by a request not using it.
+            self.sub_context_extra_keys = [
+                sub_context_chunk_id(seg, self.extra_key) for seg in sub_context_ids
+            ]
         # Per-block radix hit lengths (filled during scheduling; parallel to keys).
         self.sub_context_match_lens: Optional[List[int]] = None
         # Tokens matched in the tree that the contiguity rule then refused to
@@ -674,6 +693,19 @@ class Req(ReqDllmMixin):
         # cleared: after that the normal free-from-req_to_token paths cover them, and
         # freeing here as well would be a double free.
         self.sub_context_rotated_slots: Optional[List[torch.Tensor]] = None
+        # Blocks the insert path must leave alone, parallel to sub_context_ids. Set for
+        # a run reused only in part: its tokens no longer address the namespace holding
+        # them, so filing it would give those slots a second owner.
+        self.sub_context_no_insert: Optional[List[bool]] = None
+        # For a block whose slots live under a namespace other than its own address --
+        # a partly reused run -- the namespace they really live in. The free paths ask
+        # the tree who holds a slot before giving it back, and asking under the block's
+        # own address would find nothing and hand back KV the tree is still serving.
+        self.sub_context_source_key: Optional[List[Optional[str]]] = None
+        # Where each reused run lands: ordered, non-overlapping (start, end, slots).
+        # The complement within the prompt is what prefill actually computes. None on
+        # the stitch path, where reuse is always the run [0, len(prefix_indices)).
+        self.sub_context_layout: Optional[List[Tuple[int, int, torch.Tensor]]] = None
         # Displaced hits the stitch is holding back rather than reporting as dropped,
         # because a chunk boundary is about to be cut so `_rotate_append_sub_contexts`
         # can try them. Settled there -- as rotated, or as moved for what it declined.
@@ -1043,7 +1075,24 @@ class Req(ReqDllmMixin):
             # namespaces nothing writes to (0% forever). Falling through to the
             # single-namespace match keeps such a server correct, just without the
             # split; the launcher refuses the combination outright.
-            self._stitch_sub_contexts(tree_cache)
+            if (
+                subctx_config.INDEX_SUBCONTEXTS
+                and getattr(tree_cache, "sub_context_index", None) is not None
+            ):
+                self._scan_sub_contexts(tree_cache)
+                if not self._sub_context_layout_fits_one_pass():
+                    tree_cache.sub_context_index.fell_back += 1
+                    # More to compute than one prefill pass takes, and the chunked path
+                    # slices the prompt by position -- which a reuse full of holes
+                    # cannot be sliced by. Give the hits back and take the stitch, which
+                    # chunks correctly, rather than hold a request that never fits.
+                    self.release_sub_context_match_locks(tree_cache)
+                    self.release_sub_context_rotated_slots(tree_cache)
+                    self._stitch_sub_contexts(tree_cache)
+            else:
+                self._stitch_sub_contexts(tree_cache)
+                if subctx_config.INDEX_DRYRUN:
+                    self._measure_sub_context_scan(tree_cache)
         elif tree_cache is not None:
             if self.has_sub_contexts and not tree_cache.supports_sub_contexts():
                 # A placement conflict lands here too, but it logs its own reason.
@@ -1118,6 +1167,9 @@ class Req(ReqDllmMixin):
         for slots in self.sub_context_rotated_slots:
             tree_cache.token_to_kv_pool_allocator.free(slots)
         self.sub_context_rotated_slots = None
+        # The layout points at the slots just freed; leaving it would place them in
+        # req_to_token on the next pass.
+        self.sub_context_layout = None
 
     def _next_rotatable_boundary(
         self,
@@ -1176,6 +1228,328 @@ class Req(ReqDllmMixin):
         self.sub_context_rotated_slots.append(dst)
         return dst
 
+    def _resplit_for_sub_context_matches(self, resolved) -> None:
+        """Re-cut the prompt so every reused run is a block of its own.
+
+        This is what keeps a slot to one owner. The insert path files a block under the
+        namespace its own tokens address, so a run reused from chunk X sitting *inside*
+        a larger block would see that block filed under a second namespace -- two owners
+        for one slot, which is the oldest failure mode on this path. Cut the run out and
+        the two agree by construction: the block's tokens are X's tokens, so its address
+        is X, and filing it stores nothing new.
+
+        The same cut keeps the cache from growing quadratically. A conversation tail
+        reused up to token 1400 and computed from there leaves the new work as its own
+        chunk, so turn N stores its delta rather than another copy of turns 1..N-1 --
+        and the next scan finds the two runs back to back.
+
+        Fresh stretches are cut again at the boundaries the request arrived with: a
+        chunk spanning the system prompt and the conversation would stop matching the
+        moment either changed, which is the failure the split exists to avoid.
+        """
+        blocks = self.sub_context_ids_as_sent
+        prompt = [tok for block in blocks for tok in block]
+
+        sent_boundaries, at = [], 0
+        for block in blocks:
+            at += len(block)
+            sent_boundaries.append(at)
+
+        cuts = {0, len(prompt)}
+        for start, end, _slots, _cut, _cid in resolved:
+            cuts.add(start)
+            cuts.add(end)
+        for boundary in sent_boundaries:
+            # Except where it falls inside a reused run -- cutting one of those leaves a
+            # block whose tokens no longer address the namespace holding them.
+            if not any(
+                start < boundary < end for start, end, _s, _c, _k in resolved
+            ):
+                cuts.add(boundary)
+
+        edges = sorted(c for c in cuts if 0 <= c <= len(prompt))
+        self.sub_context_ids = [p for a, b in zip(edges, edges[1:]) if (p := prompt[a:b])]
+        self.sub_context_extra_keys = [
+            sub_context_chunk_id(block, self.extra_key)
+            for block in self.sub_context_ids
+        ]
+
+    def sub_context_fresh_positions(self) -> List[int]:
+        """The positions this pass runs through the model, in order.
+
+        Everything the prompt does not reuse. On the stitch path that is the tail after
+        the reused prefix; with a sparse layout it is the gaps between the reused runs,
+        and the tail. Ascending either way, which is what makes the last entry the
+        position whose logits become the next token.
+        """
+        n = len(self.fill_ids)
+        if self.sub_context_layout is None:
+            return list(range(len(self.prefix_indices), n))
+        fresh: List[int] = []
+        cursor = 0
+        for start, end, _slots in self.sub_context_layout:
+            fresh.extend(range(cursor, start))
+            cursor = end
+        fresh.extend(range(cursor, n))
+        return fresh
+
+    def _sub_context_layout_fits_one_pass(self) -> bool:
+        """Whether what is left to compute fits in a single prefill pass.
+
+        Chunking cuts a prompt at a position and calls everything before it the prefix.
+        A sparse reuse has holes, so there is no position with that property, and a
+        chunked sparse request would be handed a prefix that is not one. Rather than
+        teach the chunker about holes, requests that would need it take the stitch --
+        which is correct under chunking and merely reuses less.
+        """
+        if self.sub_context_layout is None:
+            return True
+        try:
+            budget = get_global_server_args().chunked_prefill_size
+        except ValueError:
+            # No scheduler around it -- a unit test driving the cache directly. Nothing
+            # is going to chunk anything, so there is nothing to keep out of.
+            return True
+        if budget is None or budget <= 0:
+            return True
+        return len(self.fill_ids) - len(self.prefix_indices) <= budget
+
+    @host_timer.timed("subctx_scan")
+    def _scan_sub_contexts(self, tree_cache: BasePrefixCache) -> None:
+        """Find this prompt's blocks wherever they are cached, at whatever position.
+
+        The difference from ``_stitch_sub_contexts`` is that there is no contiguity
+        rule. That rule exists because a prefill could only ever express "reuse a run
+        starting at position 0, compute the rest", so one missing block discarded every
+        block behind it however well cached. Here each run is placed where it belongs
+        and the gaps between them are computed, which is what the sparse prefill can
+        express.
+
+        Finding is content-addressed rather than by role, which is what lets a block
+        that *grew* reuse its earlier self: last turn's conversation tail is a different
+        chunk from this turn's, so probing this turn's address would never find it, but
+        scanning the prompt does.
+
+        A run already at the position it was computed for is reused in place, sharing
+        the tree's slots; a displaced one is copied to this request's own slots and
+        rotated there. Either way the prompt is then re-cut around what was found, which
+        is what keeps the insert path from filing one slot under two namespaces.
+        """
+        self.release_sub_context_match_locks(tree_cache)
+        self.release_sub_context_rotated_slots(tree_cache)
+        # Always scan against the split as sent; re-cutting an already-cut list drifts.
+        self.sub_context_ids = self.sub_context_ids_as_sent
+        self.sub_context_extra_keys = [
+            sub_context_chunk_id(block, self.extra_key)
+            for block in self.sub_context_ids_as_sent
+        ]
+
+        index = tree_cache.sub_context_index
+        # Prefill has to run at least one token through the model: the logits come from
+        # the last position, and an empty grid makes CUDA refuse the launch outright.
+        last_computable = max(len(self.fill_ids) - 1, 0)
+        # Trimmed to fit, not dropped for overrunning. The last block of a prompt always
+        # ends at the prompt's end -- an agent turn's generation prompt is the last thing
+        # in it -- and it is usually the largest, so refusing it whole would give up most
+        # of what there is to reuse to buy one token.
+        full_end = {}
+        candidates = []
+        for match in index.scan(self.fill_ids, self.extra_key):
+            end = min(match.end, last_computable)
+            if end - match.start < index.min_chunk_tokens:
+                continue
+            full_end[(match.start, end)] = match.end
+            candidates.append(SubContextMatch(match.start, end, match.chunk_id))
+
+        resolved = []
+        nodes = []
+        moved = rotated = discarded = 0
+        for match in index.select(candidates):
+            seg = self.fill_ids[match.start : match.end]
+            probe = tree_cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=seg, extra_key=match.chunk_id)
+                )
+            )
+            take = len(probe.device_indices)
+            if take != match.length:
+                # Partly evicted since it was indexed. Taking the surviving head would
+                # leave a block whose tokens no longer address this namespace, so the
+                # run is dropped whole and recomputed. The index is allowed to drift
+                # ahead of the tree; this is where that costs a lookup and nothing else.
+                discarded += take
+                continue
+            # Lock before anything else reads these slots: unlocked, they can be evicted
+            # and handed to another request between here and the forward pass.
+            tree_cache.inc_lock_ref(probe.last_device_node)
+            canonical = tree_cache.matched_canonical_position(
+                probe.last_device_node, take
+            )
+            delta = match.start - (canonical if canonical is not None else match.start)
+            if delta == 0:
+                slots = probe.device_indices
+            else:
+                moved += take
+                slots = self._rotate_sub_context_block(
+                    tree_cache, probe.device_indices, delta
+                )
+                if slots is None:
+                    # Out of rotation range, or the pool is full: recompute the run, as
+                    # if the hit had never happened.
+                    tree_cache.dec_lock_ref(probe.last_device_node)
+                    discarded += take
+                    continue
+                rotated += take
+            resolved.append(
+                (
+                    match.start,
+                    match.end,
+                    slots,
+                    full_end[(match.start, match.end)] != match.end,
+                    match.chunk_id,
+                )
+            )
+            nodes.append(probe.last_device_node)
+
+        self._resplit_for_sub_context_matches(resolved)
+
+        by_start = {
+            start: (end, slots, cut, cid) for start, end, slots, cut, cid in resolved
+        }
+        n_blocks = len(self.sub_context_ids)
+        match_lens = [0] * n_blocks
+        owned = [0] * n_blocks
+        no_insert = [False] * n_blocks
+        source_key: List[Optional[str]] = [None] * n_blocks
+        layout: List[Tuple[int, int, torch.Tensor]] = []
+        stitched: List[torch.Tensor] = []
+        for i, (seg_ids, _key, offset) in enumerate(self.iter_sub_contexts()):
+            hit = by_start.get(offset)
+            if hit is None or hit[0] != offset + len(seg_ids):
+                # Fresh. Too short to be worth a namespace of its own -- the one-token
+                # remainder the rule above leaves behind is the usual case -- and filing
+                # it only adds a node nothing will ever match.
+                no_insert[i] = len(seg_ids) < index.min_chunk_tokens
+                continue
+            end, slots, cut, cid = hit
+            match_lens[i] = owned[i] = len(seg_ids)
+            no_insert[i] = cut
+            if cut:
+                # Trimmed: this block's tokens are a prefix of `cid`'s, so they address
+                # a namespace of their own that nothing was ever filed under. Record
+                # where the slots actually live, or the free path will decide the tree
+                # is not holding them.
+                source_key[i] = cid
+            layout.append((offset, end, slots))
+            stitched.append(slots)
+
+        self.sub_context_layout = layout or None
+        self.sub_context_no_insert = no_insert
+        self.sub_context_source_key = source_key
+        self.sub_context_match_lens = match_lens
+        self.sub_context_owned_lens = owned
+        self.sub_context_tree_owned = None
+        self.sub_context_tree_canonical = None
+        # Parallel to the *re-cut* blocks, and holding the locks taken above so
+        # `release_sub_context_match_locks` can drop them on any path out of here.
+        self.sub_context_match_indices = [None] * n_blocks
+        self.sub_context_match_nodes = nodes or None
+        self.sub_context_match_positions = [None] * n_blocks
+        # Stage 2 exists to rescue blocks the contiguity rule stranded. There are none.
+        self.sub_context_next_boundary = None
+        self.sub_context_deferred_moved = 0
+        self.sub_context_moved = moved
+        self.sub_context_rotated = rotated
+        self.sub_context_discarded = discarded
+        index.reused_tokens += sum(len(slots) for _s, _e, slots in layout)
+        index.rotated_tokens += rotated
+
+        if stitched:
+            self.prefix_indices = torch.cat(stitched)
+        else:
+            self.prefix_indices = torch.empty(
+                (0,), dtype=torch.int64, device=tree_cache.device
+            )
+        self.last_node = tree_cache.root_node
+        self.last_host_node = tree_cache.root_node
+        self.host_hit_length = 0
+        self.mamba_branching_seqlen = None
+        # The lossy projection upstream reads: how far from position 0 the prompt is
+        # covered without a hole. Reuse no longer has to start at 0 or run unbroken, so
+        # this is usually shorter than what is being reused.
+        covered = 0
+        for start, end, _slots in layout:
+            if start != covered:
+                break
+            covered = end
+        self.cache_protected_len = covered
+
+        if TRACE_ON:
+            trace(
+                f"[TRACE-4 SUBCTX-SCAN] rid={self.rid} prompt={len(self.fill_ids)} "
+                f"reused={len(self.prefix_indices)} moved={moved} rotated={rotated} "
+                f"discarded={discarded} blocks={[len(b) for b in self.sub_context_ids]} "
+                f"layout={[(s, e) for s, e, _ in layout]}"
+            )
+
+    @host_timer.timed("subctx_scan")
+    def _measure_sub_context_scan(self, tree_cache: BasePrefixCache) -> None:
+        """Report what a content scan would find, and change nothing.
+
+        The question this answers is whether the rest of the work is worth doing. The
+        stitch can only reuse a run starting at position 0, so a block cached under one
+        prompt but sitting mid-prompt in the next is invisible to it however well it is
+        cached. Scanning finds those; the gap between the two numbers is the ceiling on
+        what a prefill that could place them anywhere would win, measured on the real
+        workload rather than argued from the design.
+
+        Every hit is looked up for real, because a scan hit whose namespace has since
+        been evicted buys nothing and counting it would overstate the ceiling.
+
+        Not quite free of side effects: ``match_prefix`` refreshes the access time of
+        what it walks, so a probed block is evicted later than it would have been. That
+        is the same touch a real reuse would make, which is why it is left as is -- the
+        residency reported here is the residency the reusing path would find, not the
+        one a server that never looked would have. It does mean this is a measurement
+        mode and not a third arm to compare outputs against.
+        """
+        index = getattr(tree_cache, "sub_context_index", None)
+        if index is None or not self.fill_ids:
+            return
+
+        matches = index.select(index.scan(self.fill_ids, self.extra_key))
+        reused = len(self.prefix_indices)
+        resident = beyond = displaced = 0
+        for match in matches:
+            seg = self.fill_ids[match.start : match.end]
+            probe = tree_cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=seg, extra_key=match.chunk_id)
+                )
+            )
+            hit = len(probe.device_indices)
+            if hit == 0:
+                continue
+            resident += hit
+            beyond += max(0, min(match.start + hit, len(self.fill_ids)) - max(match.start, reused))
+            canonical = tree_cache.matched_canonical_position(probe.last_device_node, hit)
+            if canonical is not None and canonical != match.start:
+                displaced += hit
+
+        index.found_tokens += sum(m.length for m in matches)
+        index.resident_tokens += resident
+        index.beyond_stitch_tokens += beyond
+        index.displaced_tokens += displaced
+        index.stitched_tokens += reused
+
+        if TRACE_ON:
+            trace(
+                f"[TRACE-4 SUBCTX-SCAN] rid={self.rid} prompt={len(self.fill_ids)} "
+                f"stitched={reused} scan_found={sum(m.length for m in matches)} "
+                f"resident={resident} beyond_stitch={beyond} displaced={displaced} "
+                f"blocks={[(m.start, m.end) for m in matches]}"
+            )
+
     @host_timer.timed("subctx_stitch")
     def _stitch_sub_contexts(self, tree_cache: BasePrefixCache) -> None:
         """Match each sub-context in its own namespace and stitch the contiguous
@@ -1215,6 +1589,12 @@ class Req(ReqDllmMixin):
         # `prepare_for_extend` is the only one whose slots are still ours to free.
         self.release_sub_context_match_locks(tree_cache)
         self.release_sub_context_rotated_slots(tree_cache)
+        # Reuse here is a prefix by construction, which is the shape the batch assembly
+        # takes when there is no layout. Cleared explicitly because a scan may have run
+        # first and set one before handing over.
+        self.sub_context_layout = None
+        self.sub_context_no_insert = None
+        self.sub_context_source_key = None
 
         max_prefix_len = max(len(self.fill_ids) - 1, 0)
         stitched: List[torch.Tensor] = []
@@ -1756,6 +2136,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
 
+    # Sub-context sparse prefill: the prompt positions each request computes this pass,
+    # when its reuse is not a prefix. None when every request in the batch takes the
+    # ordinary "reuse a prefix, compute the tail" shape.
+    subctx_fresh_positions: Optional[List[List[int]]] = None
+
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
@@ -1891,7 +2276,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        if any(r.sub_context_layout is not None for r in reqs):
+            # Reuse is not a prefix any more, so neither is what is left to compute.
+            # Gather it by position, and keep the positions -- they are what the model
+            # gets as `positions` and what req_to_token is written by, and nothing
+            # downstream can infer them from a length.
+            self.subctx_fresh_positions = [r.sub_context_fresh_positions() for r in reqs]
+            input_ids = [
+                [r.fill_ids[p] for p in positions]
+                for r, positions in zip(reqs, self.subctx_fresh_positions)
+            ]
+        else:
+            self.subctx_fresh_positions = None
+            input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
@@ -2386,6 +2783,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return ret
 
     def prepare_for_decode(self):
+        # Decode positions come from the sequence lengths. Leaving the prefill's
+        # scattered ones here would send this batch's tokens to the wrong positions.
+        self.subctx_fresh_positions = None
+
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
@@ -2602,6 +3003,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
+    def build_subctx_positions(self) -> Optional[torch.Tensor]:
+        """The position of every token in ``input_ids``, or None if it is inferable.
+
+        Positions are normally rebuilt downstream as one ascending run per request,
+        which a sparse prefill's are not. Requests sharing the batch with a sparse one
+        still need their own entries here -- there is one positions tensor, so it is
+        all of them or none.
+        """
+        if self.subctx_fresh_positions is None or not self.forward_mode.is_extend():
+            return None
+        flat = [p for positions in self.subctx_fresh_positions for p in positions]
+        return torch.tensor(flat, dtype=torch.int64, device=self.device)
+
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
     ) -> ModelWorkerBatch:
@@ -2672,6 +3086,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dimensions=self.dimensions,
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
+            subctx_positions=self.build_subctx_positions(),
             reqs=self.reqs,
             has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
@@ -2851,6 +3266,11 @@ class ModelWorkerBatch:
     # Diffusion LLM
     dllm_block_offsets: Optional[List[int]] = None
     dllm_config: Optional[DllmConfig] = None
+
+    # Sub-context sparse prefill: the position of every token in `input_ids`. Carried
+    # explicitly because positions are otherwise rebuilt downstream as one run per
+    # request, and a sparse prefill's are scattered.
+    subctx_positions: Optional[torch.Tensor] = None
 
     # For constrained decoding
     # FIXME(lsyin): remove this after fully overlap grammar

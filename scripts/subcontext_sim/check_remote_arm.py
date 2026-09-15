@@ -17,7 +17,7 @@ Both are checked. Exits non-zero with the reason on any mismatch.
 
 Usage:
     check_remote_arm.py URL --split true|false --rotate true|false \
-        [--maslab-config PATH --model NAME]
+        [--index true|false] [--maslab-config PATH --model NAME]
 """
 
 from __future__ import annotations
@@ -37,6 +37,14 @@ def main() -> int:
     ap.add_argument("url", help="server base URL, e.g. http://140.118.202.100:30000")
     ap.add_argument("--split", type=_bool, required=True)
     ap.add_argument("--rotate", type=_bool, required=True)
+    ap.add_argument(
+        "--index",
+        type=_bool,
+        default=None,
+        help="require the content-addressed index (and the sparse prefill that goes "
+        "with it) to be on or off. Left unchecked by default so callers written "
+        "before it existed keep meaning what they meant.",
+    )
     ap.add_argument(
         "--audit",
         type=_bool,
@@ -72,6 +80,16 @@ def main() -> int:
         print(
             f"REFUSING: asked for split={args.split} rotate={args.rotate}, but the "
             f"server reports {sub}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.index is not None and bool(sub.get("index")) != args.index:
+        print(
+            f"REFUSING: asked for index={args.index} but the server reports "
+            f"index={sub.get('index')!r}. A server old enough to have no `index` key "
+            "at all reports None here, which is the same failure as the missing "
+            "sub_context block above: it is not this checkout.",
             file=sys.stderr,
         )
         return 1

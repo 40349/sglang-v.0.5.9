@@ -249,6 +249,14 @@ class SchedulerMetricsMixin:
 
         msg += f"{graph_backend[self.device]}: {can_run_cuda_graph}"
 
+        index = getattr(self.tree_cache, "sub_context_index", None)
+        if index is not None:
+            # Running totals, on the prefill line because that is the thing they are
+            # about. The number to read is the last one: tokens a scan located, that
+            # are still cached, and that a reuse confined to a prefix could not have
+            # reached.
+            msg += f"\n{index.report()}"
+
         logger.info(msg)
 
         if self.enable_metrics:

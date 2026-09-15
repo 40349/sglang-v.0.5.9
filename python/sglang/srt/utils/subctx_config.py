@@ -36,6 +36,37 @@ ROTATE_ACROSS_RECOMPUTE = os.environ.get(
 # Debug: take the pure-torch rotation path instead of the Triton kernel.
 ROTATE_NATIVE = os.environ.get("SGLANG_SUBCONTEXT_ROTATE_NATIVE", "") not in ("", "0")
 
+# Address each block by a hash of its own tokens instead of the role it played
+# ("system_prompt_key" and friends). Two consequences, and the second is the point:
+# a namespace now holds one content, so the first request to insert one no longer
+# freezes the position every later request must match; and `extra_key` -- cache_salt
+# with lora_id concatenated -- finally reaches the block keys, which the role names
+# dropped, so one adapter's KV stops being served to another's request.
+#
+# Separate from INDEX because it is separately measurable: it changes which hits the
+# existing stitch path can use without changing how a prompt is prefilled.
+HASH_SUBCONTEXT_KEYS = os.environ.get("SGLANG_SUBCTX_HASH_KEYS", "") not in ("", "0")
+
+# Find blocks by scanning the query against an index of every registered chunk, rather
+# than looking up fixed roles at fixed offsets, and prefill the result in one pass with
+# the reused blocks wherever they land. Implies HASH_SUBCONTEXT_KEYS: a scan has
+# nothing to look up unless chunks are addressed by content.
+INDEX_SUBCONTEXTS = os.environ.get("SGLANG_SUBCTX_INDEX", "") not in ("", "0")
+
+# Scan and report, then take the stock path anyway. Answers "how much could this win"
+# before any of it is wired to the forward pass -- the tokens the index finds that the
+# contiguity rule cannot currently reach are the ceiling for the rest of the work.
+INDEX_DRYRUN = os.environ.get("SGLANG_SUBCTX_INDEX_DRYRUN", "") not in ("", "0")
+
+# Shortest run of tokens the index will take. Read here so the switch sits with the
+# others; the default lives with the code that has to justify it.
+MIN_CHUNK_TOKENS = int(os.environ.get("SGLANG_SUBCTX_MIN_CHUNK", "64"))
+
+
+def hash_subcontext_keys() -> bool:
+    """Whether block namespaces are addressed by content."""
+    return HASH_SUBCONTEXT_KEYS or INDEX_SUBCONTEXTS or INDEX_DRYRUN
+
 
 def unsupported_reason(tree_cache) -> Optional[str]:
     """Return why ``tree_cache`` cannot serve sub-contexts, or None if it can.
@@ -71,6 +102,36 @@ def unsupported_reason(tree_cache) -> Optional[str]:
     if tree_cache.is_eagle:
         return "EAGLE speculative decoding rewrites the radix keys into bigrams"
     return "the prefix cache reports no sub-context support"
+
+
+def sparse_prefill_unsupported_reason(model_runner) -> Optional[str]:
+    """Return why a prefill cannot place reused blocks freely, or None if it can.
+
+    Refusing loudly, as everywhere else on this path. Every one of these produces a
+    *quietly* wrong answer rather than an error: the backends below decide what a query
+    may attend to by comparing indices, and a sparse prefill's queries are not at the
+    indices their positions imply, so they would silently attend to the wrong keys --
+    including keys ahead of themselves.
+    """
+    backend = model_runner.server_args.attention_backend
+    if backend not in (None, "triton"):
+        return (
+            f"the {backend} attention backend applies causality by index; only triton "
+            "takes the explicit per-position mask a scattered prefill needs "
+            "(--attention-backend triton)"
+        )
+    if model_runner.sliding_window_size is not None and model_runner.sliding_window_size > 0:
+        return (
+            "sliding-window attention derives each key's absolute position from the "
+            "prefix length, which a prefill with holes in it does not have"
+        )
+    if model_runner.server_args.enable_piecewise_cuda_graph:
+        return (
+            "piecewise CUDA graphs capture a prefill's shapes, and the mask a "
+            "scattered prefill builds is sized per request "
+            "(--disable-piecewise-cuda-graph)"
+        )
+    return None
 
 
 def rotation_unsupported_reason(model_runner, tree_cache) -> Optional[str]:

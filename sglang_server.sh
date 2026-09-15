@@ -10,41 +10,31 @@
 #
 # sglang server for the sub-context A/B, run on the H200 while MASLab stays local.
 #
-#   sbatch sglang_server.sh              split ON, no rotation  (the "on" arm)
-#   ARM=off sbatch sglang_server.sh      split OFF              (the baseline arm)
-#   ARM=rot sbatch sglang_server.sh      split ON + rotation    (the new arm)
+#   ARM=off   no split -- the stock radix cache, the baseline
+#   ARM=on    split into per-block namespaces (the default)
+#   ARM=rot   + rotate a displaced block into place, + Stage 2
+#   ARM=idx   + find blocks by content anywhere in the prompt, prefill the gaps
 #
-# Diagnostic switches, both off by default and both of which make the run's timings
-# unusable for the A/B -- they bill host work to one arm:
-#   SUBCTX_TRACE=1  per-match/insert/finish tracing. Also sets PYTHONUNBUFFERED: the
-#                   scheduler is a spawned child and does not inherit `python -u`, so
-#                   its print() output is block-buffered and the last -- most
-#                   interesting -- lines are lost when it dies.
-#   SUBCTX_AUDIT=1  per-request KV conservation check on the finish path: reports
-#                   SUBCTX-AUDIT naming any request whose slots end up in neither the
-#                   pool nor a namespace (LOST) or in both (DOUBLE-OWNED). Costs a
-#                   match_prefix per block; goes through the logger, so no buffering.
-#   DUMP_TREE=1     print the whole radix tree after every extend pass
-#   ROTATE_GPU=1    CUDA-event timing around the rotation kernel, reported as the
-#                   subctx_rotate_gpu stage. Costs an event pair per rotation, which
-#                   lands inside the host stage measured beside it, so read host
-#                   overhead from a run without it.
+# The arm is read once at start, so each arm is a separate job. Read the compute
+# node's address out of the job log: Slurm picks a node, so it changes per submission.
 #
-# The arm is an env var read once at server start, so it cannot be changed without a
-# restart -- that is why each arm is a separate job.
-#
-# Read the compute node's address out of the job log and point the local
-# run_mas.sh at it: a Slurm job lands on whichever node the scheduler picked, so the
-# address is NOT stable across submissions.
+# Diagnostics, all off by default and all of which make the timings unusable for the
+# A/B: SUBCTX_TRACE=1 (per-match tracing), SUBCTX_AUDIT=1 (leak / ownership check on
+# the finish path), DUMP_TREE=1, ROTATE_GPU=1 (CUDA events around the rotation).
 
 set -euo pipefail
 
 REPO=/home/m11402151/work/sglang-v.0.5.9
 WORK_DIR=/home/m11402151/work
 PORT=${PORT:-30000}
-MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-Coder-30B-A3B-Instruct}
+MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-30B-A3B}
 CTXLEN=${CTXLEN:-16384}
 ARM=${ARM:-on}
+
+# Pinned for every arm: the idx arm places reused blocks anywhere in the sequence, and
+# triton is the only backend that takes an explicit per-position mask -- the others
+# decide what a query may attend to by comparing indices, which that breaks silently.
+BACKEND=${BACKEND:-triton}
 
 ml load miniconda3
 eval "$(conda shell.bash hook)"
@@ -60,30 +50,29 @@ case "$RESOLVED" in
   *) echo "REFUSING: sglang resolves to $RESOLVED, not $REPO"; exit 1 ;;
 esac
 
-# Put the token in ~/.cache/huggingface/token (`huggingface-cli login`) instead of
-# here -- a token in a script gets copied into logs, job output and version control.
+# Token goes in ~/.cache/huggingface/token, not here.
 export SGLANG_DISABLE_CUDNN_CHECK=1
 
 mkdir -p "$WORK_DIR/logs" "$WORK_DIR/traces"
 SUF="${ARM}_${SLURM_JOB_ID:-manual}"
 SERVER_LOG="$WORK_DIR/logs/sglang_${SUF}.log"
 
-# Per-arm switches. Everything else about the binary is identical across arms.
+# Per-arm switches; everything else about the binary is identical across arms. idx
+# leaves ROT_ACROSS off: Stage 2 rescues a block the contiguity rule stranded, and the
+# index has no contiguity rule.
 case "$ARM" in
-  on)  SUBCTX_OFF=""; ROT=""; ROT_ACROSS="" ;;
-  off) SUBCTX_OFF="1"; ROT=""; ROT_ACROSS="" ;;
-  rot) SUBCTX_OFF=""; ROT="1"; ROT_ACROSS="1" ;;
-  *)   echo "REFUSING: unknown ARM='$ARM' (want on|off|rot)"; exit 1 ;;
+  on)  SUBCTX_OFF=""; ROT=""; ROT_ACROSS=""; INDEX="" ;;
+  off) SUBCTX_OFF="1"; ROT=""; ROT_ACROSS=""; INDEX="" ;;
+  rot) SUBCTX_OFF=""; ROT="1"; ROT_ACROSS="1"; INDEX="" ;;
+  idx) SUBCTX_OFF=""; ROT="1"; ROT_ACROSS=""; INDEX="1" ;;
+  *)   echo "REFUSING: unknown ARM='$ARM' (want on|off|rot|idx)"; exit 1 ;;
 esac
 
 NODE_IP=$(hostname -I | awk '{print $1}')
 
-# Refuse if something already answers on this port. uvicorn does NOT treat a failed
-# bind as fatal: it logs "address already in use", shuts the HTTP layer down, and the
-# job stays alive holding a GPU and serving nothing -- while a "fired up and ready"
-# line from the warm-up path races into the log and makes it look healthy. A client
-# then reaches the OTHER server, passes the /server_info arm check because that one is
-# the same arm, and quietly measures whatever binary it happens to be running.
+# Refuse if something already answers here. uvicorn does NOT treat a failed bind as
+# fatal: the job stays alive holding a GPU and serving nothing, while a client reaches
+# the OTHER server -- which passes the arm check, because it is the same arm.
 if curl -sf --max-time 5 "http://127.0.0.1:${PORT}/health" > /dev/null 2>&1; then
   echo "REFUSING: something is already serving 127.0.0.1:${PORT} on $(hostname)."
   echo "  A previous sglang job is still up. Its server would take this run's traffic"
@@ -96,6 +85,7 @@ cat <<EOF
 ==========================================
 sglang server -- arm: $ARM
 model:  $MODEL_PATH
+backend:$BACKEND
 node:   $(hostname)  ip: $NODE_IP
 URL:    http://${NODE_IP}:${PORT}/v1
 log:    $SERVER_LOG
@@ -103,14 +93,15 @@ trace:  $WORK_DIR/traces/*_${SUF}.*
 ==========================================
 EOF
 
-# --reasoning-parser is deliberately absent: Qwen3-Coder-30B-A3B-Instruct is a
-# non-thinking model and emits no <think> block for it to strip.
+# --reasoning-parser qwen3: Qwen3-30B-A3B thinks by default, so without it the <think>
+# block stays in the content the harness scores.
 # --enable-cache-report is what puts cached_tokens in the usage payload.
-# No --quantization: on an H200 there is no VRAM reason to, and AWQ's dequant kernels
-# sit inside the prefill time this experiment measures.
+# Unquantized: a second approximation beside the one under test would give a quality
+# difference two candidate causes.
 SGLANG_DISABLE_SUBCONTEXT=$SUBCTX_OFF \
 SGLANG_SUBCONTEXT_ROTATE=$ROT \
 SGLANG_SUBCONTEXT_ROTATE_ACROSS=$ROT_ACROSS \
+SGLANG_SUBCTX_INDEX=$INDEX \
 SGLANG_SUBCTX_TRACE=${SUBCTX_TRACE:-} \
 SGLANG_SUBCTX_ROTATE_GPU=${ROTATE_GPU:-} \
 SGLANG_SUBCTX_AUDIT=${SUBCTX_AUDIT:-} \
@@ -127,5 +118,7 @@ python -u -m sglang.launch_server \
     --context-length "$CTXLEN" \
     --mem-fraction-static 0.9 \
     --enable-cache-report \
-    --tool-call-parser qwen3_coder \
+    --attention-backend "$BACKEND" \
+    --tool-call-parser qwen25 \
+    --reasoning-parser qwen3 \
     > "$SERVER_LOG" 2>&1

@@ -277,6 +277,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Position information
     positions: torch.Tensor = None
+    # Sub-context sparse prefill: the reused KV is scattered through the sequence
+    # rather than sitting in front of it, so attention has to be masked by real
+    # position instead of by index. Set alongside `positions` below.
+    subctx_sparse: bool = False
 
     # For extend
     extend_num_tokens: Optional[int] = None
@@ -478,6 +482,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             and getattr(ret.spec_info, "positions", None) is not None
         ):
             ret.positions = ret.spec_info.positions
+        elif batch.subctx_positions is not None:
+            ret.subctx_sparse = True
+            # Sub-context sparse prefill: the tokens being computed are the gaps
+            # between reused blocks, so their positions are not one ascending run and
+            # cannot be rebuilt from a prefix length. `compute_position` below is
+            # skipped because this is already set.
+            ret.positions = batch.subctx_positions.to(device, non_blocking=True)
 
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():

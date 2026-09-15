@@ -620,6 +620,10 @@ async def server_info():
             "rotate": subctx_config.ROTATE_SUBCONTEXT,
             "rotate_across_recompute": subctx_config.ROTATE_ACROSS_RECOMPUTE,
             "cache_output": subctx_config.CACHE_SUBCONTEXT_OUTPUT,
+            "hash_keys": subctx_config.hash_subcontext_keys(),
+            "index": subctx_config.INDEX_SUBCONTEXTS,
+            "index_dryrun": subctx_config.INDEX_DRYRUN,
+            "min_chunk": subctx_config.MIN_CHUNK_TOKENS,
             # Lets a client tell a stale server apart from the one it just started.
             # A job whose port bind failed leaves the PREVIOUS job serving; the arm
             # flags match, so only something that changed between the two builds can

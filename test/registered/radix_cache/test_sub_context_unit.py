@@ -27,8 +27,14 @@ import unittest
 import torch
 
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
+from sglang.srt.managers.schedule_batch import Req, sub_context_chunk_id
+from sglang.srt.mem_cache.subctx_index import SubContextIndex
+from sglang.srt.utils import subctx_config
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
@@ -1105,6 +1111,364 @@ class TestSubContextTruncation(unittest.TestCase):
         ids, keys = self.clip([[1, 2]], [SYS_KEY], 5, "r")
         self.assertIsNone(ids)
         self.assertIsNone(keys)
+
+
+class TestContentAddressedNamespaces(unittest.TestCase):
+    """Addressing a block by its tokens instead of the role it played.
+
+    A role name is one namespace for every content that ever plays that role, and a
+    namespace is pinned to the position its first occupant was inserted at. So the one
+    block that changes every turn -- the conversation tail -- is frozen out of the
+    cache from request #2 onwards. Content addressing dissolves that: different tokens
+    are a different namespace and carry their own position.
+    """
+
+    def setUp(self):
+        self._saved = subctx_config.HASH_SUBCONTEXT_KEYS
+
+    def tearDown(self):
+        subctx_config.HASH_SUBCONTEXT_KEYS = self._saved
+
+    def test_role_names_are_replaced_by_the_block_contents(self):
+        subctx_config.HASH_SUBCONTEXT_KEYS = True
+        blocks = [[1, 2, 3], [7, 8, 9]]
+        req = make_req("r1", blocks, [SYS_KEY, MSG_KEY])
+
+        self.assertNotIn(SYS_KEY, req.sub_context_extra_keys)
+        self.assertNotIn(MSG_KEY, req.sub_context_extra_keys)
+        self.assertEqual(
+            req.sub_context_extra_keys,
+            [sub_context_chunk_id(block, None) for block in blocks],
+        )
+
+        # The same tokens in another request are the same namespace -- that is what
+        # makes a block found at all -- and different tokens never are.
+        same = make_req("r2", [[1, 2, 3], [4, 5, 6]], [SYS_KEY, MSG_KEY])
+        self.assertEqual(same.sub_context_extra_keys[0], req.sub_context_extra_keys[0])
+        self.assertNotEqual(same.sub_context_extra_keys[1], req.sub_context_extra_keys[1])
+
+    def test_the_adapter_reaches_the_block_keys(self):
+        """``extra_key`` carries cache_salt with lora_id concatenated onto it.
+
+        The role names dropped it, so one adapter's KV was served to a request using
+        another -- the same tokens do not produce the same keys and values under a
+        different adapter.
+        """
+        subctx_config.HASH_SUBCONTEXT_KEYS = True
+        blocks = [[1, 2, 3], [7, 8, 9]]
+        plain = make_req("r1", blocks, [SYS_KEY, MSG_KEY])
+        salted = Req(
+            rid="r2",
+            origin_input_text="",
+            origin_input_ids=[tok for b in blocks for tok in b],
+            sampling_params=SamplingParams(max_new_tokens=8),
+            sub_context_ids=blocks,
+            sub_context_extra_keys=[SYS_KEY, MSG_KEY],
+            lora_id="adapter-a",
+        )
+        self.assertNotEqual(plain.sub_context_extra_keys, salted.sub_context_extra_keys)
+
+    def test_a_block_that_grew_is_no_longer_frozen_out(self):
+        """The failure content addressing exists to fix.
+
+        Turn 1 files its tail at offset 6. Turn 2's tail extends it but starts at
+        offset 4, and under one shared namespace the write path finds the earlier
+        canonical position, refuses the block, and goes on refusing it for the rest of
+        the conversation -- so the only block worth caching never is.
+        """
+        first_blocks = [[1, 2, 3, 4, 5, 6], [50, 51, 52, 53]]
+        grown_blocks = [[1, 2, 3, 4], [50, 51, 52, 53, 54, 55]]
+
+        def run(hashed):
+            subctx_config.HASH_SUBCONTEXT_KEYS = hashed
+            cache, pool, _ = make_cache()
+            first = make_req("r1", first_blocks, [SYS_KEY, MSG_KEY])
+            prefill(cache, pool, first, first_slot=100)
+            decode_and_finish(cache, pool, first, [], first_slot=200)
+            second = make_req("r2", grown_blocks, [SYS_KEY, MSG_KEY], req_pool_idx=1)
+            prefill(cache, pool, second, first_slot=300)
+            return second.sub_context_tree_owned
+
+        self.assertEqual(run(hashed=False)[1], False)
+        self.assertEqual(run(hashed=True)[1], True)
+
+
+
+class TestScanCeiling(unittest.TestCase):
+    """What a content scan finds that a prefix-only reuse cannot reach.
+
+    The stitch can only hand prefill a run starting at position 0, so the moment one
+    block misses, every block behind it is refused however well it is cached. Scanning
+    the prompt against the index finds those blocks wherever they sit. The dry run
+    measures the gap without changing what the server does, which is what makes it
+    worth running on a real workload before the prefill path is touched.
+    """
+
+    def setUp(self):
+        self._saved = (subctx_config.HASH_SUBCONTEXT_KEYS, subctx_config.INDEX_DRYRUN)
+        subctx_config.HASH_SUBCONTEXT_KEYS = True
+        subctx_config.INDEX_DRYRUN = True
+
+    def tearDown(self):
+        subctx_config.HASH_SUBCONTEXT_KEYS, subctx_config.INDEX_DRYRUN = self._saved
+
+    def test_a_block_behind_a_miss_is_found_but_unreachable(self):
+        head = [1, 2, 3, 4, 5, 6]
+        other_head = [101, 102, 103, 104]
+        block = list(range(500, 540))
+
+        cache, pool, _ = make_cache()
+        cache.sub_context_index = SubContextIndex(min_chunk_tokens=32)
+
+        first = make_req("r1", [head, block], [SYS_KEY, MSG_KEY])
+        prefill(cache, pool, first, first_slot=100)
+        decode_and_finish(cache, pool, first, [], first_slot=300)
+        # The head is below the minimum worth reusing; only the block is indexed.
+        self.assertEqual(len(cache.sub_context_index), 1)
+
+        second = make_req("r2", [other_head, block], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        second.init_next_round_input(cache)
+        self.addCleanup(second.release_sub_context_match_locks, cache)
+
+        index = cache.sub_context_index
+        # Contiguity broke on the first block, so the stitch reached nothing at all --
+        # and the block behind it is cached, findable, and 2 tokens from where it was
+        # computed.
+        self.assertEqual(len(second.prefix_indices), 0)
+        self.assertEqual(index.found_tokens, len(block))
+        self.assertEqual(index.resident_tokens, len(block))
+        self.assertEqual(index.displaced_tokens, len(block))
+        self.assertEqual(index.beyond_stitch_tokens, len(block))
+
+    def test_an_evicted_block_is_found_but_not_counted(self):
+        """A scan hit whose KV is gone buys nothing, and counting it would overstate
+        the ceiling -- so every hit is looked up for real before it is tallied."""
+        head = [1, 2, 3, 4, 5, 6]
+        block = list(range(500, 540))
+
+        cache, pool, _ = make_cache()
+        cache.sub_context_index = SubContextIndex(min_chunk_tokens=32)
+        first = make_req("r1", [head, block], [SYS_KEY, MSG_KEY])
+        prefill(cache, pool, first, first_slot=100)
+        decode_and_finish(cache, pool, first, [], first_slot=300)
+
+        cache.evict(EvictParams(num_tokens=10**6))
+        # Eviction told the index, so the chunk is not even scanned for any more.
+        self.assertEqual(len(cache.sub_context_index), 0)
+
+        second = make_req("r2", [[101, 102], block], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        second.init_next_round_input(cache)
+        self.addCleanup(second.release_sub_context_match_locks, cache)
+        self.assertEqual(cache.sub_context_index.resident_tokens, 0)
+        self.assertEqual(cache.sub_context_index.beyond_stitch_tokens, 0)
+
+
+
+def tree_slot_owners(cache):
+    """Every slot the tree holds, and which namespaces claim it.
+
+    A slot with two claimants is the worst failure this mechanism can produce: evict
+    either owner and the survivor goes on serving KV the pool has handed to someone
+    else. It is silent -- no crash, no NaN -- so it has to be asserted, not observed.
+    """
+    owners = {}
+    stack = [(child, key[0] if isinstance(key, tuple) else None)
+             for key, child in cache.root_node.children.items()]
+    while stack:
+        node, namespace = stack.pop()
+        for slot in node.value.tolist():
+            owners.setdefault(slot, set()).add(namespace)
+        for key, child in node.children.items():
+            stack.append((child, namespace))
+    return owners
+
+
+def wide_pool(pool, width: int = 512):
+    """The default fake row is 64 tokens; these prompts are longer."""
+    pool.req_to_token = torch.zeros((4, width), dtype=torch.int64)
+    return pool
+
+
+class TestScanDrivenReuse(unittest.TestCase):
+    """Reuse that does not have to be a prefix.
+
+    The stitch can only hand prefill a run starting at position 0, so the first block
+    that misses discards every block behind it. Scanning finds each block wherever it is
+    cached and the prefill computes the gaps, which is what these exercise -- along with
+    the accounting that has to hold while it does.
+    """
+
+    HEAD_A = list(range(1, 41))
+    HEAD_B = list(range(900, 910))
+    TAIL = list(range(500, 540))
+    MORE = list(range(700, 740))
+
+    def setUp(self):
+        self._saved = (
+            subctx_config.HASH_SUBCONTEXT_KEYS,
+            subctx_config.INDEX_SUBCONTEXTS,
+        )
+        subctx_config.HASH_SUBCONTEXT_KEYS = True
+        subctx_config.INDEX_SUBCONTEXTS = True
+
+    def tearDown(self):
+        (
+            subctx_config.HASH_SUBCONTEXT_KEYS,
+            subctx_config.INDEX_SUBCONTEXTS,
+        ) = self._saved
+
+    def _seeded(self, first_blocks):
+        cache, pool, allocator = make_cache(rotator=FakeRotator())
+        wide_pool(pool)
+        cache.sub_context_index = SubContextIndex(min_chunk_tokens=32)
+        first = make_req("r1", first_blocks, [SYS_KEY, MSG_KEY])
+        prefill(cache, pool, first, first_slot=100)
+        decode_and_finish(cache, pool, first, [], first_slot=400)
+        return cache, pool, allocator
+
+    def test_a_block_behind_a_miss_is_reused_where_it_lands(self):
+        """The whole point. The head changes, so the stitch reaches nothing; the block
+        behind it is cached, 30 positions from where it was computed, and reusable."""
+        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
+
+        second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        second.init_next_round_input(cache)
+        self.addCleanup(second.release_sub_context_match_locks, cache)
+
+        # Reused at 10, computed at 40: rotated by -30, and every token of it taken
+        # except the last, which prefill must run to produce logits.
+        self.assertEqual(
+            [(start, end) for start, end, _ in second.sub_context_layout], [(10, 49)]
+        )
+        self.assertEqual(len(second.prefix_indices), 39)
+        self.assertEqual(cache.kv_rotator.calls[-1][2], -30)
+
+    def test_a_run_reused_only_in_part_is_never_filed(self):
+        """A trimmed run's tokens are a prefix of the chunk holding them, so they
+        address a different namespace. Filing it there would give one set of slots two
+        owners, so the block is marked and both insert paths skip it."""
+        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
+        second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        second.init_next_round_input(cache)
+        self.addCleanup(second.release_sub_context_match_locks, cache)
+
+        # [short head, the 39 reused tokens, the one token left to compute]
+        self.assertEqual([len(b) for b in second.sub_context_ids], [10, 39, 1])
+        self.assertEqual(second.sub_context_no_insert, [True, True, True])
+
+    def test_a_grown_tail_reuses_its_earlier_self(self):
+        """The agent case: this turn's conversation contains last turn's.
+
+        Content addressing is what makes it findable -- the two are different chunks, so
+        probing this turn's address would never turn up last turn's -- and re-cutting is
+        what keeps it affordable, since the new work is stored as its own chunk rather
+        than as another copy of everything before it.
+        """
+        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
+
+        grown = make_req(
+            "r2", [self.HEAD_A, self.TAIL + self.MORE], [SYS_KEY, MSG_KEY], req_pool_idx=1
+        )
+        grown.init_next_round_input(cache)
+        self.addCleanup(grown.release_sub_context_match_locks, cache)
+
+        # The head is at its own position and the tail's earlier self right behind it;
+        # only the 40 new tokens are left to compute.
+        self.assertEqual(
+            [(start, end) for start, end, _ in grown.sub_context_layout],
+            [(0, 40), (40, 80)],
+        )
+        self.assertEqual(len(grown.prefix_indices), 80)
+        self.assertEqual([len(b) for b in grown.sub_context_ids], [40, 40, 40])
+
+    def test_no_slot_ends_up_with_two_owners(self):
+        """The regression this design exists to prevent.
+
+        Reusing a run from chunk X inside a larger block, then filing that block under
+        its own address, hands X's slots to a second namespace -- and the first eviction
+        of either then frees KV the other is still serving. Re-cutting the prompt around
+        what was found is what makes the block's address and its slots' namespace the
+        same one.
+        """
+        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
+
+        grown = make_req(
+            "r2", [self.HEAD_A, self.TAIL + self.MORE], [SYS_KEY, MSG_KEY], req_pool_idx=1
+        )
+        prefill(cache, pool, grown, first_slot=1000)
+        decode_and_finish(cache, pool, grown, [], first_slot=2000)
+
+        shared = {
+            slot: owners
+            for slot, owners in tree_slot_owners(cache).items()
+            if len(owners) > 1
+        }
+        self.assertEqual(shared, {}, f"slots claimed by two namespaces: {shared}")
+
+    def test_a_trimmed_run_at_its_own_position_is_not_freed(self):
+        """The case where a trimmed block's slots belong to the tree.
+
+        When the run is already at the position it was computed for there is nothing to
+        rotate, so it is reused in place and those slots are a node's. The block is then
+        cut short to leave prefill a token, which gives it an address no namespace was
+        ever filed under -- and the free path asks the tree who holds a slot before
+        giving it back. Asked under that address it would find nothing and hand the
+        node's own KV to the pool, which reissues it while the node goes on serving it.
+        """
+        cache, pool, allocator = self._seeded([self.HEAD_A, self.TAIL])
+        cached = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(self.TAIL, sub_context_chunk_id(self.TAIL, None))
+            )
+        ).device_indices.tolist()
+        self.assertEqual(len(cached), len(self.TAIL))
+
+        # The same prompt again: the tail is at its own position, so delta is zero and
+        # the slots handed to this request are the node's.
+        again = make_req("r2", [self.HEAD_A, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        again.init_next_round_input(cache)
+        self.assertEqual(again.sub_context_no_insert[1], True)
+        self.assertEqual(again.sub_context_source_key[1], sub_context_chunk_id(self.TAIL, None))
+        self.assertEqual(cache.kv_rotator.calls, [], "nothing to rotate at delta zero")
+
+        prefill(cache, pool, again, first_slot=1000)
+        decode_and_finish(cache, pool, again, [], first_slot=2000)
+
+        returned = set(allocator.freed)
+        self.assertEqual(
+            returned & set(cached),
+            set(),
+            "gave back slots the tree is still serving",
+        )
+
+    def test_the_stitch_leaves_no_layout_behind(self):
+        """Both paths write the same fields, and the batch reads `sub_context_layout` to
+        decide the shape of the whole pass. A layout left over from a scan that was then
+        abandoned would place freed slots into req_to_token."""
+        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
+        second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        second.init_next_round_input(cache)
+        self.assertIsNotNone(second.sub_context_layout)
+        second.release_sub_context_match_locks(cache)
+
+        second._stitch_sub_contexts(cache)
+        self.addCleanup(second.release_sub_context_match_locks, cache)
+        self.assertIsNone(second.sub_context_layout)
+        self.assertIsNone(second.sub_context_no_insert)
+
+    def test_the_positions_left_to_compute_are_the_gaps(self):
+        """What prefill is handed: the complement of the layout, ascending, ending at
+        the last position -- whose logits become the next token."""
+        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
+        second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        second.init_next_round_input(cache)
+        self.addCleanup(second.release_sub_context_match_locks, cache)
+
+        fresh = second.sub_context_fresh_positions()
+        self.assertEqual(fresh, list(range(0, 10)) + [49])
+        self.assertEqual(len(fresh), second.extend_input_len)
+        self.assertEqual(fresh[-1], len(second.origin_input_ids) - 1)
+
 
 
 if __name__ == "__main__":
