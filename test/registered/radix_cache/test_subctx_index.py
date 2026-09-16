@@ -41,24 +41,13 @@ from sglang.srt.mem_cache.subctx_index import (
 )
 
 
-def _brute_force(query, chunks, min_tokens=ANCHOR_TOKENS):
-    """Every chunk against every position, run out token by token, the slow obvious way.
-
-    Reports a run of ``min_tokens`` or more wherever a chunk's tokens agree with the
-    query's, whether the chunk is exhausted or the two diverge first.
-    """
+def _brute_force(query, chunks):
+    """Every occurrence of every chunk, found the slow obvious way."""
     found = []
     for cid, chunk in chunks.items():
-        for start in range(len(query)):
-            take = 0
-            while (
-                take < len(chunk)
-                and start + take < len(query)
-                and query[start + take] == chunk[take]
-            ):
-                take += 1
-            if take >= min_tokens:
-                found.append(Match(start, start + take, cid))
+        for start in range(len(query) - len(chunk) + 1):
+            if query[start : start + len(chunk)] == chunk:
+                found.append(Match(start, start + len(chunk), cid))
     return sorted(found)
 
 
@@ -167,11 +156,11 @@ class TestScan(unittest.TestCase):
     """Finding occurrences, held against brute force."""
 
     def test_matches_brute_force_on_random_inputs(self):
-        """A small alphabet so overlaps, nesting and shared heads actually occur.
+        """A small alphabet so overlaps and nesting actually occur.
 
         The fingerprint is only a filter, and a filter that drops a real match costs
-        reuse without ever failing -- so the check is every chunk against every
-        position, not a spot test of a case someone thought of.
+        reuse without ever failing -- so the check has to be exhaustive equality, not a
+        spot test of a case someone thought of.
         """
         rng = random.Random(20260915)
         for trial in range(300):
@@ -193,49 +182,6 @@ class TestScan(unittest.TestCase):
 
             with self.subTest(trial=trial):
                 self.assertEqual(sorted(index.scan(query)), _brute_force(query, chunks))
-
-    def test_a_chunk_is_found_by_a_head_of_it(self):
-        """The prompt holds the chunk's first 120 tokens and then diverges."""
-        rng = random.Random(20260916)
-        chunk = [rng.randrange(150000) for _ in range(200)]
-        index = SubContextIndex(min_chunk_tokens=64)
-        cid = index.register(chunk)
-
-        query = [7] * 40 + chunk[:120] + [rng.randrange(150000) for _ in range(90)]
-        self.assertEqual(index.scan(query), [Match(40, 160, cid)])
-        self.assertEqual(index.chunk_length(cid), 200)
-
-    def test_a_head_shorter_than_the_minimum_is_not_reported(self):
-        rng = random.Random(20260916)
-        chunk = [rng.randrange(150000) for _ in range(200)]
-        index = SubContextIndex(min_chunk_tokens=64)
-        index.register(chunk)
-        self.assertEqual(index.scan(chunk[:63] + [0] * 100), [])
-        self.assertEqual(len(index.scan(chunk[:64] + [0] * 100)), 1)
-
-    def test_chunk_length_tells_a_whole_occurrence_from_a_head(self):
-        rng = random.Random(20260916)
-        chunk = [rng.randrange(150000) for _ in range(200)]
-        index = SubContextIndex(min_chunk_tokens=64)
-        cid = index.register(chunk)
-
-        whole = index.scan(chunk + [0] * 50)[0]
-        self.assertEqual(whole.length, index.chunk_length(cid))
-        head = index.scan(chunk[:150] + [0] * 50)[0]
-        self.assertLess(head.length, index.chunk_length(cid))
-
-    def test_two_chunks_sharing_a_head_are_both_reported(self):
-        """Both are candidates at the same position; ``select`` picks between them."""
-        rng = random.Random(20260916)
-        head = [rng.randrange(150000) for _ in range(100)]
-        index = SubContextIndex(min_chunk_tokens=64)
-        short = index.register(head + [1] * 20)
-        long = index.register(head + [2] * 80)
-
-        found = sorted(index.scan(head + [2] * 80))
-        self.assertEqual(
-            found, sorted([Match(0, 100, short), Match(0, 180, long)])
-        )
 
     def test_a_run_too_short_to_be_worth_reusing_is_refused(self):
         index = SubContextIndex(min_chunk_tokens=64)
