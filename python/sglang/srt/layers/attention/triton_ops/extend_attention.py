@@ -700,6 +700,7 @@ def _fwd_kernel_unified(
     prefix_lens,
     mask_ptr,
     mask_indptr,
+    q_pos_ptr,
     sink_ptr,
     window_start_pos,
     sm_scale,
@@ -724,6 +725,7 @@ def _fwd_kernel_unified(
     BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
+    USE_POSITION_MASK: tl.constexpr,
     HAS_SINK: tl.constexpr,
 ):
     """
@@ -791,6 +793,16 @@ def _fwd_kernel_unified(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
+    # This block's query positions, read once: entry j of the gather list is position j,
+    # so the causal test against them is the same for every tile.
+    if USE_POSITION_MASK:
+        q_pos = tl.load(
+            q_pos_ptr + cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m,
+            mask=mask_m,
+            other=0,
+        )
+        q_pos_hi = tl.max(q_pos, axis=0)
+
     # Unified loop: process all KV tokens (prefix + extend)
     for start_n in range(0, cur_seq_kv_len, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -811,6 +823,11 @@ def _fwd_kernel_unified(
                 other=0,
             )
             final_mask &= custom_mask
+
+        # Positions, not indices: a sparse prefill's queries sit at positions the
+        # kernel's index-based causal rule would place them elsewhere.
+        if USE_POSITION_MASK:
+            final_mask &= q_pos[:, None] >= (start_n + offs_n)[None, :]
 
         # Apply causal mask for extend part
         if IS_CAUSAL and not USE_CUSTOM_MASK:
@@ -849,7 +866,10 @@ def _fwd_kernel_unified(
 
         # Check if we can skip this tile
         SKIP_TILE = False
-        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
+        if USE_POSITION_MASK:
+            # Every position in the tile is ahead of every query in this block.
+            SKIP_TILE = q_pos_hi < start_n
+        elif USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
@@ -952,6 +972,7 @@ def extend_attention_fwd_unified(
     max_len_extend,
     custom_mask=None,
     mask_indptr=None,
+    q_positions=None,
     sm_scale=None,
     logit_cap=0.0,
     is_causal=True,
@@ -975,6 +996,10 @@ def extend_attention_fwd_unified(
         max_len_extend: Maximum extend length
         custom_mask: Custom attention mask (for speculative decoding tree attention)
         mask_indptr: Mask offsets [batch_size + 1]
+        q_positions: Position of every query token [num_tokens], replacing the causal
+                     rule with "this query's position >= this key's index". The kernel
+                     compares against it in registers, so it costs no mask to hold and
+                     lets a tile every query is behind be skipped outright.
         sm_scale: Softmax scale
         logit_cap: Logit capping value
         is_causal: Whether to apply causal mask
@@ -996,6 +1021,7 @@ def extend_attention_fwd_unified(
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
     USE_CUSTOM_MASK = custom_mask is not None
+    USE_POSITION_MASK = q_positions is not None
     HAS_SINK = sinks is not None
 
     # For sliding window attention, window_start_pos tracks the absolute position
@@ -1022,6 +1048,7 @@ def extend_attention_fwd_unified(
         prefix_lens,
         custom_mask,
         mask_indptr,
+        q_positions,
         sinks,
         window_start_pos,
         sm_scale,
@@ -1046,6 +1073,7 @@ def extend_attention_fwd_unified(
         Lv=Lv,
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+        USE_POSITION_MASK=USE_POSITION_MASK,
         HAS_SINK=HAS_SINK,
         num_warps=num_warps,
         num_stages=num_stages,

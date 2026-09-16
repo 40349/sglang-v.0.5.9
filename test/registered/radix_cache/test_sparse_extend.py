@@ -2,13 +2,17 @@
 GPU test for the attention a sub-context sparse prefill runs.
 
 The claim under test: when reused blocks sit wherever the prompt puts them, a prefill
-can still be exact. Everything about that rests on the mask. The kernel's own causal
-rule compares *indices* -- query i may see key i and everything before it -- and a
-sparse prefill breaks that correspondence, because its queries are the gaps between
-reused blocks and are not at the indices their positions imply. So causality is handed
-over to an explicit mask, and if that mask is wrong attention still returns a number.
+can still be exact. Everything about that rests on the causal rule. The kernel's own
+compares *indices* -- query i may see key i and everything before it -- and a sparse
+prefill breaks that correspondence, because its queries are the gaps between reused
+blocks and are not at the indices their positions imply. So the kernel is given each
+query's position instead, and if that rule is wrong attention still returns a number.
 
-Two properties, because a mask can fail in two directions:
+The same rule can be handed over as a materialised ``custom_mask`` or as ``q_positions``
+for the kernel to compare against itself. Production uses the second; the two are held
+against each other below.
+
+Two properties, because the rule can fail in two directions:
 
 - too strict, and a query misses keys it should have attended to. Caught by comparing
   against a reference that attends by position.
@@ -68,7 +72,12 @@ class TestSparsePositionCausalAttention(unittest.TestCase):
             raise unittest.SkipTest("needs a GPU")
         torch.manual_seed(20260915)
 
-    def _run(self, kv_len, positions, heads=4, kv_heads=4, dim=64, k=None, v=None):
+    def _run(
+        self, kv_len, positions, heads=4, kv_heads=4, dim=64, k=None, v=None,
+        mode="positions",
+    ):
+        """``mode`` picks how the causal rule reaches the kernel: as ``q_positions``,
+        which is what production passes, or as a materialised ``custom_mask``."""
         device = "cuda"
         dtype = torch.bfloat16
         if k is None:
@@ -79,6 +88,7 @@ class TestSparsePositionCausalAttention(unittest.TestCase):
         q = torch.randn(len(positions), heads, dim, dtype=dtype, device=device)
         o = torch.empty_like(q)
         scale = dim**-0.5
+        by_mask = mode == "mask"
 
         extend_attention_fwd_unified(
             q,
@@ -95,10 +105,15 @@ class TestSparsePositionCausalAttention(unittest.TestCase):
             # the mask replaces.
             prefix_lens=torch.zeros(1, dtype=torch.int32, device=device),
             max_len_extend=len(positions),
-            custom_mask=position_causal_mask(positions, kv_len),
-            mask_indptr=torch.tensor(
-                [0, len(positions) * kv_len], dtype=torch.int64, device=device
+            custom_mask=position_causal_mask(positions, kv_len) if by_mask else None,
+            mask_indptr=(
+                torch.tensor(
+                    [0, len(positions) * kv_len], dtype=torch.int64, device=device
+                )
+                if by_mask
+                else None
             ),
+            q_positions=None if by_mask else positions,
             sm_scale=scale,
             is_causal=False,
         )
@@ -126,6 +141,21 @@ class TestSparsePositionCausalAttention(unittest.TestCase):
         q, k, v, o, pos, scale = self._run(kv_len, positions, heads=8, kv_heads=2)
         want = reference_attention(q, k, v, pos, scale)
         torch.testing.assert_close(o.float(), want, rtol=2e-2, atol=2e-2)
+
+    def test_positions_and_a_materialised_mask_agree(self):
+        """Both ways of stating the same rule, over a layout with three gaps.
+
+        Not bit-identical: the two reach ``tl.where`` with a uint8 and a bool condition
+        and round differently, a couple of elements by an ulp of bfloat16. A rule that
+        actually differed would move many elements, not two.
+        """
+        kv_len = 300
+        positions = list(range(0, 40)) + list(range(90, 150)) + list(range(260, 300))
+        torch.manual_seed(1)
+        _, _, _, by_pos, _, _ = self._run(kv_len, positions)
+        torch.manual_seed(1)
+        _, _, _, by_mask, _, _ = self._run(kv_len, positions, mode="mask")
+        torch.testing.assert_close(by_pos, by_mask, rtol=1e-2, atol=1e-3)
 
     def test_a_query_cannot_see_past_its_own_position(self):
         """The direction a reference comparison alone would not catch.

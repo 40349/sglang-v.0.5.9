@@ -45,6 +45,8 @@ class ForwardMetadata:
     qo_indptr: torch.Tensor
     custom_mask: torch.Tensor
     mask_indptr: torch.Tensor
+    # Position of every query token, for the sparse path's causal rule
+    q_positions: torch.Tensor
     # Sliding window
     window_kv_indptr: torch.Tensor
     window_kv_indices: torch.Tensor
@@ -240,6 +242,7 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_indices = None
         window_num_kv_splits = None
         window_kv_offsets = None
+        q_positions = None
         spec_info = forward_batch.spec_info
 
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -377,9 +380,8 @@ class TritonAttnBackend(AttentionBackend):
             # The KV for this request is its whole prompt, in position order, because
             # `req_to_token` is indexed by position -- so entry j of the gather list is
             # position j, and the causal test is just "this query's position >= j".
-            # That is why the mask has to be explicit: the kernel's own causal rule
-            # compares *indices*, and a sparse prefill's queries are not at the indices
-            # their positions would put them at.
+            # The kernel is given the positions and applies that itself; its own causal
+            # rule compares *indices*, which a sparse prefill's queries are not at.
             kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
@@ -399,7 +401,9 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr = self.qo_indptr
             qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
-            custom_mask, mask_indptr = self._build_position_causal_mask(forward_batch)
+            q_positions = forward_batch.positions
+            custom_mask = None
+            mask_indptr = None
             max_extend_len = max(forward_batch.extend_seq_lens_cpu)
             attn_logits = None
             attn_lse = None
@@ -461,49 +465,12 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr,
             custom_mask,
             mask_indptr,
+            q_positions,
             window_kv_indptr,
             window_kv_indices,
             window_num_kv_splits,
             window_kv_offsets,
         )
-
-    def _build_position_causal_mask(self, forward_batch: ForwardBatch):
-        """One byte per (query, key) pair saying whether the key is at or behind it.
-
-        ``mask[q, j] = positions[q] >= j``. The kernel reads it flat, a request at a
-        time, addressed as ``mask_start + q_row * kv_len + kv_col`` -- so the rows are
-        this request's queries in the order they appear in ``input_ids``, and the
-        columns are its prompt positions.
-
-        Materialising it costs ``queries x prompt`` bytes. That is affordable and it is
-        not the endpoint: the same rule is one comparison against the query's position,
-        which the kernel could do itself given the positions. Written out first because
-        a wrong mask is silent -- attention still returns a number -- and a version that
-        can be diffed against a reference is worth more than the bytes.
-        """
-        q_lens = forward_batch.extend_seq_lens_cpu
-        kv_lens = forward_batch.seq_lens_cpu.tolist()
-        sizes = [int(q) * int(k) for q, k in zip(q_lens, kv_lens)]
-
-        mask = torch.empty(sum(sizes), dtype=torch.uint8, device=self.device)
-        offset = 0
-        q_offset = 0
-        for q_len, kv_len, size in zip(q_lens, kv_lens, sizes):
-            q_len, kv_len = int(q_len), int(kv_len)
-            positions = forward_batch.positions[q_offset : q_offset + q_len]
-            keys = torch.arange(kv_len, device=self.device, dtype=positions.dtype)
-            mask[offset : offset + size] = (
-                positions[:, None] >= keys[None, :]
-            ).view(-1)
-            offset += size
-            q_offset += q_len
-
-        mask_indptr = self.mask_indptr[: len(sizes) + 1]
-        mask_indptr[0] = 0
-        mask_indptr[1:] = torch.tensor(
-            sizes, dtype=mask_indptr.dtype, device=self.device
-        ).cumsum(dim=0)
-        return mask, mask_indptr
 
     def _forward_extend_sparse(
         self, q, o, layer, forward_batch: ForwardBatch, logits_soft_cap
@@ -513,8 +480,10 @@ class TritonAttnBackend(AttentionBackend):
         Everything is read through one gather list covering ``[0, seq_len)``, which is
         already materialised: the reused blocks were written into ``req_to_token`` at
         their positions before the pass, and this layer's new KV went into its slots
-        just above. ``prefix_lens`` is zero because the kernel only consults it for the
-        index-based causal rule the mask has replaced.
+        just above. Entry j of that list is position j, so each query's position is the
+        whole causal rule, and the kernel compares against it in registers.
+        ``prefix_lens`` is zero because the kernel only consults it for the index-based
+        rule those positions replace.
         """
         bs = forward_batch.batch_size
         self.extend_attention_fwd_unified(
@@ -527,8 +496,7 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.kv_indices,
             torch.zeros(bs, dtype=torch.int32, device=self.device),
             self.forward_metadata.max_extend_len,
-            custom_mask=self.forward_metadata.custom_mask,
-            mask_indptr=self.forward_metadata.mask_indptr,
+            q_positions=self.forward_metadata.q_positions,
             sm_scale=layer.scaling,
             logit_cap=logits_soft_cap,
             is_causal=False,
@@ -752,6 +720,7 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr,
             custom_mask,
             mask_indptr,
+            None,  # q_positions: the sparse path is EXTEND, never captured
             window_kv_indptr,
             window_kv_indices,
             window_num_kv_splits,
