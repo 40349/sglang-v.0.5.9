@@ -1,7 +1,6 @@
 #!/bin/bash
-# The full sub-context experiment: 2 methods x 2 datasets, each run end to end on BOTH
-# arms -- the split changes model output, so pass@1 has to be scored on both -- plus a
-# replay A/B on the captured request sequence.
+# The full sub-context experiment: 2 methods x 2 datasets, each run end to end on both
+# arms, plus a replay A/B on the captured request sequence.
 #
 # Four stages per combination, each guarded by a marker file so a killed run resumes:
 #   <tag>_on    split ON, end to end. Also records the sequence the A/B replays.
@@ -9,13 +8,13 @@
 #   <tag>_ab    replay that sequence on both arms at a fixed generation length.
 #   <tag>_eval  pass@1 on both arms' results.
 #
-# HumanEval combinations run first: stopping early still leaves a complete result.
+# HumanEval combinations run first.
 set -euo pipefail
 
 REPO=/home/t2503-3090/Desktop/MiaoChen/sglang-v.0.5.9
 OUT=${OUT:-$REPO/ab_out}
-# The stage markers and these logs are this driver's own bookkeeping, so they stay at
-# the top level; run_mas.sh writes captures and results under ab_out/maslab.
+# Stage markers and logs stay at the top level; run_mas.sh writes captures and results
+# under ab_out/maslab.
 MAS_OUT=$OUT/maslab
 LOGS=$OUT/matrix_logs
 mkdir -p "$LOGS"
@@ -50,8 +49,8 @@ for combo in "${COMBOS[@]}"; do
     say "$tag: OFF done"
   else say "$tag: OFF already done, skipping"; fi
 
-  # End to end, not a replay arm: rotation fixes position but not context, so its output
-  # legitimately differs and only a freely-generating run can be scored.
+  # End to end, not a replay arm: rotation changes the output, so it has to be scored
+  # from a freely-generating run.
   if [ -n "${ROTATE:-}" ] && [ ! -f "$OUT/.done_${tag}_rot" ]; then
     say "$tag: end-to-end, split ON + rotation"
     SUBCTX_ROTATE=1 SUBCTX_ROTATE_ACROSS=${ACROSS:-1} \

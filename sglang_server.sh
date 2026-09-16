@@ -14,13 +14,14 @@
 #   ARM=on    split into per-block namespaces (the default)
 #   ARM=rot   + rotate a displaced block into place, + Stage 2
 #   ARM=idx   + find blocks by content anywhere in the prompt, prefill the gaps
+#   ARM=cdc   + cut the blocks on content too, not on the roles the prompt was built from
 #
-# The arm is read once at start, so each arm is a separate job. Read the compute
-# node's address out of the job log: Slurm picks a node, so it changes per submission.
+# The arm is read once at start: one job per arm. The compute node's address is in
+# the job log.
 #
-# Diagnostics, all off by default and all of which make the timings unusable for the
-# A/B: SUBCTX_TRACE=1 (per-match tracing), SUBCTX_AUDIT=1 (leak / ownership check on
-# the finish path), DUMP_TREE=1, ROTATE_GPU=1 (CUDA events around the rotation).
+# Diagnostics, off by default, each one makes the timings unusable for the A/B:
+# SUBCTX_TRACE=1 (per-match tracing), SUBCTX_AUDIT=1 (leak / ownership check on the
+# finish path), DUMP_TREE=1, ROTATE_GPU=1 (CUDA events around the rotation).
 
 set -euo pipefail
 
@@ -31,16 +32,13 @@ MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-30B-A3B}
 CTXLEN=${CTXLEN:-16384}
 ARM=${ARM:-on}
 
-# Pinned for every arm: the idx arm places reused blocks anywhere in the sequence, and
-# triton is the only backend that takes an explicit per-position mask -- the others
-# decide what a query may attend to by comparing indices, which that breaks silently.
+# Pinned for every arm: triton is the only backend that takes a per-position mask.
 BACKEND=${BACKEND:-triton}
 
-# run_swe.sh spells these AUDIT and TRACE; accept both so a habit from one script does
-# not silently disable a diagnostic in the other.
+# run_swe.sh spells these AUDIT and TRACE; accept both.
 SUBCTX_AUDIT=${SUBCTX_AUDIT:-${AUDIT:-}}
 SUBCTX_TRACE=${SUBCTX_TRACE:-${TRACE:-}}
-SPLIT=${SGLANG_SUBCTX_SPLIT:-blocks}
+SPLIT=blocks
 
 ml load miniconda3
 eval "$(conda shell.bash hook)"
@@ -49,7 +47,7 @@ conda activate sglangv59
 export PYTHONPATH=$REPO/python
 export PYTHONNOUSERSITE=1
 
-# Refuse rather than measure the wrong tree.
+# Refuse unless sglang resolves to this checkout.
 RESOLVED=$(python -c "import sglang, inspect; print(inspect.getfile(sglang))")
 case "$RESOLVED" in
   "$REPO"/*) echo "sglang resolves to the fork: $RESOLVED" ;;
@@ -63,22 +61,19 @@ mkdir -p "$WORK_DIR/logs" "$WORK_DIR/traces"
 SUF="${ARM}_${SLURM_JOB_ID:-manual}"
 SERVER_LOG="$WORK_DIR/logs/sglang_${SUF}.log"
 
-# Per-arm switches; everything else about the binary is identical across arms. idx
-# leaves ROT_ACROSS off: Stage 2 rescues a block the contiguity rule stranded, and the
-# index has no contiguity rule.
+# Per-arm switches; everything else about the binary is identical across arms.
 case "$ARM" in
   on)  SUBCTX_OFF=""; ROT=""; ROT_ACROSS=""; INDEX="" ;;
   off) SUBCTX_OFF="1"; ROT=""; ROT_ACROSS=""; INDEX="" ;;
   rot) SUBCTX_OFF=""; ROT="1"; ROT_ACROSS="1"; INDEX="" ;;
   idx) SUBCTX_OFF=""; ROT="1"; ROT_ACROSS=""; INDEX="1" ;;
-  *)   echo "REFUSING: unknown ARM='$ARM' (want on|off|rot|idx)"; exit 1 ;;
+  cdc) SUBCTX_OFF=""; ROT="1"; ROT_ACROSS=""; INDEX="1"; SPLIT="cdc" ;;
+  *)   echo "REFUSING: unknown ARM='$ARM' (want on|off|rot|idx|cdc)"; exit 1 ;;
 esac
 
 NODE_IP=$(hostname -I | awk '{print $1}')
 
-# Refuse if something already answers here. uvicorn does NOT treat a failed bind as
-# fatal: the job stays alive holding a GPU and serving nothing, while a client reaches
-# the OTHER server -- which passes the arm check, because it is the same arm.
+# Refuse if something already serves this port.
 if curl -sf --max-time 5 "http://127.0.0.1:${PORT}/health" > /dev/null 2>&1; then
   echo "REFUSING: something is already serving 127.0.0.1:${PORT} on $(hostname)."
   echo "  A previous sglang job is still up. Its server would take this run's traffic"
@@ -100,11 +95,8 @@ trace:  $WORK_DIR/traces/*_${SUF}.*
 ==========================================
 EOF
 
-# --reasoning-parser qwen3: Qwen3-30B-A3B thinks by default, so without it the <think>
-# block stays in the content the harness scores.
-# --enable-cache-report is what puts cached_tokens in the usage payload.
-# Unquantized: a second approximation beside the one under test would give a quality
-# difference two candidate causes.
+# --reasoning-parser qwen3 keeps the <think> block out of the scored content.
+# --enable-cache-report puts cached_tokens in the usage payload.
 SGLANG_DISABLE_SUBCONTEXT=$SUBCTX_OFF \
 SGLANG_SUBCONTEXT_ROTATE=$ROT \
 SGLANG_SUBCONTEXT_ROTATE_ACROSS=$ROT_ACROSS \
@@ -127,6 +119,6 @@ python -u -m sglang.launch_server \
     --mem-fraction-static 0.9 \
     --enable-cache-report \
     --attention-backend "$BACKEND" \
-    --tool-call-parser qwen25 \
+    --tool-call-parser qwen \
     --reasoning-parser qwen3 \
     > "$SERVER_LOG" 2>&1

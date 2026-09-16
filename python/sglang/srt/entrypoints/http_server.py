@@ -624,9 +624,7 @@ async def server_info():
             "index": subctx_config.INDEX_SUBCONTEXTS,
             "index_dryrun": subctx_config.INDEX_DRYRUN,
             "min_chunk": subctx_config.MIN_CHUNK_TOKENS,
-            # Which boundaries the blocks were cut on. Two arms that differ only here
-            # produce tables that look equally valid, so it has to be checkable from
-            # outside like the rest.
+            # Which boundaries the blocks were cut on.
             "split_mode": subctx_config.SPLIT_MODE,
             "cdc_target": subctx_config.CDC_TARGET_TOKENS,
             "cdc_max": subctx_config.CDC_MAX_TOKENS,

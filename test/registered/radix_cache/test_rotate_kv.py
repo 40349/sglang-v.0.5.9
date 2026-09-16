@@ -267,9 +267,8 @@ class TestDeltaComposableSelfTest(unittest.TestCase):
     def test_a_law_that_changes_with_position_is_rejected(self):
         """Phi3LongRoPE's shape: one inv_freq below a threshold, another above it.
 
-        Near the origin such a cache is indistinguishable from a plain one, which is
-        why the samples reach past 8192 -- a self-test that only probed small deltas
-        would wave this through.
+        Near the origin such a cache is indistinguishable from a plain one, so the
+        samples reach past 8192.
         """
         rope = RotaryEmbedding(self.HEAD, self.HEAD, 40960, 1000000, True, torch.float32)
         other = RotaryEmbedding(self.HEAD, self.HEAD, 40960, 10000, True, torch.float32)

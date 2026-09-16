@@ -105,8 +105,7 @@ def _rotate_copy_kv_kernel(
     x1 = tl.load(k_src + lo, mask=m, other=0.0).to(tl.float32)
     x2 = tl.load(k_src + hi, mask=m, other=0.0).to(tl.float32)
 
-    # Accumulate in fp32: the buffers are bf16, and rounding the product terms
-    # separately would cost more than the single rounding on store.
+    # Accumulate in fp32; the buffers are bf16 and round once, on store.
     y1 = x1 * cos[None, :] - x2 * sin[None, :]
     y2 = x2 * cos[None, :] + x1 * sin[None, :]
 
@@ -204,10 +203,8 @@ class KVRotator:
         self.max_delta = cos_sin_cache.shape[0] - 1
         self.use_native = use_native or not cos_sin_cache.is_cuda
         self.rotated_tokens = 0
-        # Elapsed time is read on a later call, once the end event has completed --
-        # never by synchronising, which would stall the very path being priced. The
-        # last few calls of a run therefore go unreported; over a run of thousands
-        # that is noise, and a blocking read would not be.
+        # Elapsed time is read on a later call, once the end event has completed,
+        # never by synchronising. The last few calls of a run go unreported.
         self._gpu_timer = (
             DeviceTimer(reporter=self._report_gpu)
             if _TIME_ROTATE_GPU and host_timer.armed() and not self.use_native
@@ -253,9 +250,8 @@ class KVRotator:
 
         pool = self.pool
 
-        # Timed here rather than at the call sites: every path that rotates goes
-        # through this method, so one probe prices the whole mechanism and no caller
-        # can be added later that quietly escapes it.
+        # Timed here, not at the call sites: every path that rotates comes through
+        # this method.
         gpu = (
             self._gpu_timer.wrap(metadata={"tokens": n})
             if self._gpu_timer is not None
@@ -296,11 +292,10 @@ class KVRotator:
 def find_rotary_embedding(model) -> Tuple[Optional[object], Optional[str]]:
     """Return the model's single ``RotaryEmbedding``, or why there isn't one.
 
-    Walks the live model rather than ``rotary_embedding._ROPE_DICT`` because that dict
-    is process-global and would also hold a draft model's entry under speculative
-    decoding. All layers share one instance via the ``_ROPE_DICT`` memo, so finding
-    more than one distinct object means the model mixes rotations and a single delta
-    would be wrong for some layer.
+    Walks the live model, not ``rotary_embedding._ROPE_DICT``, which is process-global
+    and holds a draft model's entry too under speculative decoding. All layers share one
+    instance via the ``_ROPE_DICT`` memo, so more than one distinct object means the
+    model mixes rotations and no single delta fits every layer.
 
     Subclasses are deliberately *not* filtered here. Whether a particular RoPE composes
     under a delta is measured at startup by :func:`rope_delta_composable_reason`, which

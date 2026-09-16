@@ -103,8 +103,7 @@ def main() -> int:
     if args.split_mode is not None and sub.get("split_mode") != args.split_mode:
         print(
             f"REFUSING: asked for split_mode={args.split_mode} but the server reports "
-            f"split_mode={sub.get('split_mode')!r}. The two cut the same prompt into "
-            "different blocks, so their hit rates are not comparable.",
+            f"split_mode={sub.get('split_mode')!r}.",
             file=sys.stderr,
         )
         return 1

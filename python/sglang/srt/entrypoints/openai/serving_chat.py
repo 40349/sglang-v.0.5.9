@@ -437,11 +437,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 return None, None
             bounds = [0, *cuts, len(prompt_ids)]
             segments = [prompt_ids[a:b] for a, b in zip(bounds, bounds[1:])]
-            # Named by ordinal only to fill the slot: `Req.__init__` replaces every key
-            # with a hash of that block's own tokens, which `SPLIT_MODE == "cdc"` is
-            # gated on. A content-defined block has no role to be named after, and a
-            # positional name would pin each namespace to the offset it first appeared
-            # at -- the bug the hashing exists to fix.
+            # Placeholder keys: `Req.__init__` replaces each one with a hash of that
+            # block's own tokens.
             return segments, [f"cdc_{i}" for i in range(len(segments))]
 
         n_sys = 0

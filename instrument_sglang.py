@@ -65,8 +65,7 @@ INIT_CALLS = [
 
 TRACER_IMPORT = "from sglang.srt.managers.forward_trace import ForwardTracer"
 
-# The forward-pass CUDA-event hook. Exact-match replacement, so a mismatch is
-# loud rather than silently producing a baseline with no GPU trace.
+# The forward-pass CUDA-event hook. Exact-match replacement: a mismatch is loud.
 FORWARD_HOOK_OLD = """    @contextmanager
     def record_forward_metrics(self: Scheduler, batch: ScheduleBatch):
         if not (self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER):

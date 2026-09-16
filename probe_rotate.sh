@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# One-shot check that sub-context KV rotation is alive and doing what it claims: three
-# requests built so one hits each rotation path (scripts/subcontext_sim/
-# probe_rotate_client.py), plus the per-pass forward trace.
+# One-shot check on sub-context KV rotation: three requests, one per rotation path
+# (scripts/subcontext_sim/probe_rotate_client.py), plus the per-pass forward trace.
 #
 #   ./probe_rotate.sh            rotation on  (both stages)
 #   ROTATE=0 ./probe_rotate.sh   control: same requests, same binary, rotation off
 #
-# Run both -- the control is what makes the numbers mean anything. Diagnostic only:
-# SGLANG_SUBCTX_TRACE sits inside the regions host_timer measures.
+# Run both. Diagnostic only: SGLANG_SUBCTX_TRACE sits inside the regions host_timer
+# measures.
 set -euo pipefail
 
 REPO=/home/t2503-3090/Desktop/MiaoChen/sglang-v.0.5.9
@@ -28,7 +27,7 @@ source /home/t2503-3090/miniconda3/etc/profile.d/conda.sh
 conda activate $ENV
 export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
 
-# See run_mas.sh: the scheduler renames itself and holds the pool.
+# The scheduler renames itself and holds the pool. See run_mas.sh.
 stop() { pkill -TERM -f '[s]glang::|[s]glang\.launch_server' 2>/dev/null || true; sleep 10; }
 trap stop EXIT
 
@@ -47,7 +46,7 @@ nohup python -u -m sglang.launch_server \
   --port $PORT \
   --mem-fraction-static 0.85 \
   > "$LOG" 2>&1 &
-disown   # otherwise the trap's kill prints a job-control "Killed" line
+disown   # keeps the trap's kill from printing a job-control "Killed" line
 
 echo -n "waiting"
 for _ in $(seq 1 300); do
@@ -58,7 +57,7 @@ for _ in $(seq 1 300); do
   echo -n .; sleep 2
 done
 
-# An arm that silently ran without the rotation it is named for still produces numbers.
+# Ask the server whether the rotation is actually on.
 if [ "$ROTATE" = "0" ]; then
   grep -q "Sub-context KV rotation ENABLED" "$LOG" \
     && { echo "REFUSING: the control arm has rotation enabled"; exit 1; }

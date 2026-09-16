@@ -130,9 +130,8 @@ class HostTimer:
             if not self._stages:
                 return
             doc = {"proc": self._proc, "stages": self._snapshot(self._stages)}
-            # Present only once the warm-up marker has been seen. Readers should
-            # prefer it and say so when it is missing, rather than silently
-            # reporting a window that includes warm-up.
+            # Present only once the warm-up marker has been seen; its absence means
+            # the window includes warm-up.
             if self._measured is not None:
                 doc["measured"] = self._snapshot(self._measured)
             self._last_dump = time.perf_counter()

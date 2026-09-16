@@ -1,12 +1,8 @@
 #!/bin/bash
-# Diagnostic replay: why does the contiguity rule discard so much?
+# Diagnostic replay: per-namespace hit lengths, to account for what the contiguity
+# rule discards. On av_he the split matched 265,398 tokens and spent 227,812.
 #
-# On av_he the split matched 265,398 tokens and spent only 227,812. A hit is discarded
-# only when an EARLIER segment missed, so those are messages-block hits gated by the
-# system block -- of which only four distinct ones exist here.
-#
-# SUBCTX_TRACE is ON deliberately, for per-namespace hit lengths. Do not read GPU or
-# host numbers out of this run.
+# SUBCTX_TRACE is ON. Do not read GPU or host numbers out of this run.
 set -euo pipefail
 
 REPO=/home/t2503-3090/Desktop/MiaoChen/sglang-v.0.5.9
@@ -18,8 +14,8 @@ PORT=${PORT:-30000}
 MODEL=${MODEL:-QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ}
 
 source /home/t2503-3090/miniconda3/etc/profile.d/conda.sh
-# `[s]` so this script's own command line cannot match; `sglang::` because the
-# scheduler renames itself and is the process holding the pool. See run_mas.sh.
+# `[s]` so this script's own command line cannot match; `sglang::` is the scheduler,
+# which renames itself and holds the pool.
 pkill -TERM -f '[s]glang::|[s]glang\.launch_server' 2>/dev/null || true
 sleep 10
 conda activate sglangv59

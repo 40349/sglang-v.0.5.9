@@ -837,6 +837,7 @@ ARM_STEMS = (
     ("sub", "sub-context"),
     ("rot", "+ rotation"),
     ("idx", "+ index"),
+    ("cdc", "+ content-cut blocks"),
 )
 
 
@@ -1218,9 +1219,9 @@ def main() -> int:
                    help="directory holding client_/trace_/stage_ files (default .)")
     m.add_argument("--suffix", default="",
                    help="the _<tag>_ab suffix run_mas.sh gave the run's files")
-    m.add_argument("--arms", default="base,sub,rot,idx",
+    m.add_argument("--arms", default="base,sub,rot,idx,cdc",
                    help="which arms to put in the table, comma separated "
-                        "(base, sub, rot, idx). An arm whose files are missing is left "
+                        "(base, sub, rot, idx, cdc). An arm whose files are missing is left "
                         "out either way; this drops one that IS there. Deltas are "
                         "always against the leftmost column")
     m.set_defaults(func=cmd_summary)

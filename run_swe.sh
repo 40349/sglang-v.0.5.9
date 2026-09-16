@@ -4,62 +4,53 @@
 #   ./run_swe.sh record   server records every chat request; you drive swe_test.sh
 #   ./run_swe.sh toggle   replay that capture once per arm and print the tables
 #
-# Arms. Same words as sglang_server.sh and run_mas.sh, so one word means one thing on
-# every box -- in particular `rot` is rotation AND Stage 2 there, so it is here too:
+# Arms. Same words as sglang_server.sh and run_mas.sh; `rot` is rotation and Stage 2
+# in all three:
 #
 #   off  no split at all -- the stock single-namespace radix cache
 #   on   split into per-block namespaces, displaced hits dropped
 #   rot  + rotate a displaced hit to where it is reused, + Stage 2
 #   idx  + find blocks by content anywhere in the prompt, and prefill the gaps
+#   cdc  + cut the blocks on content too, not on the roles the prompt was built from
 #
-# Only off and idx run by default; on and rot are the rungs between them, kept so a
-# question about one mechanism's own contribution can still be answered. idx runs with
-# rotation on either way, so leaving rot out costs the attribution, not the mechanism.
+# Default is "off cdc". on, rot and idx are the rungs between them and run when named.
 #
-#   ARMS="off rot idx" ./run_swe.sh toggle              put the rotation rung back
+#   ARMS="off rot idx cdc" ./run_swe.sh toggle          put the middle rungs back
 #   AUDIT=1 FULL=1 ./run_swe.sh toggle                  correctness pass, timings unusable
 #   REQUESTS=~/work/traces/requests_on_42.jsonl ...     a capture recorded elsewhere
 #   MODEL=... CTXLEN=... ./run_swe.sh ...               a smaller model for a smoke run
 #
-# `toggle` restarts the server per arm and reads the traces it writes locally, so it
-# has to run on the box holding the GPU -- on the H200, from the checkout there.
-# Everything lands in ab_out/swe. MASLab is run_mas.sh.
+# `toggle` restarts the server per arm and reads the traces it writes locally: run it
+# on the box holding the GPU. Output lands in ab_out/swe. MASLab is run_mas.sh.
 set -euo pipefail
 
-# From the script's own location: on the H200 this runs from another checkout, and a
-# hardcoded path would measure whichever sglang that box has.
+# The script's own location, so this measures the checkout it sits in.
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 OUT=${OUT:-$REPO/ab_out/swe}
-# Unquantized: a second approximation beside the one under test would give a quality
-# difference two candidate causes.
 MODEL=${MODEL:-Qwen/Qwen3-30B-A3B}
 PORT=${PORT:-30000}
-CTXLEN=${CTXLEN:-32768}   # 16384 讓 astropy 那題在 16393 tokens 撞牆；KV pool 放得下 32k
-GEN_TOKENS=${GEN_TOKENS:-32}  # replay generates a fixed length so both arms do equal work
-CONC=${CONC:-1}   # requests in flight; 1 keeps the arms reproducible
+CTXLEN=${CTXLEN:-32768}       # the longest SWE-bench prompt measured is 32,996 tokens
+GEN_TOKENS=${GEN_TOKENS:-32}  # fixed generated length per replayed request
+CONC=${CONC:-1}               # requests in flight
 ENV=${ENV:-sglangv59}
-# Empty means "drop the flag". No colon: ${VAR:-x} substitutes for empty too, which
-# would make QUANT= mean "moe_wna16".
+# Empty means "drop the flag". No colon: ${VAR:-x} substitutes for empty too.
 QUANT=${QUANT-}
-TOOL_PARSER=${TOOL_PARSER-qwen25}
+TOOL_PARSER=${TOOL_PARSER-qwen}
 
-ARMS=${ARMS:-"off idx"}
+ARMS=${ARMS:-"off cdc"}
 
-# Pinned for every arm: idx places reused blocks anywhere in the sequence, and triton
-# is the only backend that takes a per-position mask -- the others compare indices.
+# Pinned for every arm: triton is the only backend that takes a per-position mask.
 BACKEND=${BACKEND:-triton}
 
-# The finish-path audits walk the whole tree once per pass, so every GPU number below
-# would price the audit. On for a correctness pass.
+# The finish-path audits walk the whole tree once per pass; the numbers below then
+# include the audit.
 AUDIT=${AUDIT:-}
 
-# Let each request stop where it wants. Off by default because equal work per arm is
-# what makes the timings comparable -- but pinning the length with ignore_eos makes the
-# request that stops during prefill, and so never reaches `cache_unfinished_req`,
-# structurally impossible. That is where the double-free of ed27c8a lived.
+# Let each request stop where it wants instead of pinning the length with ignore_eos.
+# The arms then generate different amounts and the timings stop being comparable.
 FULL=${FULL:-}
 
-# Resolved, not hardcoded: where conda came from a module it is somewhere else.
+# conda.sh, resolved from CONDA_EXE rather than hardcoded.
 if [ -z "${CONDA_SH:-}" ]; then
   _base=${CONDA_EXE:-}; _base=${_base%/bin/conda}
   [ -n "$_base" ] || _base=$(conda info --base 2>/dev/null || true)
@@ -69,7 +60,7 @@ if [ -z "${CONDA_SH:-}" ]; then
     CONDA_SH=/home/t2503-3090/miniconda3/etc/profile.d/conda.sh
   fi
 fi
-# Overridable so a capture sglang_server.sh recorded on the H200 replays in place.
+# Override to replay a capture recorded elsewhere.
 REQUESTS=${REQUESTS:-$OUT/requests.jsonl}
 SWE_TEST=${SWE_TEST:-/home/t2503-3090/Desktop/MiaoChen/swe_bench/swe_test.sh}
 CHECK_ARM=$REPO/scripts/subcontext_sim/check_remote_arm.py
@@ -86,26 +77,25 @@ conda activate $ENV 2>/dev/null || {
   conda env list
   exit 1
 }
-export PYTHONNOUSERSITE=1        # ~/.local has a broken torch dist-info ahead of the env
-export PYTHONUNBUFFERED=1        # stdout is a pipe once the console is teed; see run_mas.sh
+export PYTHONNOUSERSITE=1        # ignore ~/.local
+export PYTHONUNBUFFERED=1
 export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
 
 arm_switches() {
-  # Cleared every time: these are exported, so an arm that does not set one would
-  # otherwise inherit the previous arm's.
-  export SUBCTX_OFF= SUBCTX_ROTATE= SUBCTX_ACROSS= SUBCTX_INDEX=
+  # Cleared every time; an arm that does not set one gets the empty value.
+  export SUBCTX_OFF= SUBCTX_ROTATE= SUBCTX_ACROSS= SUBCTX_INDEX= SUBCTX_SPLIT=blocks
   case "$1" in
     off) export SUBCTX_OFF=1 ;;
     on)  ;;
     rot) export SUBCTX_ROTATE=1 SUBCTX_ACROSS=1 ;;
-    # No Stage 2: it rescues a block the contiguity rule stranded, and the index has none.
     idx) export SUBCTX_ROTATE=1 SUBCTX_INDEX=1 ;;
-    *)   echo "unknown arm '$1'; want any of: off on rot idx"; exit 1 ;;
+    cdc) export SUBCTX_ROTATE=1 SUBCTX_INDEX=1 SUBCTX_SPLIT=cdc ;;
+    *)   echo "unknown arm '$1'; want any of: off on rot idx cdc"; exit 1 ;;
   esac
 }
 
-# The bench names files by stem, an older vocabulary: client_base.json is the off arm,
-# client_sub.json the on arm. The stems are what `summary` looks for.
+# The bench names files by stem: client_base.json is the off arm, client_sub.json the
+# on arm. The stems are what `summary` looks for.
 arm_stem() {
   case "$1" in
     off) echo base ;;
@@ -114,8 +104,7 @@ arm_stem() {
   esac
 }
 
-# Ask the server what it is rather than trusting the switches: an arm that silently ran
-# as another arm still produces a table that looks like a valid comparison.
+# Ask the server what it is rather than trusting the switches.
 verify_arm() {
   local split rotate index
   case "$1" in
@@ -123,10 +112,11 @@ verify_arm() {
     on)  split=true;  rotate=false; index=false ;;
     rot) split=true;  rotate=true;  index=false ;;
     idx) split=true;  rotate=true;  index=true  ;;
+    cdc) split=true;  rotate=true;  index=true  ;;
   esac
   python "$CHECK_ARM" "http://127.0.0.1:$PORT" \
     --split $split --rotate $rotate --index $index \
-    --split-mode "${SGLANG_SUBCTX_SPLIT:-blocks}" \
+    --split-mode "${SUBCTX_SPLIT:-blocks}" \
     --audit "$([ -n "$AUDIT" ] && echo true || echo false)"
 }
 
@@ -146,6 +136,7 @@ launch() {
   SGLANG_SUBCONTEXT_ROTATE=${SUBCTX_ROTATE:-} \
   SGLANG_SUBCONTEXT_ROTATE_ACROSS=${SUBCTX_ACROSS:-} \
   SGLANG_SUBCTX_INDEX=${SUBCTX_INDEX:-} \
+  SGLANG_SUBCTX_SPLIT=${SUBCTX_SPLIT:-blocks} \
   SGLANG_SUBCTX_AUDIT=${AUDIT:-} \
   SGLANG_SUBCTX_TRACE=${SUBCTX_TRACE:-} \
   nohup python -u -m sglang.launch_server \
@@ -174,8 +165,7 @@ stop() {
   sleep 10
 }
 
-# Callers set CLIENT (+ TRACE/STAGE). swe_test.sh sends a different --model than the
-# server really holds, so pin it here.
+# Callers set CLIENT (+ TRACE/STAGE). --model is pinned to what the server holds.
 replay() {
   python $REPO/subcontext_bench.py replay "$REQUESTS" \
     --url http://127.0.0.1:$PORT \
@@ -184,7 +174,7 @@ replay() {
     ${FULL:+--full}
 }
 
-# The tables at the end are the result and are written nowhere else. CONSOLE= disables.
+# The tables at the end are written nowhere else. CONSOLE= disables the tee.
 CONSOLE=${CONSOLE-$OUT/${1:-run}.txt}
 if [ -n "$CONSOLE" ]; then
   echo "### $(date -Is)  $0 ${*:-}  ARMS='$ARMS' BACKEND=$BACKEND AUDIT=${AUDIT:-off} CONC=$CONC GEN_TOKENS=$GEN_TOKENS" >> "$CONSOLE"
@@ -196,7 +186,7 @@ fi
 
 case "${1:-}" in
   record)
-    # Only ever the one this script owns: REQUESTS can point at a capture made elsewhere.
+    # Only ever the capture this script owns.
     [ "$REQUESTS" = "$OUT/requests.jsonl" ] || {
       echo "REFUSING: REQUESTS points at $REQUESTS, which this script did not make."
       echo "  Unset REQUESTS to record a new one into $OUT."
@@ -231,8 +221,8 @@ TXT
       verify_arm "$arm"
       TRACE=$OUT/trace_$stem.jsonl STAGE=$OUT/stage_$stem \
         CLIENT=$OUT/client_$stem.json replay
-      # What the tables cannot show: a request whose work did not fit one prefill pass
-      # gives its reuse back and takes the stitch, which looks like finding nothing.
+      # The index's own counters; a request that did not fit one prefill pass reports
+      # as having found nothing.
       if [ "$arm" = "idx" ]; then
         grep "sub-context index:" $OUT/server_$arm.log | tail -1 || true
       fi

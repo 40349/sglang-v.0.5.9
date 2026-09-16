@@ -9,7 +9,7 @@
 # and Stage 2). `toggle` drives all three itself and refuses to be told one.
 #
 # An arm's results land in ab_out/maslab/<arm>/ named ..._<tag>_<arm>, both halves from
-# $ARM rather than from anything typed. Everything printed is also appended to
+# $ARM. Everything printed is also appended to
 # $OUT/<mode><suffix>.txt; CONSOLE=path moves it, CONSOLE= turns it off.
 #
 # Re-print the summary without re-running, and choose the columns:
@@ -17,12 +17,12 @@
 #   python subcontext_bench.py summary ab_out/maslab --suffix _ag_he_ab --arms base,rot
 #
 # CONC=8 replays with 8 requests in flight, for serving capacity rather than a
-# per-request number; expect the rotation arm to stop reproducing exactly when you do.
+# per-request number.
 #
 # REMOTE SERVER. SERVER_URL runs MASLab here against a server on another box (the
 # H200); ARM must match how that server was started, and `record` reads /server_info
-# and refuses if it does not. `toggle` does NOT work that way -- it restarts the server
-# per arm and reads traces written on its own disk -- so run it on the server box.
+# and refuses if it does not. `toggle` restarts the server per arm and reads traces on
+# its own disk: run it on the server box.
 #
 #   SERVER_URL=http://140.118.202.100:30000 ARM=rot \
 #     METHOD=agentverse MAS_CONFIG= DATASET=humaneval TAG=av_he ./run_mas.sh record
@@ -35,15 +35,13 @@ MODEL=${MODEL:-QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ}
 QUANT=${QUANT-moe_wna16}   # set empty on a box with the VRAM for bf16 weights
 PORT=${PORT:-30000}
 CTXLEN=${CTXLEN:-16384}
-# Decides whether an A/B measures the split or the eviction policy, and is a property
-# of the box: 0.85 leaves a 30B AWQ workable on 24GB, an H200 can take 0.9.
+# 0.85 leaves a 30B AWQ workable on 24GB; an H200 can take 0.9.
 MEMFRAC=${MEMFRAC:-0.85}
-GEN_TOKENS=${GEN_TOKENS:-32}   # replay generates a fixed length so both arms do equal work
-# 1 keeps every arm reproducible and makes the throughput row 1/latency by construction.
+GEN_TOKENS=${GEN_TOKENS:-32}   # fixed generated length per replayed request
+# 1 request in flight; the throughput row is then 1/latency by construction.
 CONC=${CONC:-1}
 ENV=${ENV:-sglangv59}
-# Not one hardcoded path: on the H200 conda arrives through `ml load miniconda3` and
-# sits elsewhere. Ask conda itself, with the 3090 layout as the fallback.
+# Ask conda itself, with the 3090 layout as the fallback.
 if [ -z "${CONDA_SH:-}" ]; then
   _base=${CONDA_EXE:-}; _base=${_base%/bin/conda}
   [ -n "$_base" ] || _base=$(conda info --base 2>/dev/null || true)
@@ -58,13 +56,13 @@ MAS_MODEL=${MAS_MODEL:-Qwen3-Coder-30B-A3B}
 MAS_TEMP=${MAS_TEMP:-0.0}
 
 METHOD=${METHOD:-autogen}
-# `-` not `:-`: an explicitly empty MAS_CONFIG must stay empty. agentverse picks its own
-# config from the dataset, and substituting autogen's config_code is a FileNotFoundError.
+# `-` not `:-`: an explicitly empty MAS_CONFIG stays empty. agentverse picks its own
+# config from the dataset.
 MAS_CONFIG=${MAS_CONFIG-config_code}
 DATASET=${DATASET:-humaneval}
 TAG=${TAG:-}
 
-# Empty => this box runs the server too (the original single-machine setup).
+# Empty: this box runs the server too.
 SERVER_URL=${SERVER_URL:-}
 if [ -n "$SERVER_URL" ]; then REMOTE=1; else REMOTE=0; SERVER_URL=http://127.0.0.1:$PORT; fi
 
@@ -78,13 +76,11 @@ case "$ARM" in
   *)   echo "REFUSING: unknown ARM='$ARM' (want on|off|rot)"; exit 1 ;;
 esac
 
-# Both the directory and the suffix come from $ARM, so nothing typed can put an arm's
-# results anywhere but its own directory: a stale TAG=av_he_rot on an ARM=on run once
-# wrote the on arm over the rot results and left no evidence but an mtime.
+# Both the directory and the suffix come from $ARM, not from TAG.
 [ -z "$ARM" ] || OUT=$OUT/$ARM
 SUF=${TAG:+_$TAG}${ARM:+_$ARM}
 REQUESTS=${REQUESTS:-$OUT/requests$SUF.jsonl}
-INFER=${INFER:-$OUT/infer$SUF.jsonl}   # overridable so a pre-split run can still be scored
+INFER=${INFER:-$OUT/infer$SUF.jsonl}   # override to score a run recorded elsewhere
 
 mkdir -p "$OUT"
 [ -r "$CONDA_SH" ] || {
@@ -98,9 +94,7 @@ conda activate $ENV 2>/dev/null || {
   conda env list
   exit 1
 }
-export PYTHONNOUSERSITE=1        # ~/.local has a broken torch dist-info ahead of the env
-# Teeing made stdout a pipe, and Python block-buffers on a pipe: without this the
-# replay's per-request line goes silent for the whole arm.
+export PYTHONNOUSERSITE=1        # ignore ~/.local
 export PYTHONUNBUFFERED=1
 export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
 
@@ -126,14 +120,12 @@ remote_check() {
     --model "$MAS_MODEL"
 }
 
-# Every process the server spawns, not just the one exec'd: setproctitle renames the
-# scheduler to `sglang::scheduler`, so it no longer matches "sglang.launch_server" --
-# and it is the one holding the weights AND the KV pool. `[s]` stops the pattern
-# matching whatever shell carries it.
+# Every process the server spawns: setproctitle renames the scheduler to
+# `sglang::scheduler`, which holds the weights and the KV pool. `[s]` stops the
+# pattern matching whatever shell carries it.
 SGLANG_PROCS='[s]glang::|[s]glang\.launch_server|[s]glang\.bench|[s]glang\.srt'
 
-# TERM first and then wait: the host timers dump on SIGTERM, and killing the scheduler
-# outright throws away the stage trace this run is measured with.
+# TERM first and then wait: the host timers dump on SIGTERM.
 kill_servers() {
   pkill -TERM -f "$SGLANG_PROCS" 2>/dev/null || true
   for _ in $(seq 1 40); do
@@ -146,9 +138,8 @@ kill_servers() {
   sleep 5
 }
 
-# The UUID of the card this run will actually get, not the node's GPU 0: Slurm hands out
-# devices through CUDA_VISIBLE_DEVICES, and checking the wrong card both refuses good
-# runs and waves through doomed ones. That variable may hold an index or a UUID.
+# The UUID of the card this run gets, read from CUDA_VISIBLE_DEVICES, which may hold
+# an index or a UUID.
 target_gpu_uuid() {
   local first
   first=${CUDA_VISIBLE_DEVICES:-0}
@@ -164,8 +155,7 @@ target_gpu_uuid() {
 require_free_vram() {
   command -v nvidia-smi > /dev/null 2>&1 || return 0
   local uuid row total free need
-  # `|| true` as in report_gpu: a guard on the empty value is unreachable if a non-zero
-  # status aborts the assignment first. Failing to probe means "say nothing".
+  # `|| true` as in report_gpu: failing to probe means say nothing.
   uuid=$(target_gpu_uuid) || true
   [ -n "$uuid" ] || return 0
   row=$(nvidia-smi --query-gpu=uuid,memory.total,memory.free \
@@ -179,8 +169,7 @@ require_free_vram() {
   echo "REFUSING: the GPU this job was given (${uuid}) has ${free} MiB free, but"
   echo "  --mem-fraction-static $MEMFRAC wants ${need} MiB of its ${total} MiB."
   if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
-    # The likeliest cause: nothing scheduled this run onto a card, so it defaulted to
-    # index 0 -- which on a shared box is where everyone else defaulted too.
+    # Nothing scheduled this run onto a card, so it defaulted to index 0.
     echo "  CUDA_VISIBLE_DEVICES is unset, so this fell back to the node's GPU 0."
     echo "  If you meant to run inside a Slurm allocation, you are not in one"
     echo "  (SLURM_JOB_ID=${SLURM_JOB_ID:-unset}); get one, or name a free card"
@@ -205,13 +194,11 @@ require_free_vram() {
   exit 1
 }
 
-# Say which physical card the server actually got. With no Slurm allocation and no
-# CUDA_VISIBLE_DEVICES, sglang falls back to device 0 of the NODE -- on a shared box,
-# the card everyone else without an allocation defaulted onto too.
+# Say which physical card the server got. With no Slurm allocation and no
+# CUDA_VISIBLE_DEVICES, sglang falls back to device 0 of the node.
 report_gpu() {
-  # Every value below is a pipeline inside a command substitution, so under `set -e -o
-  # pipefail` a non-zero status ends the SCRIPT silently and the `[ -n ... ]` guards
-  # never run. A diagnostic must not be able to kill the run it is describing.
+  # Every value below is a pipeline in a command substitution; under `set -e -o
+  # pipefail` a non-zero status would end the script before the `[ -n ... ]` guards run.
   command -v nvidia-smi > /dev/null 2>&1 || { echo "  (no nvidia-smi; GPU not reported)"; return 0; }
   local pid cvd uuid index
   pid=$(pgrep -f '[s]glang::scheduler' | head -1) || true
@@ -229,14 +216,12 @@ report_gpu() {
 }
 
 # Callers set LOG, and optionally CAPTURE / TRACE / STAGE / SUBCTX_* / ROTATE_GPU.
-# ROTATE_GPU=1 fills the summary's [GPU] row at the cost of an event pair per rotation,
-# so take host overhead from a run without it.
+# ROTATE_GPU=1 fills the summary's [GPU] row and adds an event pair per rotation.
 launch() {
   kill_servers
   require_free_vram
-  # `nohup ... &` outlives this shell, Ctrl-C and the salloc that owns the GPU included:
-  # an abandoned toggle once left a scheduler holding 129 GB on a reclaimed card. Armed
-  # here so only a run that started a server tears one down -- a REMOTE record must not.
+  # `nohup ... &` outlives this shell, Ctrl-C included. Armed here so only a run that
+  # started a server tears one down.
   LAUNCHED=1
   if [ -n "${TRACE:-}" ]; then rm -f "$TRACE"; fi
   if [ -n "${STAGE:-}" ]; then rm -f "$STAGE".*; fi
@@ -280,7 +265,7 @@ replay() {
     --model $MODEL --gen-tokens $GEN_TOKENS --concurrency $CONC --save-text
 }
 
-# The trap is installed unconditionally: an interrupted run is the case that leaks.
+# The trap is installed unconditionally.
 LAUNCHED=0
 TEE_PID=
 on_exit() {
@@ -288,15 +273,15 @@ on_exit() {
     echo; echo "cleaning up the server this run started"
     kill_servers
   fi
-  # Last, and only then: closing stdout is what lets `tee` see EOF and flush.
+  # Closing stdout lets `tee` see EOF and flush.
   exec 1>&- 2>&- || true
   [ -n "$TEE_PID" ] && wait "$TEE_PID" 2>/dev/null
   return 0
 }
 trap on_exit EXIT
 
-# A `toggle` costs an hour and its result IS the console output. Appended, not
-# truncated: a re-run on the same tag wants both, and the header says which is which.
+# The console output is the result. Appended, not truncated; the header says which
+# run is which.
 CONSOLE=${CONSOLE-$OUT/${1:-run}$SUF.txt}
 if [ -n "$CONSOLE" ]; then
   {
@@ -305,8 +290,7 @@ if [ -n "$CONSOLE" ]; then
          "CONC=$CONC MEMFRAC=$MEMFRAC GEN_TOKENS=$GEN_TOKENS MODEL=$MODEL"
   } >> "$CONSOLE"
   exec > >(tee -a "$CONSOLE") 2>&1
-  # `tee` outlives the shell's last write, so on_exit waits for it or the summary
-  # tables are missing from the file.
+  # `tee` outlives the shell's last write; on_exit waits for it.
   TEE_PID=$!
   echo "console -> $CONSOLE"
 fi
@@ -314,8 +298,8 @@ fi
 case "${1:-}" in
   record)
     : "${TAG:?set TAG so this capture does not overwrite another combination}"
-    # RESUME keeps both files so MASLab's reserve_unprocessed_queries can pick up where
-    # a killed run stopped; the capture then holds both attempts.
+    # RESUME keeps both files for MASLab's reserve_unprocessed_queries; the capture
+    # then holds both attempts.
     if [ -z "${RESUME:-}" ]; then rm -f "$INFER"; [ "$REMOTE" = 1 ] || rm -f "$REQUESTS"; fi
     if [ "$REMOTE" = 1 ]; then
       # The capture and traces land on the server's disk, where `toggle` needs them.
@@ -326,7 +310,7 @@ case "${1:-}" in
         grep -q "Sub-context split DISABLED" $OUT/server_record$SUF.log \
           || { echo "REFUSING: SUBCTX_OFF set but the split did not report itself disabled"; exit 1; }
       fi
-      # The KV pool size decides whether the A/B measures the split or eviction.
+      # MEMFRAC sets the KV pool size.
       grep -m1 -o "max_total_num_tokens=[0-9]*" $OUT/server_record$SUF.log \
         | tee $OUT/kvpool$SUF.txt || echo "WARNING: could not read KV pool size"
     fi
@@ -338,13 +322,10 @@ case "${1:-}" in
         --model_name $MAS_MODEL \
         --model_temperature $MAS_TEMP \
         --output_path "$INFER" )
-    # A run whose server went away mid-flight still writes a full-length results file
-    # with `None` where the calls failed, and evaluate.py then reports an accuracy over
-    # only the rows it could score. Refuse to call that a recording.
-    #
-    # But an unparseable answer is not that: AgentVerse's parse_solver raises IndexError
-    # on a reply that ran out of tokens mid-fence. The model answered and the method
-    # could not use it -- a real failure every arm has some of, so keep it and score it.
+    # Refuse a run whose server went away mid-flight: it writes a full-length results
+    # file with `None` where the calls failed. An unparseable answer is not that --
+    # AgentVerse's parse_solver raises IndexError on a reply that ran out of tokens
+    # mid-fence -- so keep those and score them.
     python - "$INFER" <<'EOF' || exit 1
 import json, sys
 rows = [json.loads(l) for l in open(sys.argv[1])]
@@ -354,8 +335,7 @@ for r in rows:
         continue
     err = r.get("error") or ""
     calls = sum(v.get("num_llm_calls", 0) for v in (r.get("token_stats") or {}).values())
-    # Classify on the exception TYPE, not on words anywhere in the traceback: matching
-    # bare status codes read "503" out of a source line number and refused a clean run.
+    # Classify on the exception type, not on words anywhere in the traceback.
     tail = [ln for ln in err.strip().splitlines() if ln and not ln[0].isspace()]
     kind = tail[-1].split(":", 1)[0].lower() if tail else ""
     transport = not err or calls == 0 or any(
@@ -402,7 +382,7 @@ EOF
     echo; echo "======== SPLIT OFF ========"
     SUBCTX_OFF=1 LOG=$OUT/server_off$SUF.log \
       TRACE=$OUT/trace_base$SUF.jsonl STAGE=$OUT/stage_base$SUF launch
-    # A baseline that silently ran with the split on still looks like a valid comparison.
+    # Ask the server what it is rather than trusting the switches.
     grep -q "Sub-context split DISABLED" $OUT/server_off$SUF.log \
       || { echo "REFUSING: the split did not report itself disabled"; exit 1; }
     TRACE=$OUT/trace_base$SUF.jsonl STAGE=$OUT/stage_base$SUF \
@@ -414,15 +394,15 @@ EOF
     TRACE=$OUT/trace_sub$SUF.jsonl STAGE=$OUT/stage_sub$SUF \
       CLIENT=$OUT/client_sub$SUF.json replay
 
-    # Only when asked, so the two-arm comparison stays what it was before rotation.
+    # Only when asked.
     if [ -n "${ROTATE:-}" ]; then
       echo; echo "======== SPLIT ON + ROTATE ========"
       SUBCTX_ROTATE=1 SUBCTX_ROTATE_ACROSS=${ACROSS:-} LOG=$OUT/server_rot$SUF.log \
         TRACE=$OUT/trace_rot$SUF.jsonl STAGE=$OUT/stage_rot$SUF launch
       grep -q "Sub-context KV rotation ENABLED" $OUT/server_rot$SUF.log \
         || { echo "REFUSING: rotation did not report itself enabled"; exit 1; }
-      # ACROSS decides whether prefill is cut at block edges, worth ~4.5 pp of hit rate
-      # and ~10% of prefill GPU time, so a run with no record of it cannot be read.
+      # ACROSS decides whether prefill is cut at block edges: ~4.5 pp of hit rate and
+      # ~10% of prefill GPU time.
       want_across=$([ -n "${ACROSS:-}" ] && echo True || echo False)
       grep -q "across-recompute=$want_across" $OUT/server_rot$SUF.log \
         || { echo "REFUSING: asked for ACROSS=${ACROSS:-<unset>} but the server reported"; \
@@ -441,9 +421,8 @@ EOF
     python $REPO/subcontext_bench.py parity \
       $OUT/client_base$SUF.json $OUT/client_sub$SUF.json || true
 
-    # With rotation in the run the headline is baseline vs rotation; the plain split is
-    # the control that separates the plumbing's cost from the rotation's benefit, and it
-    # stays in the sections above. `--arms base,sub,rot` puts its column back.
+    # With rotation in the run the headline is baseline vs rotation. `--arms
+    # base,sub,rot` puts the plain split's column back.
     echo; echo "======== SUMMARY ========"
     python $REPO/subcontext_bench.py summary "$OUT" --suffix "$SUF" \
       ${ROTATE:+--arms base,rot}
@@ -455,8 +434,8 @@ EOF
       python $REPO/subcontext_bench.py report $OUT/trace_base$SUF.jsonl $OUT/trace_rot$SUF.jsonl
       echo; echo "======== ROTATE host cost ========"
       python $REPO/subcontext_bench.py stages $OUT/stage_sub$SUF $OUT/stage_rot$SUF
-      # Rotation fixes the position a block is reused at, not the context it was computed
-      # under, so divergence is expected and is the number to read. pass@1 prices it.
+      # Rotation fixes the position a block is reused at, not the context it was
+      # computed under. pass@1 prices the divergence.
       echo; echo "======== PARITY: rotate vs split (divergence EXPECTED) ========"
       python $REPO/subcontext_bench.py parity \
         $OUT/client_sub$SUF.json $OUT/client_rot$SUF.json || true
@@ -464,8 +443,8 @@ EOF
     ;;
 
   eval)
-    # Separate from toggle on purpose: the replay pins the length with ignore_eos, so
-    # its output is not a real attempt. Quality comes from the record run.
+    # Separate from toggle: the replay pins the length with ignore_eos. Quality comes
+    # from the record run.
     : "${TAG:?set TAG to the run you want scored}"
     [ -s "$INFER" ] || { echo "no results at $INFER; run '$0 record' first"; exit 1; }
     echo ">> scoring $INFER${ARM:+ (arm $ARM)}"
@@ -476,8 +455,7 @@ EOF
         --tested_infer_path "$INFER" \
         --overwrite )
     # evaluate.py leaves eval_score None where the method produced nothing and reports
-    # accuracy over the rest, giving each arm its own denominator -- off 152/160 vs on
-    # 154/163 reverses over the whole set. Unanswered is a failure, so score every row.
+    # accuracy over the rest, giving each arm its own denominator. Score every row.
     python - "$OUT/xverify_eval$SUF.jsonl" <<'EOF'
 import json, os, sys
 p = sys.argv[1]
