@@ -126,6 +126,7 @@ verify_arm() {
   esac
   python "$CHECK_ARM" "http://127.0.0.1:$PORT" \
     --split $split --rotate $rotate --index $index \
+    --split-mode "${SGLANG_SUBCTX_SPLIT:-blocks}" \
     --audit "$([ -n "$AUDIT" ] && echo true || echo false)"
 }
 

@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.subctx_index import (
     SubContextIndex,
     anchor_fingerprints,
     chunk_id,
+    cut_points,
 )
 
 
@@ -274,6 +275,85 @@ class TestSelect(unittest.TestCase):
         wide = [Match(0, 9, "sc:a"), Match(10, 19, "sc:b")]
         overlapping = Match(5, 16, "sc:mid")
         self.assertEqual(SubContextIndex.select(wide + [overlapping]), wide)
+
+
+class TestCutPoints(unittest.TestCase):
+    """Boundaries decided by content, and the bounds that bend that rule."""
+
+    def setUp(self):
+        self.rng = random.Random(20260915)
+
+    def toks(self, n):
+        return [self.rng.randrange(1000, 150000) for _ in range(n)]
+
+    def chunks(self, ids, *a, **kw):
+        cuts = cut_points(ids, *a, **kw)
+        bounds = [0, *cuts, len(ids)]
+        return [ids[x:y] for x, y in zip(bounds, bounds[1:])]
+
+    def test_the_pieces_reassemble_into_the_input(self):
+        """`concat(segments) == prompt_ids` is what the prefill path assumes."""
+        ids = self.toks(20000)
+        for target in (128, 256, 512):
+            flat = [tok for c in self.chunks(ids, target) for tok in c]
+            self.assertEqual(flat, ids)
+
+    def test_a_run_is_cut_the_same_way_wherever_it_sits(self):
+        """The property the whole scheme rests on.
+
+        Only the interior is claimed: the bounds make the first and last boundary of an
+        occurrence depend on where the previous one fell, so those can differ. A
+        content-defined cut in the middle may not.
+        """
+        doc = self.toks(3000)
+        alone = {c for c in cut_points(doc, 256) if 600 < c < len(doc) - 600}
+        self.assertTrue(alone, "test needs a doc long enough to have interior cuts")
+        for _ in range(20):
+            pre = self.toks(self.rng.randrange(0, 4000))
+            full = pre + doc + self.toks(self.rng.randrange(0, 4000))
+            moved = {
+                c - len(pre)
+                for c in cut_points(full, 256)
+                if len(pre) < c < len(pre) + len(doc)
+            }
+            self.assertEqual(
+                {c for c in moved if 600 < c < len(doc) - 600},
+                alone,
+                "the same tokens were cut differently at a different offset",
+            )
+
+    def test_a_quoted_fragment_still_yields_the_chunks_it_yielded_whole(self):
+        """Quoting part of a document is the case roles cannot serve at all."""
+        doc = self.toks(4000)
+        whole = {chunk_id(c) for c in self.chunks(doc, 256) if len(c) >= 64}
+        part = doc[900:3100]
+        shared = whole & {chunk_id(c) for c in self.chunks(part, 256) if len(c) >= 64}
+        self.assertGreater(len(shared), 1)
+
+    def test_bounds_are_respected(self):
+        ids = self.toks(50000)
+        lens = [len(c) for c in self.chunks(ids, 256, 64, 1024)]
+        self.assertGreaterEqual(min(lens), 64)
+        self.assertLessEqual(max(lens), 1024)
+
+    def test_average_chunk_length_tracks_the_target(self):
+        ids = self.toks(60000)
+        for target in (128, 256, 512):
+            lens = [len(c) for c in self.chunks(ids, target, 8, 64 * target)]
+            mean = sum(lens) / len(lens)
+            self.assertGreater(mean, target * 0.5)
+            self.assertLess(mean, target * 2.0)
+
+    def test_nothing_to_cut_is_no_cuts_rather_than_a_useless_one(self):
+        self.assertEqual(cut_points(self.toks(100), 256, 64), [])
+        self.assertEqual(cut_points([], 256), [])
+        self.assertEqual(cut_points(self.toks(5000), 1), [])
+
+    def test_a_short_tail_stays_on_the_chunk_before_it(self):
+        """A stub too short to register would be a namespace no scan may reuse."""
+        for _ in range(10):
+            ids = self.toks(self.rng.randrange(3000, 9000))
+            self.assertGreaterEqual(len(self.chunks(ids, 256, 64, 1024)[-1]), 64)
 
 
 if __name__ == "__main__":

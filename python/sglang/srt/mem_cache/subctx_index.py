@@ -169,6 +169,67 @@ def anchor_fingerprints(ids: np.ndarray) -> np.ndarray:
         return _mix(span * _POW[ANCHOR_TOKENS - 1 : ANCHOR_TOKENS - 1 + windows])
 
 
+
+def cut_points(
+    ids: Sequence[int],
+    target_tokens: int,
+    min_tokens: int = MIN_CHUNK_TOKENS,
+    max_tokens: int = 0,
+) -> List[int]:
+    """Offsets at which to cut ``ids`` into chunks, decided by content.
+
+    A cut is made before position ``i`` when the fingerprint of ``ids[i:i+ANCHOR_TOKENS]``
+    has its low ``log2(target_tokens)`` bits clear -- so whether a position is a boundary
+    depends on the tokens *at* it and nothing else. That is the property the whole scheme
+    needs: the same run of tokens is cut in the same places wherever it appears and
+    whatever precedes it, so a document quoted at a new offset, or quoted in part, still
+    yields the chunks it yielded before. Splitting on message or document boundaries
+    cannot do this -- there a single edit anywhere in a block loses the whole block.
+
+    The bounds are where that guarantee stops being exact. ``min_tokens`` suppresses a
+    cut too close to the last one and ``max_tokens`` forces one that content never
+    produced; both make a boundary depend on where the previous boundary fell, which is
+    history again. The damage is local -- a shifted occurrence loses the chunks either
+    side of a forced cut and keeps the ones between -- and it is why ``max_tokens``
+    should stay well above ``target_tokens``, so forcing stays rare. Measured hit rates
+    will sit below what the pure rule predicts; that gap is this, not a bug.
+
+    ``target_tokens`` is rounded down to a power of two (the rule is a bit mask). A tail
+    shorter than ``min_tokens`` is left on the chunk before it rather than made into a
+    namespace no scan may reuse.
+    """
+    n = len(ids)
+    if target_tokens < 2 or n < 2 * min_tokens:
+        return []
+    if max_tokens <= 0:
+        max_tokens = 4 * target_tokens
+    max_tokens = max(max_tokens, 2 * min_tokens)
+
+    arr = np.asarray(ids, dtype=np.int32)
+    prints = anchor_fingerprints(arr)
+    if prints.shape[0] == 0:
+        return []
+
+    mask = np.uint64((1 << (int(target_tokens).bit_length() - 1)) - 1)
+    cand = np.flatnonzero((prints & mask) == np.uint64(0))
+
+    cuts: List[int] = []
+    last = 0
+    ci = 0
+    n_cand = cand.shape[0]
+    while True:
+        while ci < n_cand and cand[ci] < last + min_tokens:
+            ci += 1
+        nxt = int(cand[ci]) if ci < n_cand else n
+        if nxt - last > max_tokens:
+            nxt = last + max_tokens
+        if n - nxt < min_tokens:
+            break
+        cuts.append(nxt)
+        last = nxt
+    return cuts
+
+
 class _Scope:
     """The chunks registered under one ``extra_key``.
 

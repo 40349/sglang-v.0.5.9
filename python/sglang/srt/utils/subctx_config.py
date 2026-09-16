@@ -62,10 +62,46 @@ INDEX_DRYRUN = os.environ.get("SGLANG_SUBCTX_INDEX_DRYRUN", "") not in ("", "0")
 # others; the default lives with the code that has to justify it.
 MIN_CHUNK_TOKENS = int(os.environ.get("SGLANG_SUBCTX_MIN_CHUNK", "64"))
 
+# Where block boundaries come from.
+#
+#   "blocks"  the roles the prompt was built from -- system / tools / messages. Every
+#             number measured before this switch existed was taken under it, so it
+#             stays the default and the older arms stay comparable.
+#   "cdc"     content decides. A boundary falls where the token window at it hashes
+#             to zero mod the target, so a run of tokens is cut the same way wherever
+#             it appears and whatever precedes it -- which is what lets a document
+#             quoted at a new offset, or quoted in part, still be found. Roles cannot:
+#             one edit anywhere in a block loses the whole block.
+SPLIT_MODE = os.environ.get("SGLANG_SUBCTX_SPLIT", "blocks")
+
+# Average chunk length "cdc" aims for, and the length at which it gives up waiting for
+# a boundary and forces one. Rounded down to a power of two (the rule is a bit mask).
+# Keep MAX well above TARGET: a forced cut is the one boundary content did not choose,
+# so it is also the one a shifted occurrence can fail to reproduce.
+CDC_TARGET_TOKENS = int(os.environ.get("SGLANG_SUBCTX_CDC_TARGET", "256"))
+CDC_MAX_TOKENS = int(os.environ.get("SGLANG_SUBCTX_CDC_MAX", "1024"))
+
 
 def hash_subcontext_keys() -> bool:
     """Whether block namespaces are addressed by content."""
     return HASH_SUBCONTEXT_KEYS or INDEX_SUBCONTEXTS or INDEX_DRYRUN
+
+
+if SPLIT_MODE not in ("blocks", "cdc"):
+    raise ValueError(
+        f"SGLANG_SUBCTX_SPLIT={SPLIT_MODE!r}; want 'blocks' or 'cdc'"
+    )
+
+if SPLIT_MODE == "cdc" and not DISABLE_SUBCONTEXT and not hash_subcontext_keys():
+    # Content-defined blocks have no role to be named after, so their namespaces would
+    # be numbered by position -- one namespace for every content, pinned to the first
+    # offset anyone inserted it at. That is the bug content hashing exists to fix, and
+    # it would silently undo the split rather than fail. Moot when the split is off
+    # altogether, which is why the baseline arm can leave this exported and still run.
+    raise ValueError(
+        "SGLANG_SUBCTX_SPLIT=cdc needs content-addressed namespaces: set "
+        "SGLANG_SUBCTX_INDEX=1 (or SGLANG_SUBCTX_HASH_KEYS=1)"
+    )
 
 
 def unsupported_reason(tree_cache) -> Optional[str]:

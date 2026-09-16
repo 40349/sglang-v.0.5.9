@@ -52,7 +52,14 @@ from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import host_timer
-from sglang.srt.utils.subctx_config import DISABLE_SUBCONTEXT
+from sglang.srt.mem_cache.subctx_index import cut_points
+from sglang.srt.utils.subctx_config import (
+    CDC_MAX_TOKENS,
+    CDC_TARGET_TOKENS,
+    DISABLE_SUBCONTEXT,
+    MIN_CHUNK_TOKENS,
+    SPLIT_MODE,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -399,16 +406,21 @@ class OpenAIServingChat(OpenAIServingBase):
         tools: Optional[List[Dict]],
         prompt_ids: List[int],
     ) -> tuple[Optional[List[List[int]]], Optional[List[str]]]:
-        """Split ``prompt_ids`` into system_prompt / tools / messages blocks.
+        """Split ``prompt_ids`` into blocks, each matched and inserted in its own
+        radix namespace so it is reused independently of what surrounds it.
 
-        Each block is matched and inserted in its own radix namespace, so the fixed
-        head of an agent conversation is reused independently of the tail that grows
-        every turn.
+        Two ways to choose the boundaries, see ``SPLIT_MODE``. ``"blocks"`` takes them
+        from the roles the prompt was built from -- system prompt, tool definitions,
+        conversation -- so the fixed head of an agent trajectory is reused apart from
+        the tail that grows every turn. ``"cdc"`` takes them from the content, so a run
+        of tokens is cut the same way wherever it appears; that is what lets a block be
+        found at a new offset, or found when only part of it was quoted.
 
-        The split is made on the already-rendered token ids -- leading messages are
-        re-rendered only to locate the boundary -- so ``concat(segments) == prompt_ids``
-        holds exactly. Templates that do not render the system block as a literal prefix
-        get a coarser split, or none.
+        Either way the split is made on the already-rendered token ids, so
+        ``concat(segments) == prompt_ids`` holds exactly. ``"blocks"`` re-renders the
+        leading messages to locate its boundary and gets a coarser split, or none, from
+        templates that do not render the system block as a literal prefix; ``"cdc"``
+        needs no render at all.
         """
 
         def _is_prefix(head: List[int], full: List[int]) -> bool:
@@ -416,6 +428,21 @@ class OpenAIServingChat(OpenAIServingBase):
 
         if DISABLE_SUBCONTEXT or not prompt_ids or not messages:
             return None, None
+
+        if SPLIT_MODE == "cdc":
+            cuts = cut_points(
+                prompt_ids, CDC_TARGET_TOKENS, MIN_CHUNK_TOKENS, CDC_MAX_TOKENS
+            )
+            if not cuts:
+                return None, None
+            bounds = [0, *cuts, len(prompt_ids)]
+            segments = [prompt_ids[a:b] for a, b in zip(bounds, bounds[1:])]
+            # Named by ordinal only to fill the slot: `Req.__init__` replaces every key
+            # with a hash of that block's own tokens, which `SPLIT_MODE == "cdc"` is
+            # gated on. A content-defined block has no role to be named after, and a
+            # positional name would pin each namespace to the offset it first appeared
+            # at -- the bug the hashing exists to fix.
+            return segments, [f"cdc_{i}" for i in range(len(segments))]
 
         n_sys = 0
         while n_sys < len(messages) and messages[n_sys].get("role") == "system":

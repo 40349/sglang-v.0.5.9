@@ -36,6 +36,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("url", help="server base URL, e.g. http://140.118.202.100:30000")
     ap.add_argument("--split", type=_bool, required=True)
+    ap.add_argument(
+        "--split-mode",
+        choices=("blocks", "cdc"),
+        default=None,
+        help="require the boundaries to come from roles (blocks) or content (cdc)",
+    )
     ap.add_argument("--rotate", type=_bool, required=True)
     ap.add_argument(
         "--index",
@@ -90,6 +96,15 @@ def main() -> int:
             f"index={sub.get('index')!r}. A server old enough to have no `index` key "
             "at all reports None here, which is the same failure as the missing "
             "sub_context block above: it is not this checkout.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.split_mode is not None and sub.get("split_mode") != args.split_mode:
+        print(
+            f"REFUSING: asked for split_mode={args.split_mode} but the server reports "
+            f"split_mode={sub.get('split_mode')!r}. The two cut the same prompt into "
+            "different blocks, so their hit rates are not comparable.",
             file=sys.stderr,
         )
         return 1
