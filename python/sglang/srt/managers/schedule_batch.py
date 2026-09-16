@@ -1352,13 +1352,11 @@ class Req(ReqDllmMixin):
         # ends at the prompt's end -- an agent turn's generation prompt is the last thing
         # in it -- and it is usually the largest, so refusing it whole would give up most
         # of what there is to reuse to buy one token.
-        full_end = {}
         candidates = []
         for match in index.scan(self.fill_ids, self.extra_key):
             end = min(match.end, last_computable)
             if end - match.start < index.min_chunk_tokens:
                 continue
-            full_end[(match.start, end)] = match.end
             candidates.append(SubContextMatch(match.start, end, match.chunk_id))
 
         resolved = []
@@ -1405,7 +1403,7 @@ class Req(ReqDllmMixin):
                     match.start,
                     match.end,
                     slots,
-                    full_end[(match.start, match.end)] != match.end,
+                    match.length != index.chunk_length(match.chunk_id),
                     match.chunk_id,
                 )
             )

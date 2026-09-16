@@ -8,8 +8,9 @@ identity -- moving it there is what ``rotate_kv.py`` does, using the
 ``canonical_position`` the radix tree records alongside the KV.
 
 Scanning walks the query position by position. At every position we fingerprint the
-next ``ANCHOR_TOKENS`` tokens, look the fingerprint up in the index, and report any
-candidate whose *whole* token sequence then matches at that position.
+next ``ANCHOR_TOKENS`` tokens, look the fingerprint up in the index, and report each
+candidate for as far as its tokens and the query's then agree -- the whole chunk where
+the whole chunk occurs, a head of it where only a head does.
 
 Only a fixed-length head is fingerprinted, so a chunk costs one table entry rather than
 one trie node per token, registration is a dict insert with no rebuild, and the
@@ -84,12 +85,26 @@ def _bloom_hits(bits: np.ndarray, mask: np.uint64, prints: np.ndarray) -> np.nda
     return np.flatnonzero(hit)
 
 
+def _common_prefix(ids: np.ndarray, chunk: np.ndarray) -> int:
+    """Number of tokens ``ids`` and ``chunk`` share counting from their starts."""
+    n = min(ids.shape[0], chunk.shape[0])
+    if n == 0:
+        return 0
+    diff = np.flatnonzero(ids[:n] != chunk[:n])
+    return int(diff[0]) if diff.shape[0] else n
+
+
 # ``None`` is a real scope (no cache_salt, no adapter), so absence needs its own value.
 _MISSING = object()
 
 
 class Match(NamedTuple):
-    """``token_ids[start:end]`` is the chunk registered as ``chunk_id``."""
+    """``token_ids[start:end]`` is ``chunk_id``'s chunk, or a leading run of it.
+
+    ``end`` stops where the two sequences diverge, so it spans the whole registered
+    chunk when the whole chunk occurs at ``start`` and less when only its head does.
+    ``SubContextIndex.chunk_length`` tells the two apart.
+    """
 
     start: int
     end: int
@@ -377,10 +392,21 @@ class SubContextIndex:
         elif cid in bucket:
             bucket.remove(cid)
 
+    def chunk_length(self, cid: str) -> int:
+        """Tokens registered under ``cid``, or 0 if nothing is."""
+        scope = self._scopes.get(self._scope_of.get(cid, _MISSING))
+        chunk = None if scope is None else scope.chunks.get(cid)
+        return 0 if chunk is None else int(chunk.shape[0])
+
     def scan(
         self, token_ids: Sequence[int], extra_key: Optional[str] = None
     ) -> List[Match]:
         """Every registered chunk that occurs in ``token_ids``, at every position.
+
+        A chunk is reported wherever its first ``ANCHOR_TOKENS`` tokens occur, running
+        as far as its tokens and the query's agree; runs shorter than
+        ``min_chunk_tokens`` are dropped. A head reaching only part way into the chunk
+        is still reported, and reuses that many of the chunk's slots.
 
         Exhaustive and unordered by preference: overlapping and nested occurrences are
         all reported. ``select`` decides which of them to reuse.
@@ -404,10 +430,9 @@ class SubContextIndex:
         matches: List[Match] = []
         for start in _bloom_hits(bits, mask, prints).tolist():
             for cid in scope.by_anchor.get(int(prints[start]), ()):
-                chunk = scope.chunks[cid]
-                end = start + chunk.shape[0]
-                if end <= n and np.array_equal(ids[start:end], chunk):
-                    matches.append(Match(start, end, cid))
+                take = _common_prefix(ids[start:], scope.chunks[cid])
+                if take >= self.min_chunk_tokens:
+                    matches.append(Match(start, start + take, cid))
         return matches
 
     @staticmethod
