@@ -223,9 +223,9 @@ TXT
         CLIENT=$OUT/client_$stem.json replay
       # The index's own counters; a request that did not fit one prefill pass reports
       # as having found nothing.
-      if [ "$arm" = "idx" ]; then
-        grep "sub-context index:" $OUT/server_$arm.log | tail -1 || true
-      fi
+      case "$arm" in
+        idx|cdc) grep "sub-context index:" $OUT/server_$arm.log | tail -1 || true ;;
+      esac
     done
 
     stop
