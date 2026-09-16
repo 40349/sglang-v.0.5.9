@@ -36,6 +36,12 @@ ARM=${ARM:-on}
 # decide what a query may attend to by comparing indices, which that breaks silently.
 BACKEND=${BACKEND:-triton}
 
+# run_swe.sh spells these AUDIT and TRACE; accept both so a habit from one script does
+# not silently disable a diagnostic in the other.
+SUBCTX_AUDIT=${SUBCTX_AUDIT:-${AUDIT:-}}
+SUBCTX_TRACE=${SUBCTX_TRACE:-${TRACE:-}}
+SPLIT=${SGLANG_SUBCTX_SPLIT:-blocks}
+
 ml load miniconda3
 eval "$(conda shell.bash hook)"
 conda activate sglangv59
@@ -86,6 +92,7 @@ cat <<EOF
 sglang server -- arm: $ARM
 model:  $MODEL_PATH
 backend:$BACKEND
+split:  $SPLIT   audit: ${SUBCTX_AUDIT:-off}   ctxlen: $CTXLEN
 node:   $(hostname)  ip: $NODE_IP
 URL:    http://${NODE_IP}:${PORT}/v1
 log:    $SERVER_LOG
@@ -102,9 +109,10 @@ SGLANG_DISABLE_SUBCONTEXT=$SUBCTX_OFF \
 SGLANG_SUBCONTEXT_ROTATE=$ROT \
 SGLANG_SUBCONTEXT_ROTATE_ACROSS=$ROT_ACROSS \
 SGLANG_SUBCTX_INDEX=$INDEX \
-SGLANG_SUBCTX_TRACE=${SUBCTX_TRACE:-} \
+SGLANG_SUBCTX_SPLIT=$SPLIT \
+SGLANG_SUBCTX_TRACE=$SUBCTX_TRACE \
 SGLANG_SUBCTX_ROTATE_GPU=${ROTATE_GPU:-} \
-SGLANG_SUBCTX_AUDIT=${SUBCTX_AUDIT:-} \
+SGLANG_SUBCTX_AUDIT=$SUBCTX_AUDIT \
 PYTHONUNBUFFERED=${SUBCTX_TRACE:+1} \
 SGLANG_DUMP_TREE=${DUMP_TREE:-} \
 SGLANG_CAPTURE_REQUESTS=$WORK_DIR/traces/requests_${SUF}.jsonl \
