@@ -2,8 +2,6 @@
 
 這份講的是怎麼把這個 fork 的 sglang server 用 CDC 模式跑起來，以及怎麼確認它真的在運作。
 
-機制本身的說明在 [`subcontext_mechanism.md`](subcontext_mechanism.md)。
-
 ---
 
 ## 最小啟動指令
