@@ -472,6 +472,25 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets,
         )
 
+    @staticmethod
+    def _extend_cache_loc(forward_batch: ForwardBatch) -> torch.Tensor:
+        """Where this layer's KV goes, which is not always ``out_cache_loc``.
+
+        While the reused tokens are being scored, the pass carries a row for every
+        position in the prompt, but only the tokens it actually computes have a slot of
+        their own. The reused rows are sent to the padded slot 0 instead: their real
+        rows belong to the radix tree and are shared with every other request holding
+        that block, and this layer's key for them is wanted as a comparison, not as a
+        cache entry.
+
+        Once the selection is made the row count changes to match ``out_cache_loc``
+        again, and this returns it unchanged.
+        """
+        plan = forward_batch.subctx_blend_plan
+        if plan is not None and plan.sel_rows is None:
+            return plan.probe_cache_loc
+        return forward_batch.out_cache_loc
+
     def _forward_extend_sparse(
         self, q, o, layer, forward_batch: ForwardBatch, logits_soft_cap
     ):
@@ -882,7 +901,18 @@ class TritonAttnBackend(AttentionBackend):
         # Save KV cache first (must do this before unified kernel)
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer, self._extend_cache_loc(forward_batch), k, v
+            )
+
+        plan = forward_batch.subctx_blend_plan
+        if plan is not None and layer.layer_id == plan.check_layer:
+            # The pool still holds the *cached* key at the reused slots -- the write
+            # above deliberately skipped those rows -- so this is the one moment where
+            # both keys for a reused position exist. Scoring happens here; the slots
+            # and the token set are not touched until this layer's own attention has
+            # run below, because it is still reading the cache rows being scored.
+            plan.select(
+                k, forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             )
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
@@ -899,7 +929,14 @@ class TritonAttnBackend(AttentionBackend):
             causal = False
 
         if forward_batch.subctx_sparse:
-            return self._forward_extend_sparse(q, o, layer, forward_batch, logits_soft_cap)
+            out = self._forward_extend_sparse(
+                q, o, layer, forward_batch, logits_soft_cap
+            )
+            if plan is not None and layer.layer_id == plan.check_layer:
+                # Only now: the attention above read the cache rows this is about to
+                # stop pointing at.
+                plan.commit(k, v, forward_batch, layer)
+            return out
 
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:

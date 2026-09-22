@@ -40,6 +40,12 @@ SUBCTX_AUDIT=${SUBCTX_AUDIT:-${AUDIT:-}}
 SUBCTX_TRACE=${SUBCTX_TRACE:-${TRACE:-}}
 SPLIT=blocks
 
+# Fraction of the reused tokens that get recomputed anyway. A dial, not part of the
+# arm name: 0 is the arm as it stands, and the interesting runs sweep it.
+TOPK_RATIO=${TOPK_RATIO:-0}
+TOPK_LAYER=${TOPK_LAYER:-1}
+CHUNKED_PREFILL=${CHUNKED_PREFILL:-}
+
 ml load miniconda3
 eval "$(conda shell.bash hook)"
 conda activate sglangv59
@@ -71,6 +77,21 @@ case "$ARM" in
   *)   echo "REFUSING: unknown ARM='$ARM' (want on|off|rot|idx|cdc)"; exit 1 ;;
 esac
 
+# Scoring a reused token needs a key computed for it, so the first layers run the whole
+# prompt -- and a prompt longer than the chunked-prefill budget takes the stitch path
+# instead, which is exactly the long, heavily-reused prompt this is for. It would still
+# serve, and the arm would quietly be measuring something else, so refuse instead of
+# picking a budget: changing it changes every arm's chunking and the caller has to
+# decide that for the whole comparison, not for one run.
+if [ "$TOPK_RATIO" != "0" ] && [ -z "$CHUNKED_PREFILL" ]; then
+  echo "REFUSING: TOPK_RATIO=$TOPK_RATIO needs CHUNKED_PREFILL set to at least the"
+  echo "  longest prompt you will send (the probe pass runs full length, so anything"
+  echo "  above the budget silently falls back to the stitch and reuses less)."
+  echo "  e.g. CHUNKED_PREFILL=$CTXLEN -- and set it for EVERY arm in the comparison,"
+  echo "  or the arms differ in their chunking as well as in the thing under test."
+  exit 1
+fi
+
 NODE_IP=$(hostname -I | awk '{print $1}')
 
 # Refuse if something already serves this port.
@@ -88,6 +109,7 @@ sglang server -- arm: $ARM
 model:  $MODEL_PATH
 backend:$BACKEND
 split:  $SPLIT   audit: ${SUBCTX_AUDIT:-off}   ctxlen: $CTXLEN
+topk:   ratio $TOPK_RATIO at layer $TOPK_LAYER   chunked prefill: ${CHUNKED_PREFILL:-default}
 node:   $(hostname)  ip: $NODE_IP
 URL:    http://${NODE_IP}:${PORT}/v1
 log:    $SERVER_LOG
@@ -102,6 +124,8 @@ SGLANG_SUBCONTEXT_ROTATE=$ROT \
 SGLANG_SUBCONTEXT_ROTATE_ACROSS=$ROT_ACROSS \
 SGLANG_SUBCTX_INDEX=$INDEX \
 SGLANG_SUBCTX_SPLIT=$SPLIT \
+SGLANG_SUBCTX_TOPK_RATIO=${TOPK_RATIO:-0} \
+SGLANG_SUBCTX_TOPK_LAYER=${TOPK_LAYER:-1} \
 SGLANG_SUBCTX_TRACE=$SUBCTX_TRACE \
 SGLANG_SUBCTX_ROTATE_GPU=${ROTATE_GPU:-} \
 SGLANG_SUBCTX_AUDIT=$SUBCTX_AUDIT \
@@ -116,6 +140,7 @@ python -u -m sglang.launch_server \
     --port "$PORT" \
     --tp-size 1 \
     --context-length "$CTXLEN" \
+    ${CHUNKED_PREFILL:+--chunked-prefill-size "$CHUNKED_PREFILL"} \
     --mem-fraction-static 0.9 \
     --enable-cache-report \
     --attention-backend "$BACKEND" \

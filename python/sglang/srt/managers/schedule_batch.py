@@ -706,6 +706,11 @@ class Req(ReqDllmMixin):
         # The complement within the prompt is what prefill actually computes. None on
         # the stitch path, where reuse is always the run [0, len(prefix_indices)).
         self.sub_context_layout: Optional[List[Tuple[int, int, torch.Tensor]]] = None
+        # Parallel to the layout: whether each run landed on this request's own rotated
+        # copy rather than on the tree's rows. Selective recompute displaces a position
+        # off its row, and a copy nobody else holds is then unreferenced -- so it has to
+        # be handed back there, while a tree row must not be.
+        self.sub_context_layout_ours: Optional[List[bool]] = None
         # Displaced hits the stitch is holding back rather than reporting as dropped,
         # because a chunk boundary is about to be cut so `_rotate_append_sub_contexts`
         # can try them. Settled there -- as rotated, or as moved for what it declined.
@@ -1170,6 +1175,7 @@ class Req(ReqDllmMixin):
         # The layout points at the slots just freed; leaving it would place them in
         # req_to_token on the next pass.
         self.sub_context_layout = None
+        self.sub_context_layout_ours = None
 
     def _next_rotatable_boundary(
         self,
@@ -1293,6 +1299,55 @@ class Req(ReqDllmMixin):
         fresh.extend(range(cursor, n))
         return fresh
 
+    def sub_context_reused_positions(self) -> List[int]:
+        """The positions this pass reads from the cache instead of computing.
+
+        The complement of ``sub_context_fresh_positions`` within the prompt, and the
+        candidates selective recompute scores. Ascending, and in the same order as the
+        slots ``sub_context_reused_slots`` returns, which is what lets a score index
+        stand for both a position and the cache row it is being compared against.
+        """
+        if self.sub_context_layout is None:
+            return []
+        reused: List[int] = []
+        for start, end, _slots in self.sub_context_layout:
+            reused.extend(range(start, end))
+        return reused
+
+    def sub_context_reused_slots(self) -> List[torch.Tensor]:
+        """The cache rows behind ``sub_context_reused_positions``, in the same order."""
+        if self.sub_context_layout is None:
+            return []
+        return [slots for _start, _end, slots in self.sub_context_layout]
+
+    def sub_context_reused_ours(self) -> List[bool]:
+        """Per reused position: is its row this request's own copy, or the tree's?
+
+        Recomputing a position moves it onto a row of its own. If the row it leaves is
+        the tree's, the tree goes on serving it; if it is a rotated copy made for this
+        request, nothing points at it any more and it has to go back to the pool.
+        """
+        if self.sub_context_layout is None:
+            return []
+        ours = self.sub_context_layout_ours or [False] * len(self.sub_context_layout)
+        return [
+            flag
+            for (start, end, _slots), flag in zip(self.sub_context_layout, ours)
+            for _ in range(end - start)
+        ]
+
+    def sub_context_topk_count(self) -> int:
+        """How many reused tokens this pass recomputes anyway.
+
+        A fixed fraction of what was reused, so it is host-known before the forward --
+        which is what keeps every shape, indptr and allocation on this path free of a
+        mid-forward device sync. Only *which* tokens is decided on the device.
+        """
+        if self.sub_context_layout is None or not subctx_config.topk_active():
+            return 0
+        n_reused = sum(end - start for start, end, _slots in self.sub_context_layout)
+        return min(n_reused, int(n_reused * subctx_config.TOPK_RATIO))
+
     def _sub_context_layout_fits_one_pass(self) -> bool:
         """Whether what is left to compute fits in a single prefill pass.
 
@@ -1301,6 +1356,13 @@ class Req(ReqDllmMixin):
         chunked sparse request would be handed a prefix that is not one. Rather than
         teach the chunker about holes, requests that would need it take the stitch --
         which is correct under chunking and merely reuses less.
+
+        Selective recompute raises the bar to the whole prompt: scoring a reused token
+        needs a freshly computed key for it, so the first layers run every position,
+        not just the ones left to compute. A long prompt that reuses nearly all of
+        itself is exactly the case this excludes, so the arm has to be launched with a
+        --chunked-prefill-size above the longest prompt and the fallback count
+        watched.
         """
         if self.sub_context_layout is None:
             return True
@@ -1312,6 +1374,8 @@ class Req(ReqDllmMixin):
             return True
         if budget is None or budget <= 0:
             return True
+        if subctx_config.topk_active():
+            return len(self.fill_ids) <= budget
         return len(self.fill_ids) - len(self.prefix_indices) <= budget
 
     @host_timer.timed("subctx_scan")
@@ -1363,6 +1427,10 @@ class Req(ReqDllmMixin):
 
         resolved = []
         nodes = []
+        # Whether the slots a run lands on are this request's own copy rather than the
+        # tree's rows. Only selective recompute cares, and only because displacing a
+        # position off a copy nobody else holds leaves that row unreferenced.
+        ours_by_start: Dict[int, bool] = {}
         moved = rotated = discarded = 0
         for match in index.select(candidates):
             seg = self.fill_ids[match.start : match.end]
@@ -1400,6 +1468,7 @@ class Req(ReqDllmMixin):
                     discarded += take
                     continue
                 rotated += take
+            ours_by_start[match.start] = delta != 0
             resolved.append(
                 (
                     match.start,
@@ -1422,6 +1491,7 @@ class Req(ReqDllmMixin):
         no_insert = [False] * n_blocks
         source_key: List[Optional[str]] = [None] * n_blocks
         layout: List[Tuple[int, int, torch.Tensor]] = []
+        layout_ours: List[bool] = []
         stitched: List[torch.Tensor] = []
         for i, (seg_ids, _key, offset) in enumerate(self.iter_sub_contexts()):
             hit = by_start.get(offset)
@@ -1441,9 +1511,25 @@ class Req(ReqDllmMixin):
                 # is not holding them.
                 source_key[i] = cid
             layout.append((offset, end, slots))
+            layout_ours.append(ours_by_start.get(offset, False))
             stitched.append(slots)
+            if subctx_config.topk_active():
+                # A block some of whose tokens this request recomputes no longer holds
+                # the KV its content hash promises -- it holds KV fitted to *these*
+                # neighbours. Filing it would hand that to every later request that
+                # scans the same content. `no_insert` already means "these slots stay
+                # ours, freed at finish" on both insert paths, which is what is wanted.
+                #
+                # Every reused block, not just the ones that end up with a selected
+                # token: which tokens win is not known until the forward has run, and
+                # this list is read before that. It costs little -- a reused block is
+                # already in the tree, or it could not have been reused. The *fresh*
+                # blocks above are left alone, and they are the ones that matter:
+                # refusing those would stop the cache ever learning new content.
+                no_insert[i] = True
 
         self.sub_context_layout = layout or None
+        self.sub_context_layout_ours = layout_ours or None
         self.sub_context_no_insert = no_insert
         self.sub_context_source_key = source_key
         self.sub_context_match_lens = match_lens
@@ -1593,6 +1679,7 @@ class Req(ReqDllmMixin):
         # takes when there is no layout. Cleared explicitly because a scan may have run
         # first and set one before handing over.
         self.sub_context_layout = None
+        self.sub_context_layout_ours = None
         self.sub_context_no_insert = None
         self.sub_context_source_key = None
 
@@ -2141,6 +2228,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # ordinary "reuse a prefix, compute the tail" shape.
     subctx_fresh_positions: Optional[List[List[int]]] = None
 
+    # The positions the *first* layers run, when reused tokens are being scored: the
+    # whole prompt. None unless selective recompute is on. The rows beyond the fresh
+    # ones exist to produce keys to compare against the cache, and are cut away once
+    # they have.
+    subctx_probe_positions: Optional[List[List[int]]] = None
+
+    # Slots held for the reused tokens that will be recomputed, concatenated over the
+    # batch. Unclaimed until the forward scatters them into ``req_to_token``, after
+    # which the ordinary free paths reach them like any other slot of this request.
+    subctx_topk_slots: Optional[torch.Tensor] = None
+
+    # The scoring and cut-down layout for this batch. Built once the slots are in hand,
+    # read by the attention backend at the scored layer and by the model runner between
+    # layer ranges.
+    subctx_blend_plan: Optional[Any] = None
+
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
@@ -2282,14 +2385,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # gets as `positions` and what req_to_token is written by, and nothing
             # downstream can infer them from a length.
             self.subctx_fresh_positions = [r.sub_context_fresh_positions() for r in reqs]
-            input_ids = [
-                [r.fill_ids[p] for p in positions]
-                for r, positions in zip(reqs, self.subctx_fresh_positions)
-            ]
+            if subctx_config.topk_active():
+                # Scoring a reused token needs a key computed *here*, for a position
+                # the reuse path would otherwise never run. So the prompt goes through
+                # whole, and the token dimension is cut back down to the fresh tokens
+                # plus whatever scored highest once the scored layer has run. The KV of
+                # the extra rows is thrown away -- only their keys are wanted.
+                self.subctx_probe_positions = [
+                    list(range(len(r.fill_ids))) for r in reqs
+                ]
+                input_ids = [list(r.fill_ids) for r in reqs]
+            else:
+                self.subctx_probe_positions = None
+                input_ids = [
+                    [r.fill_ids[p] for p in positions]
+                    for r, positions in zip(reqs, self.subctx_fresh_positions)
+                ]
         else:
             self.subctx_fresh_positions = None
+            self.subctx_probe_positions = None
             input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
-        extend_num_tokens = sum(len(ids) for ids in input_ids)
+        # Slots, not rows: the probe's extra rows write nothing of their own. Keeping
+        # this the count of *computed* tokens is what leaves every length invariant
+        # downstream -- the allocator, `write_cache_indices_sparse`, and the
+        # `seq_len - pre_len == extend_input_len` assert below -- exactly as it was.
+        if self.subctx_fresh_positions is not None:
+            extend_num_tokens = sum(len(p) for p in self.subctx_fresh_positions)
+        else:
+            extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
@@ -2786,6 +2909,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode positions come from the sequence lengths. Leaving the prefill's
         # scattered ones here would send this batch's tokens to the wrong positions.
         self.subctx_fresh_positions = None
+        self.subctx_probe_positions = None
+        self.subctx_topk_slots = None
+        self.subctx_blend_plan = None
 
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
@@ -3013,7 +3139,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         """
         if self.subctx_fresh_positions is None or not self.forward_mode.is_extend():
             return None
-        flat = [p for positions in self.subctx_fresh_positions for p in positions]
+        # One entry per row of ``input_ids``, which is the whole prompt while the
+        # scored layers run. The cut to the selected rows happens between layer ranges.
+        source = self.subctx_probe_positions or self.subctx_fresh_positions
+        flat = [p for positions in source for p in positions]
         return torch.tensor(flat, dtype=torch.int64, device=self.device)
 
     def get_model_worker_batch(
@@ -3087,6 +3216,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
             subctx_positions=self.build_subctx_positions(),
+            subctx_blend_plan=self.subctx_blend_plan,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
@@ -3271,6 +3401,10 @@ class ModelWorkerBatch:
     # explicitly because positions are otherwise rebuilt downstream as one run per
     # request, and a sparse prefill's are scattered.
     subctx_positions: Optional[torch.Tensor] = None
+
+    # Selective recompute of reused tokens: how to score them, and how to cut the
+    # token dimension back down once they have been scored. None unless it is on.
+    subctx_blend_plan: Optional[Any] = None
 
     # For constrained decoding
     # FIXME(lsyin): remove this after fully overlap grammar

@@ -2304,6 +2304,93 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             **kwargs,
         )
 
+    def _set_extend_lens(self, forward_batch: ForwardBatch, lens: List[int]) -> None:
+        """Retarget the per-request row counts at a different token set.
+
+        Two things read these: the sparse extend metadata, which turns them into
+        ``qo_indptr``, and the logits processor, which takes ``cumsum(...) - 1`` as the
+        last row of each request. Both have to mean the set that is actually being run.
+        """
+        forward_batch.extend_seq_lens_cpu = lens
+        forward_batch.extend_seq_lens = torch.tensor(
+            lens, dtype=torch.int32, device=forward_batch.extend_seq_lens.device
+        )
+
+    def forward_subctx_blend(
+        self, forward_batch: ForwardBatch, **kwargs
+    ) -> LogitsProcessorOutput:
+        """Run a prefill that recomputes the reused tokens whose keys moved most.
+
+        Two layer ranges with different token sets. The first carries every position in
+        the prompt, because scoring a reused token needs a key computed here and the
+        reuse path never computes one; the scored layer picks the top fraction and
+        gives those positions rows of their own. The second carries only the tokens
+        being kept -- the ones that were going to be computed anyway, plus the ones
+        just selected -- and is the pass the rest of the model sees.
+
+        The attention metadata is rebuilt in between because both of its inputs have
+        changed: the row count, and ``req_to_token``, which now sends the selected
+        positions to this request's rows instead of the tree's. Rebuilding is also what
+        keeps ``kv_indices`` honest -- it was gathered before the swap, and a stale one
+        would quietly leave the whole pass reading the cached keys it just decided to
+        replace.
+        """
+        plan = forward_batch.subctx_blend_plan
+        model = self.model
+        num_layers = self.model_config.num_hidden_layers
+
+        self._set_extend_lens(forward_batch, plan.probe_lens)
+        self.attn_backend.init_forward_metadata(forward_batch)
+        model.forward_split_prefill(
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            (0, plan.check_layer + 1),
+            **kwargs,
+        )
+        assert plan.sel_rows is not None, (
+            "the scored layer never ran: layer "
+            f"{plan.check_layer} did not reach the attention backend, so nothing was "
+            "scored and the cut below would drop rows at random"
+        )
+
+        if plan.orphaned_slots is not None and plan.orphaned_slots.numel():
+            # Rows the selection displaced that were this request's own rotated copies.
+            # They left `req_to_token` when the selection landed, so no free path can
+            # reach them any more.
+            self.token_to_kv_pool_allocator.free(plan.orphaned_slots)
+
+        forward_batch.hidden_states = forward_batch.hidden_states[plan.sel_rows]
+        forward_batch.residual = forward_batch.residual[plan.sel_rows]
+        forward_batch.positions = plan.sel_positions
+        forward_batch.out_cache_loc = self._gather_sel_cache_loc(forward_batch, plan)
+        self._set_extend_lens(forward_batch, plan.sel_lens)
+
+        self.attn_backend.init_forward_metadata(forward_batch)
+        return model.forward_split_prefill(
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            (plan.check_layer + 1, num_layers),
+            **kwargs,
+        )
+
+    def _gather_sel_cache_loc(self, forward_batch: ForwardBatch, plan) -> torch.Tensor:
+        """The slot behind every row of the selected set, in row order.
+
+        Read back out of ``req_to_token`` rather than reassembled from the two
+        allocations it came from: that table is the one place that says where a
+        position's KV lives, and ``commit`` has just finished updating it.
+        """
+        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        parts = []
+        cursor = 0
+        for i, length in enumerate(plan.sel_lens):
+            positions = plan.sel_positions[cursor : cursor + length]
+            parts.append(req_to_token[plan.req_pool_indices[i], positions])
+            cursor += length
+        return torch.cat(parts).to(torch.int64)
+
     def forward_extend(
         self,
         forward_batch: ForwardBatch,
@@ -2319,6 +2406,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
+
+        if forward_batch.subctx_blend_plan is not None:
+            # Runs the layer stack in two ranges over two different token sets, which
+            # neither the piecewise graph nor a compiled model can express. Both are
+            # refused at launch when this is on.
+            return (
+                self.forward_subctx_blend(
+                    forward_batch,
+                    input_embeds=kwargs.get("input_embeds"),
+                ),
+                False,
+            )
 
         can_run_graph = (
             self.piecewise_cuda_graph_runner is not None

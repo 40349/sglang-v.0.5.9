@@ -1022,20 +1022,39 @@ def _overhead_value(
     return _added_us_per_req(arm, base, stage, n_req)
 
 
+def _split_ratio_stem(stem: str) -> Tuple[str, Optional[int]]:
+    """``"idx_r15"`` -> ``("idx", 15)``. Any other stem keeps its own name.
+
+    Selective recompute is a dial rather than an arm, so a sweep writes several files
+    under one arm name and tells them apart by the ratio they ran at.
+    """
+    base, _, tail = stem.rpartition("_r")
+    if base and tail.isdigit():
+        return base, int(tail)
+    return stem, None
+
+
 def cmd_summary(args: argparse.Namespace) -> int:
     want = [s.strip() for s in args.arms.split(",") if s.strip()]
-    unknown = [s for s in want if s not in dict(ARM_STEMS)]
+    known = dict(ARM_STEMS)
+    unknown = [s for s in want if _split_ratio_stem(s)[0] not in known]
     if unknown:
         print(f"unknown arm(s) {', '.join(unknown)}; want any of "
-              f"{', '.join(s for s, _ in ARM_STEMS)}", file=sys.stderr)
+              f"{', '.join(s for s, _ in ARM_STEMS)}, optionally with a recompute "
+              f"ratio appended as _rNN (e.g. idx_r15)", file=sys.stderr)
         return 1
     arms = []
-    for stem, label in ARM_STEMS:
-        if stem not in want:
-            continue
+    # Arm order first, then ratio, so a sweep of one arm reads left to right.
+    for stem in sorted(want, key=lambda s: (
+        [k for k, _ in ARM_STEMS].index(_split_ratio_stem(s)[0]),
+        _split_ratio_stem(s)[1] or 0,
+    )):
+        base_stem, ratio = _split_ratio_stem(stem)
         arm = _load_arm(args.dir, args.suffix, stem)
         if arm is not None:
-            arm["label"] = label
+            arm["label"] = known[base_stem] + (
+                f" +{ratio}% recompute" if ratio else ""
+            )
             arms.append(arm)
     if not arms:
         print(f"no arms found under {args.dir} with suffix {args.suffix!r} "

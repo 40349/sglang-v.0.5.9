@@ -790,7 +790,11 @@ class Scheduler(
             INDEX_DRYRUN,
             INDEX_SUBCONTEXTS,
             MIN_CHUNK_TOKENS,
+            TOPK_LAYER,
+            TOPK_RATIO,
             sparse_prefill_unsupported_reason,
+            topk_active,
+            topk_unsupported_reason,
         )
 
         if not (INDEX_SUBCONTEXTS or INDEX_DRYRUN):
@@ -803,6 +807,15 @@ class Scheduler(
                     f"served: {reason}. Unset SGLANG_SUBCTX_INDEX, or set "
                     "SGLANG_SUBCTX_INDEX_DRYRUN=1 to measure without it."
                 )
+        if topk_active():
+            reason = topk_unsupported_reason(self.tp_worker.model_runner)
+            if reason is not None:
+                raise ValueError(
+                    "Selective recompute of reused tokens is enabled "
+                    f"(SGLANG_SUBCTX_TOPK_RATIO={TOPK_RATIO}) but cannot be served: "
+                    f"{reason}. Set SGLANG_SUBCTX_TOPK_RATIO=0 to reuse blocks whole, "
+                    "as the arm did before."
+                )
         if self.tree_cache.kv_rotator is None:
             raise ValueError(
                 "The sub-context index is enabled but KV rotation is not, so every "
@@ -813,9 +826,15 @@ class Scheduler(
             min_chunk_tokens=MIN_CHUNK_TOKENS
         )
         logger.info(
-            "Sub-context index ENABLED (min chunk %d tokens%s)",
+            "Sub-context index ENABLED (min chunk %d tokens%s)%s",
             self.tree_cache.sub_context_index.min_chunk_tokens,
             ", dry run -- scanning and reporting only" if INDEX_DRYRUN else "",
+            (
+                f"; selective recompute of {TOPK_RATIO:.0%} of reused tokens, "
+                f"scored at layer {TOPK_LAYER}"
+                if topk_active()
+                else ""
+            ),
         )
 
     def _init_sub_context_rotation(self):

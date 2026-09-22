@@ -13,6 +13,9 @@
 #   idx  + find blocks by content anywhere in the prompt, and prefill the gaps
 #   cdc  + cut the blocks on content too, not on the roles the prompt was built from
 #
+# TOPK_RATIO recomputes that fraction of the reused tokens on idx and cdc, chosen by
+# how far their key moved. It is a dial rather than an arm, and it joins the file stem.
+#
 # Default is "off cdc". on, rot and idx are the rungs between them and run when named.
 #
 #   ARMS="off rot idx cdc" ./run_swe.sh toggle          put the middle rungs back
@@ -38,6 +41,27 @@ QUANT=${QUANT-}
 TOOL_PARSER=${TOOL_PARSER-qwen}
 
 ARMS=${ARMS:-"off cdc"}
+
+# Fraction of the tokens a prompt reuses that get recomputed anyway, scored by how far
+# their key has moved. Applies to idx and cdc, the arms that have reused tokens to
+# score; 0 is those arms as they stand. Sweeping it is the point:
+#
+#   ARMS="off idx" TOPK_RATIO=0.15 CHUNKED_PREFILL=$CTXLEN ./run_swe.sh toggle
+#
+# The probe pass runs the whole prompt through the first layers, so a prompt above the
+# chunked-prefill budget falls back to the stitch and quietly reuses less. Set the
+# budget for EVERY arm in a comparison, not just the one being swept.
+TOPK_RATIO=${TOPK_RATIO:-0}
+TOPK_LAYER=${TOPK_LAYER:-1}
+CHUNKED_PREFILL=${CHUNKED_PREFILL:-}
+
+if [ "$TOPK_RATIO" != "0" ] && [ -z "$CHUNKED_PREFILL" ]; then
+  echo "REFUSING: TOPK_RATIO=$TOPK_RATIO with no CHUNKED_PREFILL. The probe runs the"
+  echo "  whole prompt, so anything longer than the budget takes the stitch instead --"
+  echo "  which is exactly the long, heavily-reused prompt this is for, and the arm"
+  echo "  would still produce a table. Try CHUNKED_PREFILL=$CTXLEN."
+  exit 1
+fi
 
 # Pinned for every arm: triton is the only backend that takes a per-position mask.
 BACKEND=${BACKEND:-triton}
@@ -84,23 +108,33 @@ export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
 arm_switches() {
   # Cleared every time; an arm that does not set one gets the empty value.
   export SUBCTX_OFF= SUBCTX_ROTATE= SUBCTX_ACROSS= SUBCTX_INDEX= SUBCTX_SPLIT=blocks
+  # Only the arms that place blocks freely have reused tokens to score. Setting it on
+  # the others is refused at launch, so clear it rather than leaving it to leak in.
+  export SUBCTX_TOPK_RATIO=0
   case "$1" in
     off) export SUBCTX_OFF=1 ;;
     on)  ;;
     rot) export SUBCTX_ROTATE=1 SUBCTX_ACROSS=1 ;;
-    idx) export SUBCTX_ROTATE=1 SUBCTX_INDEX=1 ;;
-    cdc) export SUBCTX_ROTATE=1 SUBCTX_INDEX=1 SUBCTX_SPLIT=cdc ;;
+    idx) export SUBCTX_ROTATE=1 SUBCTX_INDEX=1 SUBCTX_TOPK_RATIO=$TOPK_RATIO ;;
+    cdc) export SUBCTX_ROTATE=1 SUBCTX_INDEX=1 SUBCTX_SPLIT=cdc SUBCTX_TOPK_RATIO=$TOPK_RATIO ;;
     *)   echo "unknown arm '$1'; want any of: off on rot idx cdc"; exit 1 ;;
   esac
 }
 
 # The bench names files by stem: client_base.json is the off arm, client_sub.json the
-# on arm. The stems are what `summary` looks for.
+# on arm. The stems are what `summary` looks for. A non-zero ratio joins the stem --
+# it is not part of the arm's name but it is part of what the run measured, and a
+# sweep would otherwise write every ratio over the last one.
 arm_stem() {
+  local stem
   case "$1" in
-    off) echo base ;;
-    on)  echo sub ;;
-    *)   echo "$1" ;;
+    off) stem=base ;;
+    on)  stem=sub ;;
+    *)   stem="$1" ;;
+  esac
+  case "$1:$TOPK_RATIO" in
+    idx:0|cdc:0|off:*|on:*|rot:*) echo "$stem" ;;
+    *) echo "${stem}_r$(printf '%02d' "$(python -c "print(round($TOPK_RATIO*100))")")" ;;
   esac
 }
 
@@ -117,6 +151,7 @@ verify_arm() {
   python "$CHECK_ARM" "http://127.0.0.1:$PORT" \
     --split $split --rotate $rotate --index $index \
     --split-mode "${SUBCTX_SPLIT:-blocks}" \
+    --topk-ratio "${SUBCTX_TOPK_RATIO:-0}" \
     --audit "$([ -n "$AUDIT" ] && echo true || echo false)"
 }
 
@@ -137,11 +172,14 @@ launch() {
   SGLANG_SUBCONTEXT_ROTATE_ACROSS=${SUBCTX_ACROSS:-} \
   SGLANG_SUBCTX_INDEX=${SUBCTX_INDEX:-} \
   SGLANG_SUBCTX_SPLIT=${SUBCTX_SPLIT:-blocks} \
+  SGLANG_SUBCTX_TOPK_RATIO=${SUBCTX_TOPK_RATIO:-0} \
+  SGLANG_SUBCTX_TOPK_LAYER=${TOPK_LAYER:-1} \
   SGLANG_SUBCTX_AUDIT=${AUDIT:-} \
   SGLANG_SUBCTX_TRACE=${SUBCTX_TRACE:-} \
   nohup python -u -m sglang.launch_server \
     --model-path $MODEL \
     --context-length $CTXLEN \
+    ${CHUNKED_PREFILL:+--chunked-prefill-size $CHUNKED_PREFILL} \
     ${QUANT:+--quantization $QUANT} \
     ${TOOL_PARSER:+--tool-call-parser $TOOL_PARSER} \
     --attention-backend $BACKEND \

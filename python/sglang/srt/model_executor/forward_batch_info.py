@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -281,6 +281,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # rather than sitting in front of it, so attention has to be masked by real
     # position instead of by index. Set alongside `positions` below.
     subctx_sparse: bool = False
+    # Selective recompute: the layout for scoring the reused tokens and cutting the
+    # token dimension down to the fresh ones plus whatever scored highest. When this is
+    # set the pass runs in two layer ranges and the row count changes between them.
+    subctx_blend_plan: Optional[Any] = None
 
     # For extend
     extend_num_tokens: Optional[int] = None
@@ -489,6 +493,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # cannot be rebuilt from a prefix length. `compute_position` below is
             # skipped because this is already set.
             ret.positions = batch.subctx_positions.to(device, non_blocking=True)
+            # While the scored layers run, `positions` covers the whole prompt rather
+            # than the tokens being computed. The cut back down happens between layer
+            # ranges, in `ModelRunner.forward_subctx_blend`.
+            ret.subctx_blend_plan = batch.subctx_blend_plan
 
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():

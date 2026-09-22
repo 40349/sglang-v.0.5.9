@@ -628,6 +628,11 @@ async def server_info():
             "split_mode": subctx_config.SPLIT_MODE,
             "cdc_target": subctx_config.CDC_TARGET_TOKENS,
             "cdc_max": subctx_config.CDC_MAX_TOKENS,
+            # How much of what the prompt reuses is recomputed anyway, and where the
+            # deviation that decides it is measured. A dial, so the arm name does not
+            # carry it and a run has to read it from here.
+            "topk_ratio": subctx_config.TOPK_RATIO,
+            "topk_layer": subctx_config.TOPK_LAYER,
             # Lets a client tell a stale server apart from the one it just started.
             # A job whose port bind failed leaves the PREVIOUS job serving; the arm
             # flags match, so only something that changed between the two builds can

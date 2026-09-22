@@ -52,6 +52,14 @@ def main() -> int:
         "before it existed keep meaning what they meant.",
     )
     ap.add_argument(
+        "--topk-ratio",
+        type=float,
+        default=None,
+        help="require the server to be recomputing this fraction of the tokens it "
+        "reuses. The arm name does not carry the ratio, so a run swept over several "
+        "of them has nothing else to tell its own results apart.",
+    )
+    ap.add_argument(
         "--audit",
         type=_bool,
         default=None,
@@ -107,6 +115,17 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+
+    if args.topk_ratio is not None:
+        got = sub.get("topk_ratio")
+        if got is None or abs(float(got) - args.topk_ratio) > 1e-9:
+            print(
+                f"REFUSING: asked for topk_ratio={args.topk_ratio} but the server "
+                f"reports topk_ratio={got!r}. Ratios are swept within one arm name, "
+                "so a mismatch here produces a table whose rows are all the same run.",
+                file=sys.stderr,
+            )
+            return 1
 
     if args.audit is not None and bool(sub.get("audit")) != args.audit:
         print(
