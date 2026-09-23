@@ -13,9 +13,11 @@
 #   cdc  + cut the blocks on content too, not on the roles the prompt was built from
 #
 # TOPK_RATIO recomputes that fraction of the reused tokens on idx and cdc; a non-zero
-# ratio is appended to the file stem. Default ARMS is "off cdc".
+# ratio is appended to the file stem. Default ARMS is "off cdc". `cdc@0.15` sets the
+# ratio for that one arm, so several ratios run in one toggle.
 #
 #   ARMS="off rot idx cdc" ./run_swe.sh toggle          put the middle rungs back
+#   ARMS="off cdc cdc@0.15" CHUNKED_PREFILL=$CTXLEN ./run_swe.sh toggle
 #   AUDIT=1 FULL=1 ./run_swe.sh toggle                  correctness pass, timings unusable
 #   REQUESTS=~/work/traces/requests_on_42.jsonl ...     a capture recorded elsewhere
 #   MODEL=... CTXLEN=... ./run_swe.sh ...               a smaller model for a smoke run
@@ -47,8 +49,29 @@ TOPK_RATIO=${TOPK_RATIO:-0}
 TOPK_LAYER=${TOPK_LAYER:-1}
 CHUNKED_PREFILL=${CHUNKED_PREFILL:-}
 
-if awk -v r="$TOPK_RATIO" 'BEGIN { exit !(r > 0) }' && [ -z "$CHUNKED_PREFILL" ]; then
-  echo "REFUSING: TOPK_RATIO=$TOPK_RATIO with no CHUNKED_PREFILL. The probe runs the"
+# An arm is `name` or `name@ratio`; the ratio defaults to TOPK_RATIO.
+arm_name()  { echo "${1%%@*}"; }
+arm_ratio() { case "$1" in *@*) echo "${1#*@}" ;; *) echo "$TOPK_RATIO" ;; esac; }
+ratio_positive() { awk -v r="$1" 'BEGIN { exit !(r > 0) }'; }
+
+any_ratio=
+for arm in $ARMS; do
+  case "$arm" in
+    *@*)
+      case "$(arm_name "$arm")" in
+        idx|cdc) ;;
+        *) echo "REFUSING: '$arm': only idx and cdc take a ratio"; exit 1 ;;
+      esac
+      awk -v r="$(arm_ratio "$arm")" 'BEGIN { exit !(r ~ /^[0-9.]+$/ && r >= 0 && r <= 1) }' || {
+        echo "REFUSING: '$arm': the ratio must be a number in [0, 1]"; exit 1; } ;;
+  esac
+  case "$(arm_name "$arm")" in
+    idx|cdc) ratio_positive "$(arm_ratio "$arm")" && any_ratio="$arm" ;;
+  esac
+done
+
+if [ -n "$any_ratio" ] && [ -z "$CHUNKED_PREFILL" ]; then
+  echo "REFUSING: $any_ratio recomputes with no CHUNKED_PREFILL. The probe runs the"
   echo "  whole prompt, so anything longer than the budget takes the stitch instead --"
   echo "  which is exactly the long, heavily-reused prompt this is for, and the arm"
   echo "  would still produce a table. Try CHUNKED_PREFILL=$CTXLEN."
@@ -100,12 +123,14 @@ arm_switches() {
   export SUBCTX_OFF= SUBCTX_ROTATE= SUBCTX_ACROSS= SUBCTX_INDEX= SUBCTX_SPLIT=blocks
   # The ratio applies to idx and cdc only.
   export SUBCTX_TOPK_RATIO=0
-  case "$1" in
+  local ratio
+  ratio=$(arm_ratio "$1")
+  case "$(arm_name "$1")" in
     off) export SUBCTX_OFF=1 ;;
     on)  ;;
     rot) export SUBCTX_ROTATE=1 SUBCTX_ACROSS=1 ;;
-    idx) export SUBCTX_ROTATE=1 SUBCTX_INDEX=1 SUBCTX_TOPK_RATIO=$TOPK_RATIO ;;
-    cdc) export SUBCTX_ROTATE=1 SUBCTX_INDEX=1 SUBCTX_SPLIT=cdc SUBCTX_TOPK_RATIO=$TOPK_RATIO ;;
+    idx) export SUBCTX_ROTATE=1 SUBCTX_INDEX=1 SUBCTX_TOPK_RATIO=$ratio ;;
+    cdc) export SUBCTX_ROTATE=1 SUBCTX_INDEX=1 SUBCTX_SPLIT=cdc SUBCTX_TOPK_RATIO=$ratio ;;
     *)   echo "unknown arm '$1'; want any of: off on rot idx cdc"; exit 1 ;;
   esac
 }
@@ -113,16 +138,18 @@ arm_switches() {
 # File stem per arm, as `summary` expects: off -> base, on -> sub, others as named. A
 # non-zero ratio on idx/cdc appends _rNN (percent).
 arm_stem() {
-  local stem
-  case "$1" in
+  local stem name ratio
+  name=$(arm_name "$1")
+  ratio=$(arm_ratio "$1")
+  case "$name" in
     off) stem=base ;;
     on)  stem=sub ;;
-    *)   stem="$1" ;;
+    *)   stem="$name" ;;
   esac
-  case "$1" in
+  case "$name" in
     idx|cdc)
-      if awk -v r="$TOPK_RATIO" 'BEGIN { exit !(r > 0) }'; then
-        echo "${stem}_r$(printf '%02d' "$(python -c "print(round($TOPK_RATIO*100))")")"
+      if ratio_positive "$ratio"; then
+        echo "${stem}_r$(printf '%02d' "$(python -c "print(round($ratio*100))")")"
       else
         echo "$stem"
       fi ;;
@@ -133,7 +160,7 @@ arm_stem() {
 # Ask the server what it is rather than trusting the switches.
 verify_arm() {
   local split rotate index
-  case "$1" in
+  case "$(arm_name "$1")" in
     off) split=false; rotate=false; index=false ;;
     on)  split=true;  rotate=false; index=false ;;
     rot) split=true;  rotate=true;  index=false ;;
@@ -247,13 +274,14 @@ TXT
       stem=$(arm_stem "$arm")
       echo; echo "======== ARM: $arm ========"
       arm_switches "$arm"
-      LOG=$OUT/server_$arm.log TRACE=$OUT/trace_$stem.jsonl STAGE=$OUT/stage_$stem launch
+      log=$OUT/server_${arm//@/_}.log
+      LOG=$log TRACE=$OUT/trace_$stem.jsonl STAGE=$OUT/stage_$stem launch
       verify_arm "$arm"
       TRACE=$OUT/trace_$stem.jsonl STAGE=$OUT/stage_$stem \
         CLIENT=$OUT/client_$stem.json replay
       # The index's own counters.
-      case "$arm" in
-        idx|cdc) grep "sub-context index:" $OUT/server_$arm.log | tail -1 || true ;;
+      case "$(arm_name "$arm")" in
+        idx|cdc) grep "sub-context index:" "$log" | tail -1 || true ;;
       esac
     done
 
