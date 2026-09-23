@@ -12,8 +12,11 @@ user message; F1 tokenizes with the served model's tokenizer; thinking is off.
 Each run's reuse rate is printed: near zero on idx/cdc means the passages were not
 found and the run measured nothing.
 
-    python blend_quality.py run URL --task wikimqa --data CacheBlend/inputs/wikimqa_s.json --out off.json
-    python blend_quality.py compare off.json cdc_r15.json
+    python blend_quality.py run http://127.0.0.1:30000          all three tasks
+    python blend_quality.py compare ab_out/quality/<model> off cdc cdc_r15
+
+`run` names its output <task>_<arm>.json after the server's own arm (as
+sglang_server.sh tags it), so the arm is set once, on the server.
 
 Needs `transformers` and `rouge_score`.
 """
@@ -23,11 +26,14 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import os
 import re
 import string
 import sys
 import time
 import urllib.request
+
+DATA_FILES = {"wikimqa": "wikimqa_s.json", "musique": "musique_s.json", "samsum": "samsum.json"}
 
 TASKS = {
     "wikimqa": dict(
@@ -152,6 +158,72 @@ def chat(
     return resp, time.perf_counter() - t0
 
 
+def arm_tag(sub: dict) -> str:
+    """The server's arm as sglang_server.sh tags it: off, on, rot, idx, cdc, + _rNN."""
+    if not sub.get("split_enabled"):
+        return "off"
+    if sub.get("index"):
+        tag = "cdc" if sub.get("split_mode") == "cdc" else "idx"
+    else:
+        tag = "rot" if sub.get("rotate") else "on"
+    ratio = float(sub.get("topk_ratio") or 0)
+    return f"{tag}_r{int(ratio * 100 + 0.5):02d}" if ratio > 0 else tag
+
+
+def run_task(task, args, base, model, info, tokenizer, scorer) -> None:
+    cfg = TASKS[task]
+    data = json.load(open(os.path.join(args.inputs, DATA_FILES[task])))
+    if args.limit:
+        data = data[: args.limit]
+    out = os.path.join(
+        args.out_dir, info["model_path"].split("/")[-1], f"{task}_{arm_tag(info['sub_context'])}.json"
+    )
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    print(f"  task:   {task}  samples: {len(data)}  prime: {not args.no_prime}")
+
+    rows = []
+    for i, ex in enumerate(data):
+        docs, q = build_prompt(task, ex, tokenizer)
+        if not docs:
+            continue
+        if not args.no_prime:
+            # Two tokens, EOS ignored: on the split arms a request that finishes during
+            # its prefill step is never filed, and its passage would not be found.
+            for d in docs:
+                chat(base, model, d, 2, args.thinking, ignore_eos=True)
+        resp, latency = chat(base, model, cfg["prefix"] + "".join(docs) + q, cfg["max_tokens"], args.thinking)
+        text = resp["choices"][0]["message"].get("content") or ""
+        usage = resp.get("usage") or {}
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+        rows.append(
+            dict(
+                idx=i,
+                prompt_tokens=usage.get("prompt_tokens"),
+                cached_tokens=cached,
+                latency_s=round(latency, 4),
+                output=text,
+                score=score(task, text, ex["answers"], tokenizer, scorer),
+            )
+        )
+        if (i + 1) % 10 == 0 or i + 1 == len(data):
+            mean = sum(r["score"] for r in rows) / len(rows)
+            reuse = sum(r["cached_tokens"] for r in rows) / max(1, sum(r["prompt_tokens"] or 0 for r in rows))
+            print(f"  [{i + 1}/{len(data)}] {cfg['metric']} {mean:.4f}  reused {reuse:.1%} of prompt tokens")
+
+    summary = dict(
+        task=task,
+        metric=cfg["metric"],
+        n=len(rows),
+        score=sum(r["score"] for r in rows) / len(rows),
+        reuse=sum(r["cached_tokens"] for r in rows) / max(1, sum(r["prompt_tokens"] or 0 for r in rows)),
+        latency_s=sum(r["latency_s"] for r in rows) / len(rows),
+        sub_context=info["sub_context"],
+        model_path=info["model_path"],
+    )
+    json.dump(dict(summary=summary, rows=rows), open(out, "w"), indent=1)
+    print(f"  {task}: {cfg['metric']} {summary['score']:.4f}  reused {summary['reuse']:.1%}  -> {out}")
+
+
 def cmd_run(args) -> int:
     from rouge_score import rouge_scorer
     from transformers import AutoTokenizer
@@ -164,95 +236,60 @@ def cmd_run(args) -> int:
     model = args.model or get(base + "/v1/models")["data"][0]["id"]
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or info["model_path"])
     scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
-    cfg = TASKS[args.task]
-
-    data = json.load(open(args.data))
-    if args.limit:
-        data = data[: args.limit]
-    print(f"  server: {info['model_path']}  sub_context: {info['sub_context']}")
-    print(f"  task:   {args.task}  samples: {len(data)}  prime: {not args.no_prime}")
-
-    rows = []
-    for i, ex in enumerate(data):
-        docs, q = build_prompt(args.task, ex, tokenizer)
-        if not docs:
-            continue
-        if not args.no_prime:
-            # Two tokens, EOS ignored: on the split arms a request that finishes during
-            # its prefill step is never filed, and its passage would not be found.
-            for d in docs:
-                chat(base, model, d, 2, args.thinking, ignore_eos=True)
-        resp, latency = chat(base, model, cfg["prefix"] + "".join(docs) + q, cfg["max_tokens"], args.thinking)
-        text = resp["choices"][0]["message"].get("content") or ""
-        usage = resp.get("usage") or {}
-        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
-        row = dict(
-            idx=i,
-            prompt_tokens=usage.get("prompt_tokens"),
-            cached_tokens=cached,
-            latency_s=round(latency, 4),
-            output=text,
-            score=score(args.task, text, ex["answers"], tokenizer, scorer),
-        )
-        rows.append(row)
-        if (i + 1) % 10 == 0 or i + 1 == len(data):
-            mean = sum(r["score"] for r in rows) / len(rows)
-            reuse = sum(r["cached_tokens"] for r in rows) / max(1, sum(r["prompt_tokens"] or 0 for r in rows))
-            print(f"  [{i + 1}/{len(data)}] {cfg['metric']} {mean:.4f}  reused {reuse:.1%} of prompt tokens")
-
-    summary = dict(
-        task=args.task,
-        metric=cfg["metric"],
-        n=len(rows),
-        score=sum(r["score"] for r in rows) / len(rows),
-        reuse=sum(r["cached_tokens"] for r in rows) / max(1, sum(r["prompt_tokens"] or 0 for r in rows)),
-        latency_s=sum(r["latency_s"] for r in rows) / len(rows),
-        sub_context=info["sub_context"],
-        model_path=info["model_path"],
-    )
-    json.dump(dict(summary=summary, rows=rows), open(args.out, "w"), indent=1)
-    print(json.dumps({k: v for k, v in summary.items() if k != "sub_context"}, indent=1))
-    print(f"  -> {args.out}")
+    print(f"  server: {info['model_path']}  arm: {arm_tag(info['sub_context'])}")
+    for task in args.task:
+        run_task(task, args, base, model, info, tokenizer, scorer)
     return 0
 
 
-def cmd_compare(args) -> int:
-    a, b = (json.load(open(p)) for p in (args.base, args.other))
+def compare_pair(a: dict, b: dict, name_b: str) -> None:
     sa, sb = a["summary"], b["summary"]
-    if sa["task"] != sb["task"]:
-        print(f"REFUSING: {sa['task']} vs {sb['task']}", file=sys.stderr)
-        return 1
     rb = {r["idx"]: r for r in b["rows"]}
     pairs = [(r, rb[r["idx"]]) for r in a["rows"] if r["idx"] in rb]
     diffs = [y["score"] - x["score"] for x, y in pairs]
     same = sum(x["output"] == y["output"] for x, y in pairs)
     worse = sum(d < -1e-9 for d in diffs)
     better = sum(d > 1e-9 for d in diffs)
-    print(f"task {sa['task']} ({sa['metric']}), {len(pairs)} paired samples")
-    print(f"  {'':12}{'score':>10}{'reuse':>10}{'latency':>10}")
-    for name, s in (("base", sa), ("other", sb)):
-        print(f"  {name:12}{s['score']:>10.4f}{s['reuse']:>10.1%}{s['latency_s']:>9.3f}s")
-    print(f"  delta       {sb['score'] - sa['score']:>+10.4f}")
-    print(f"  identical output {same}/{len(pairs)}   worse {worse}   better {better}   tied {len(pairs) - worse - better}")
+    print(
+        f"  {name_b:10}{sb['score']:>9.4f}{sb['score'] - sa['score']:>+9.4f}{sb['reuse']:>9.1%}"
+        f"{sb['latency_s']:>9.3f}s   same {same}/{len(pairs)}  worse {worse}  better {better}"
+    )
+
+
+def cmd_compare(args) -> int:
+    for task in sorted(TASKS):
+        paths = [os.path.join(args.dir, f"{task}_{arm}.json") for arm in args.arms]
+        if not all(os.path.exists(p) for p in paths):
+            continue
+        runs = [json.load(open(p)) for p in paths]
+        base = runs[0]["summary"]
+        print(f"{task} ({base['metric']}), baseline {args.arms[0]}, {base['n']} samples")
+        print(f"  {'arm':10}{'score':>9}{'delta':>9}{'reuse':>9}{'latency':>10}")
+        print(f"  {args.arms[0]:10}{base['score']:>9.4f}{'':>9}{base['reuse']:>9.1%}{base['latency_s']:>9.3f}s")
+        for arm, run in zip(args.arms[1:], runs[1:]):
+            compare_pair(runs[0], run, arm)
     return 0
 
 
 def main() -> int:
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
-    r.add_argument("url", help="server base URL, e.g. http://140.118.202.100:30000")
-    r.add_argument("--task", choices=sorted(TASKS), required=True)
-    r.add_argument("--data", required=True, help="CacheBlend/inputs/{wikimqa_s,musique_s,samsum}.json")
-    r.add_argument("--out", required=True)
+    r.add_argument("url", help="server base URL, e.g. http://127.0.0.1:30000")
+    r.add_argument("--task", nargs="+", choices=sorted(TASKS), default=sorted(TASKS))
+    r.add_argument("--inputs", default=os.path.expanduser("~/Desktop/MiaoChen/CacheBlend/inputs"),
+                   help="CacheBlend's inputs/ directory")
+    r.add_argument("--out-dir", default=os.path.join(repo, "ab_out/quality"),
+                   help="written to <out-dir>/<model>/<task>_<arm>.json")
     r.add_argument("--limit", type=int, default=0)
     r.add_argument("--model", default=None, help="default: what /v1/models lists")
     r.add_argument("--tokenizer", default=None, help="default: the server's model_path")
     r.add_argument("--thinking", action="store_true", help="leave Qwen3 thinking on")
     r.add_argument("--no-prime", action="store_true", help="skip sending each passage alone first")
     c = sub.add_parser("compare")
-    c.add_argument("base")
-    c.add_argument("other")
+    c.add_argument("dir", help="ab_out/quality/<model>")
+    c.add_argument("arms", nargs="+", help="file tags, baseline first, e.g. off cdc cdc_r15")
     args = ap.parse_args()
     return cmd_run(args) if args.cmd == "run" else cmd_compare(args)
 

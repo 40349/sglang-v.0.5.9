@@ -15,7 +15,7 @@
 #   ./run_swe.sh toggle   replay that capture once per arm in ARMS and print the tables
 #   sbatch run_swe.sh toggle     the same as a batch job (submit from the checkout)
 #
-#   ARMS="off cdc cdc@0.15" CTXLEN=40960 CHUNKED_PREFILL=40960 ./run_swe.sh toggle
+#   ARMS="off cdc cdc@0.15" CTXLEN=40960 ./run_swe.sh toggle
 #   ARMS="off rot idx cdc" ./run_swe.sh toggle          the middle rungs; the first arm
 #                                                       is the baseline
 #   AUDIT=1 FULL=1 ./run_swe.sh toggle                  correctness pass, timings unusable

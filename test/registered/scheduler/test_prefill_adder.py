@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import PrefillAdder
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -306,6 +306,81 @@ class TestPrefillAdder(CustomTestCase):
             adder.rem_total_token_offset, 250
         )  # 50 + 75 + 100 + 125 + 125 - 100 - 125 = 250
         self.assertEqual(running_batch.release_req.call_count, 2)
+
+    # Selective recompute's probe runs the whole prompt, not just the fresh tokens.
+
+    BUDGET = 8192
+
+    def create_budget_adder(self, available_size=100000):
+        self.mock_token_allocator.available_size.return_value = available_size
+        return PrefillAdder(
+            page_size=1,
+            tree_cache=self.mock_tree_cache,
+            token_to_kv_pool_allocator=self.mock_token_allocator,
+            running_batch=self.create_running_batch(),
+            new_token_ratio=1.0,
+            rem_input_tokens=self.BUDGET,
+            rem_chunk_tokens=self.BUDGET,
+        )
+
+    def create_prefill_req(self, rid, fresh, prompt=None, topk=0):
+        """``fresh`` tokens to compute; with ``prompt``, a sparse layout whose probe
+        runs ``prompt`` rows."""
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=16)
+        req.sampling_params = SimpleNamespace(max_new_tokens=16, ignore_eos=False)
+        req.extend_input_len = fresh
+        req.host_hit_length = 0
+        req.last_node = MagicMock()
+        req.sub_context_next_boundary = None
+        prompt = prompt or fresh
+        req.prefix_indices = [0] * (prompt - fresh)
+        req.sub_context_layout = [(0, prompt - fresh, None)] if prompt > fresh else None
+        req.sub_context_forward_rows.return_value = prompt
+        req.sub_context_topk_count.return_value = topk
+        return req
+
+    def test_probe_over_budget_runs_alone(self):
+        adder = self.create_budget_adder()
+        probe = self.create_prefill_req("probe", fresh=100, prompt=30000)
+        adder.add_one_req(probe, has_chunked_req=False, truncation_align_size=None)
+        self.assertEqual(adder.can_run_list, [probe])
+        self.assertEqual(adder.rem_chunk_tokens, self.BUDGET - 30000)
+
+        later = self.create_prefill_req("later", fresh=10)
+        adder.add_one_req(later, has_chunked_req=False, truncation_align_size=None)
+        self.assertEqual(adder.can_run_list, [probe])
+
+    def test_probe_over_what_is_left_waits(self):
+        adder = self.create_budget_adder()
+        first = self.create_prefill_req("first", fresh=1000)
+        adder.add_one_req(first, has_chunked_req=False, truncation_align_size=None)
+
+        probe = self.create_prefill_req("probe", fresh=100, prompt=30000)
+        result = adder.add_one_req(
+            probe, has_chunked_req=False, truncation_align_size=None
+        )
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertEqual(adder.can_run_list, [first])
+        self.assertEqual(adder.rem_chunk_tokens, self.BUDGET - 1000)
+
+    def test_probe_that_fits_shares_the_pass(self):
+        adder = self.create_budget_adder()
+        first = self.create_prefill_req("first", fresh=1000)
+        adder.add_one_req(first, has_chunked_req=False, truncation_align_size=None)
+
+        probe = self.create_prefill_req("probe", fresh=100, prompt=3000)
+        adder.add_one_req(probe, has_chunked_req=False, truncation_align_size=None)
+        self.assertEqual(adder.can_run_list, [first, probe])
+        self.assertEqual(adder.rem_chunk_tokens, self.BUDGET - 1000 - 3000)
+
+    def test_recomputed_slots_count_toward_kv(self):
+        adder = self.create_budget_adder(available_size=1000)
+        probe = self.create_prefill_req("probe", fresh=100, prompt=3000, topk=950)
+        result = adder.add_one_req(
+            probe, has_chunked_req=False, truncation_align_size=None
+        )
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.can_run_list, [])
 
 
 if __name__ == "__main__":

@@ -733,9 +733,14 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        total_tokens = req.extend_input_len + min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
+        # Selective recompute also allocates a slot per recomputed reused token.
+        total_tokens = (
+            req.extend_input_len
+            + req.sub_context_topk_count()
+            + min(
+                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                CLIP_MAX_NEW_TOKENS,
+            )
         )
 
         # adjusting the input_tokens based on host_hit_length and page_size
@@ -766,6 +771,22 @@ class PrefillAdder:
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+                return AddReqResult.OTHER
+
+            # Selective recompute's probe runs the whole prompt: it shares a pass only
+            # if it fits what is left, and otherwise runs alone, over the budget.
+            probe_extra = req.sub_context_forward_rows() - req.extend_input_len
+            if (
+                probe_extra > 0
+                and len(self.can_run_list) != 0
+                and (
+                    input_tokens + probe_extra >= self.rem_input_tokens
+                    or (
+                        self.rem_chunk_tokens is not None
+                        and input_tokens + probe_extra > self.rem_chunk_tokens
+                    )
+                )
+            ):
                 return AddReqResult.OTHER
 
             # Stage 2: tokens to compute up to the next rotatable block edge, if that
@@ -825,6 +846,10 @@ class PrefillAdder:
                         CLIP_MAX_NEW_TOKENS,
                     ),
                 )
+                if probe_extra > 0:
+                    self.rem_input_tokens -= probe_extra
+                    if self.rem_chunk_tokens is not None:
+                        self.rem_chunk_tokens -= probe_extra
             elif req.sub_context_layout is not None:
                 # A sparse layout cannot be chunked: wait for a pass with room. The scan
                 # already sent requests that can never fit to the stitch.

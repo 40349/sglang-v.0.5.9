@@ -2327,6 +2327,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         model = self.model
         num_layers = self.model_config.num_hidden_layers
 
+        # One slot per probe row, for whatever writes this range's KV (the attention
+        # backend, or a model's fused RoPE + KV write).
+        forward_batch.out_cache_loc = plan.probe_cache_loc
         self._set_extend_lens(forward_batch, plan.probe_lens)
         self.attn_backend.init_forward_metadata(forward_batch)
         model.forward_split_prefill(

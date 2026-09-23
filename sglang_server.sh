@@ -11,8 +11,8 @@
 # sglang server for the sub-context experiments, one arm per start. This is the only
 # place an arm becomes server settings; run_swe.sh starts it once per arm as well.
 #
-#   ARM=cdc@0.15 CTXLEN=40960 CHUNKED_PREFILL=40960 sbatch sglang_server.sh   a job
-#   ARM=cdc@0.15 CTXLEN=40960 CHUNKED_PREFILL=40960 bash sglang_server.sh     this box
+#   ARM=cdc@0.15 CTXLEN=40960 sbatch sglang_server.sh   a job
+#   ARM=cdc@0.15 CTXLEN=40960 bash sglang_server.sh     this box
 #   ARM=cdc@0.15 bash sglang_server.sh check      validate, print the arm's file tag
 #
 # Arms:
@@ -29,8 +29,7 @@
 # Knobs:
 #
 #   MODEL=Qwen/Qwen3-30B-A3B CTXLEN=32768 PORT=30000 MEMFRAC=0.90 BACKEND=triton
-#   CHUNKED_PREFILL        required by a ratio > 0: at least the longest prompt, and the
-#                          same value for every arm compared
+#   CHUNKED_PREFILL        unset keeps the server default; the same for every arm compared
 #   TOOL_PARSER=qwen REASONING_PARSER=qwen3 QUANT=    empty drops the flag
 #   TOPK_LAYER CDC_TARGET CDC_MIN CDC_MAX             unset keeps the server default
 #   AUDIT TRACE ROTATE_GPU DUMP_TREE                  diagnostics; timings then unusable
@@ -95,12 +94,6 @@ if [ "$ARM" != "$NAME" ]; then
 fi
 TAG=$NAME
 if awk -v r="$RATIO" 'BEGIN { exit !(r > 0) }'; then
-  if [ -z "$CHUNKED_PREFILL" ]; then
-    echo "REFUSING: ARM=$ARM recomputes with no CHUNKED_PREFILL. The probe runs the whole"
-    echo "  prompt, so a prompt longer than the budget silently takes the stitch instead."
-    echo "  Set it to at least the longest prompt (e.g. $CTXLEN), the same for every arm."
-    exit 1
-  fi
   TAG=${NAME}_r$(awk -v r="$RATIO" 'BEGIN { printf "%02d", int(r * 100 + 0.5) }')
 fi
 
@@ -158,8 +151,9 @@ export SGLANG_SUBCTX_AUDIT=$AUDIT SGLANG_SUBCTX_TRACE=$TRACE \
 [ -z "${CDC_MIN:-}" ] || export SGLANG_SUBCTX_MIN_CHUNK=$CDC_MIN
 [ -z "${CDC_MAX:-}" ] || export SGLANG_SUBCTX_CDC_MAX=$CDC_MAX
 
-# A job serves other machines; on this box only this box needs it.
-HOST=${HOST:-$([ -n "${SLURM_JOB_ID:-}" ] && echo 0.0.0.0 || echo 127.0.0.1)}
+# A job serves other machines; on this box only this box needs it. Not read from the
+# environment: conda activation exports HOST as the compiler triplet.
+HOST=$([ -n "${SLURM_JOB_ID:-}" ] && echo 0.0.0.0 || echo 127.0.0.1)
 NODE_IP=$(hostname -I | awk '{print $1}')
 
 cat <<EOF

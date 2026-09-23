@@ -469,16 +469,6 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets,
         )
 
-    @staticmethod
-    def _extend_cache_loc(forward_batch: ForwardBatch) -> torch.Tensor:
-        """Where this layer's KV goes: the probe's slots (reused rows to dummy slot 0)
-        before the selection is made, ``out_cache_loc`` otherwise.
-        """
-        plan = forward_batch.subctx_blend_plan
-        if plan is not None and plan.sel_rows is None:
-            return plan.probe_cache_loc
-        return forward_batch.out_cache_loc
-
     def _forward_extend_sparse(
         self, q, o, layer, forward_batch: ForwardBatch, logits_soft_cap
     ):
@@ -884,7 +874,7 @@ class TritonAttnBackend(AttentionBackend):
         # Save KV cache first (must do this before unified kernel)
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, self._extend_cache_loc(forward_batch), k, v
+                layer, forward_batch.out_cache_loc, k, v
             )
 
         plan = forward_batch.subctx_blend_plan

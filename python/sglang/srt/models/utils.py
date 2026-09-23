@@ -127,6 +127,12 @@ def create_fused_set_kv_buffer_arg(
     k_buffer = token_to_kv_pool.get_key_buffer(layer_id)
     v_buffer = token_to_kv_pool.get_value_buffer(layer_id)
 
+    # The kernel writes row i to cache_loc[i], unchecked.
+    assert value.shape[0] <= forward_batch.out_cache_loc.shape[0], (
+        f"fused KV write: {value.shape[0]} rows but only "
+        f"{forward_batch.out_cache_loc.shape[0]} cache slots"
+    )
+
     return FusedSetKVBufferArg(
         value=value,
         k_buffer=k_buffer.view(k_buffer.shape[0], -1),

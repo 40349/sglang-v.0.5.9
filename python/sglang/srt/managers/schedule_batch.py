@@ -1236,11 +1236,20 @@ class Req(ReqDllmMixin):
         n_reused = sum(end - start for start, end, _slots in self.sub_context_layout)
         return min(n_reused, int(n_reused * subctx_config.TOPK_RATIO))
 
+    def sub_context_forward_rows(self) -> int:
+        """Rows the prefill forward runs: the whole prompt when selective recompute
+        probes it, otherwise the tokens to compute.
+        """
+        if self.sub_context_layout is not None and subctx_config.topk_active():
+            return len(self.fill_ids)
+        return self.extend_input_len
+
     def _sub_context_layout_fits_one_pass(self) -> bool:
         """Whether the sparse layout fits one prefill pass (it cannot be chunked).
 
-        The budget is ``--chunked-prefill-size``. It must hold the tokens left to
-        compute, or the whole prompt when selective recompute is on.
+        The budget is ``--chunked-prefill-size`` and it must hold the tokens left to
+        compute. Selective recompute's probe is not held to it; the prefill adder runs
+        a probe that does not fit alone.
         """
         if self.sub_context_layout is None:
             return True
@@ -1250,8 +1259,6 @@ class Req(ReqDllmMixin):
             return True  # no server args (unit tests)
         if budget is None or budget <= 0:
             return True
-        if subctx_config.topk_active():
-            return len(self.fill_ids) <= budget
         return len(self.fill_ids) - len(self.prefix_indices) <= budget
 
     @host_timer.timed("subctx_scan")
