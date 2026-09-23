@@ -5,6 +5,7 @@ this fork), and optionally checks that MASLab's ``model_api_config.json`` points
 same URL. Exits non-zero with the reason on any mismatch.
 
 Usage:
+    check_remote_arm.py URL --arm off|on|rot|idx|cdc[@ratio] [--audit B]
     check_remote_arm.py URL --split true|false --rotate true|false \
         [--index B] [--split-mode blocks|cdc] [--topk-ratio R] [--audit B] \
         [--maslab-config PATH --model NAME]
@@ -22,17 +23,33 @@ def _bool(v: str) -> bool:
     return v.lower() in ("1", "true", "yes", "on")
 
 
+# What each arm of sglang_server.sh leaves the server reporting.
+ARMS = {
+    "off": dict(split=False, rotate=False, index=False, split_mode="blocks"),
+    "on": dict(split=True, rotate=False, index=False, split_mode="blocks"),
+    "rot": dict(split=True, rotate=True, index=False, split_mode="blocks"),
+    "idx": dict(split=True, rotate=True, index=True, split_mode="blocks"),
+    "cdc": dict(split=True, rotate=True, index=True, split_mode="cdc"),
+}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("url", help="server base URL, e.g. http://140.118.202.100:30000")
-    ap.add_argument("--split", type=_bool, required=True)
+    ap.add_argument(
+        "--arm",
+        default=None,
+        help="an arm as sglang_server.sh takes it, e.g. cdc@0.15; sets --split, "
+        "--rotate, --index, --split-mode and --topk-ratio",
+    )
+    ap.add_argument("--split", type=_bool, default=None)
     ap.add_argument(
         "--split-mode",
         choices=("blocks", "cdc"),
         default=None,
         help="require the boundaries to come from roles (blocks) or content (cdc)",
     )
-    ap.add_argument("--rotate", type=_bool, required=True)
+    ap.add_argument("--rotate", type=_bool, default=None)
     ap.add_argument(
         "--index",
         type=_bool,
@@ -55,6 +72,15 @@ def main() -> int:
     ap.add_argument("--maslab-config")
     ap.add_argument("--model")
     args = ap.parse_args()
+    if args.arm is not None:
+        name, _, ratio = args.arm.partition("@")
+        if name not in ARMS:
+            ap.error(f"unknown arm {args.arm!r}")
+        for key, value in ARMS[name].items():
+            setattr(args, key, value)
+        args.topk_ratio = float(ratio or 0)
+    elif args.split is None or args.rotate is None:
+        ap.error("give --arm, or both --split and --rotate")
 
     base = args.url.rstrip("/")
     try:

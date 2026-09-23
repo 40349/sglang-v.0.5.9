@@ -26,7 +26,7 @@ python -u -m sglang.launch_server \
   --reasoning-parser qwen3
 ```
 
-`sglang_server.sh` 是包好的版本（`ARM=cdc bash sglang_server.sh`），但裡面的路徑是寫死的，自己跑的話用上面的指令比較快。
+`sglang_server.sh` 是包好的版本：在 checkout 裡執行 `ARM=cdc bash sglang_server.sh`（Slurm 上用 `sbatch`）。要重算一部分重用的 token 就把比例寫進 arm，例如 `ARM=cdc@0.15`，並且設 `CHUNKED_PREFILL`。其他參數寫在檔案開頭的註解。
 
 ---
 

@@ -1,232 +1,123 @@
 #!/bin/bash
-# SWE-bench arm of the sub-context A/B.
+#SBATCH --job-name=swe_toggle
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --gres=gpu:1
+#SBATCH --time=24:00:00
+#SBATCH --output=swe_toggle_%j.log
 #
-#   ./run_swe.sh record   server records every chat request; you drive swe_test.sh
-#   ./run_swe.sh toggle   replay that capture once per arm and print the tables
+# SWE-bench arm of the sub-context A/B. Starts sglang_server.sh once per arm; arms and
+# server knobs are that script's and pass straight through.
 #
-# Arms (same words as sglang_server.sh and run_mas.sh):
+#   ./run_swe.sh record   start ARM's server and record every chat request; you drive
+#                         the agent
+#   ./run_swe.sh toggle   replay that capture once per arm in ARMS and print the tables
+#   sbatch run_swe.sh toggle     the same as a batch job (submit from the checkout)
 #
-#   off  no split at all -- the stock single-namespace radix cache
-#   on   split into per-block namespaces, displaced hits dropped
-#   rot  + rotate a displaced hit to where it is reused, + Stage 2
-#   idx  + find blocks by content anywhere in the prompt, and prefill the gaps
-#   cdc  + cut the blocks on content too, not on the roles the prompt was built from
-#
-# TOPK_RATIO recomputes that fraction of the reused tokens on idx and cdc; a non-zero
-# ratio is appended to the file stem. Default ARMS is "off cdc". `cdc@0.15` sets the
-# ratio for that one arm, so several ratios run in one toggle.
-#
-#   ARMS="off rot idx cdc" ./run_swe.sh toggle          put the middle rungs back
-#   ARMS="off cdc cdc@0.15" CHUNKED_PREFILL=$CTXLEN ./run_swe.sh toggle
+#   ARMS="off cdc cdc@0.15" CTXLEN=40960 CHUNKED_PREFILL=40960 ./run_swe.sh toggle
+#   ARMS="off rot idx cdc" ./run_swe.sh toggle          the middle rungs; the first arm
+#                                                       is the baseline
 #   AUDIT=1 FULL=1 ./run_swe.sh toggle                  correctness pass, timings unusable
 #   REQUESTS=~/work/traces/requests_on_42.jsonl ...     a capture recorded elsewhere
-#   MODEL=... CTXLEN=... ./run_swe.sh ...               a smaller model for a smoke run
 #
-# `toggle` restarts the server per arm and reads the traces it writes locally: run it
-# on the box holding the GPU. Output lands in ab_out/swe. MASLab is run_mas.sh.
+# `toggle` reads the traces the server writes locally: run it on the box holding the
+# GPU. Output lands in ab_out/swe.
 set -euo pipefail
 
-# The script's own location, so this measures the checkout it sits in.
+# sbatch runs a spool copy of this file; the checkout is then where it was submitted.
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+[ -d "$REPO/python/sglang" ] || REPO=${SLURM_SUBMIT_DIR:-}
+[ -d "$REPO/python/sglang" ] || { echo "REFUSING: no checkout found; submit from it"; exit 1; }
+SERVER=$REPO/sglang_server.sh
 OUT=${OUT:-$REPO/ab_out/swe}
-MODEL=${MODEL:-Qwen/Qwen3-30B-A3B}
-PORT=${PORT:-30000}
-CTXLEN=${CTXLEN:-32768}       # the longest SWE-bench prompt measured is 32,996 tokens
 GEN_TOKENS=${GEN_TOKENS:-32}  # fixed generated length per replayed request
 CONC=${CONC:-1}               # requests in flight
-ENV=${ENV:-sglangv59}
-# Empty means "drop the flag". No colon: ${VAR:-x} substitutes for empty too.
-QUANT=${QUANT-}
-TOOL_PARSER=${TOOL_PARSER-qwen}
-
-ARMS=${ARMS:-"off cdc"}
-
-# Selective recompute (idx and cdc only). A ratio > 0 needs CHUNKED_PREFILL >= the
-# longest prompt, set for every arm in the comparison:
-#
-#   ARMS="off idx" TOPK_RATIO=0.15 CHUNKED_PREFILL=$CTXLEN ./run_swe.sh toggle
-TOPK_RATIO=${TOPK_RATIO:-0}
-TOPK_LAYER=${TOPK_LAYER:-1}
-CHUNKED_PREFILL=${CHUNKED_PREFILL:-}
-
-# An arm is `name` or `name@ratio`; the ratio defaults to TOPK_RATIO.
-arm_name()  { echo "${1%%@*}"; }
-arm_ratio() { case "$1" in *@*) echo "${1#*@}" ;; *) echo "$TOPK_RATIO" ;; esac; }
-ratio_positive() { awk -v r="$1" 'BEGIN { exit !(r > 0) }'; }
-
-any_ratio=
-for arm in $ARMS; do
-  case "$arm" in
-    *@*)
-      case "$(arm_name "$arm")" in
-        idx|cdc) ;;
-        *) echo "REFUSING: '$arm': only idx and cdc take a ratio"; exit 1 ;;
-      esac
-      awk -v r="$(arm_ratio "$arm")" 'BEGIN { exit !(r ~ /^[0-9.]+$/ && r >= 0 && r <= 1) }' || {
-        echo "REFUSING: '$arm': the ratio must be a number in [0, 1]"; exit 1; } ;;
-  esac
-  case "$(arm_name "$arm")" in
-    idx|cdc) ratio_positive "$(arm_ratio "$arm")" && any_ratio="$arm" ;;
-  esac
-done
-
-if [ -n "$any_ratio" ] && [ -z "$CHUNKED_PREFILL" ]; then
-  echo "REFUSING: $any_ratio recomputes with no CHUNKED_PREFILL. The probe runs the"
-  echo "  whole prompt, so anything longer than the budget takes the stitch instead --"
-  echo "  which is exactly the long, heavily-reused prompt this is for, and the arm"
-  echo "  would still produce a table. Try CHUNKED_PREFILL=$CTXLEN."
-  exit 1
-fi
-
-# Same backend for every arm; idx/cdc need triton (per-position mask).
-BACKEND=${BACKEND:-triton}
-
-# Slot-ownership audits (a full tree walk per pass; timings then include it).
-AUDIT=${AUDIT:-}
-
 # Use each request's own max_tokens instead of pinning the length with ignore_eos.
 FULL=${FULL:-}
-
-# conda.sh, resolved from CONDA_EXE rather than hardcoded.
-if [ -z "${CONDA_SH:-}" ]; then
-  _base=${CONDA_EXE:-}; _base=${_base%/bin/conda}
-  [ -n "$_base" ] || _base=$(conda info --base 2>/dev/null || true)
-  if [ -n "$_base" ] && [ -r "$_base/etc/profile.d/conda.sh" ]; then
-    CONDA_SH=$_base/etc/profile.d/conda.sh
-  else
-    CONDA_SH=/home/t2503-3090/miniconda3/etc/profile.d/conda.sh
-  fi
-fi
+# Slot-ownership audits in the server (a full tree walk per pass; timings include it).
+AUDIT=${AUDIT:-}
 # Override to replay a capture recorded elsewhere.
 REQUESTS=${REQUESTS:-$OUT/requests.jsonl}
 SWE_TEST=${SWE_TEST:-/home/t2503-3090/Desktop/MiaoChen/swe_bench/swe_test.sh}
 CHECK_ARM=$REPO/scripts/subcontext_sim/check_remote_arm.py
 
+ARM=${ARM:-on}
+ARMS=${ARMS:-"off cdc"}
+export MODEL=${MODEL:-Qwen/Qwen3-30B-A3B}
+export PORT=${PORT:-30000}
+# Replay saves only `content`, and a reasoning parser would move the pinned generation,
+# all of it inside <think>, out of it.
+export REASONING_PARSER=${REASONING_PARSER-}
+
+# Every arm is checked before the first one runs.
+check_arm() {
+  local out
+  out=$(ARM=$1 bash "$SERVER" check) || { echo "$out"; exit 1; }
+}
+case "${1:-}" in
+  record) check_arm "$ARM" ;;
+  toggle) for a in $ARMS; do check_arm "$a"; done ;;
+esac
+
 mkdir -p "$OUT"
-[ -r "$CONDA_SH" ] || {
-  echo "no conda.sh at $CONDA_SH"
-  echo "set CONDA_SH=<conda base>/etc/profile.d/conda.sh   (conda info --base)"
-  exit 1
-}
-source "$CONDA_SH"
-conda activate $ENV 2>/dev/null || {
-  echo "no conda env '$ENV' under $CONDA_SH; set ENV=<name>. available:"
-  conda env list
-  exit 1
-}
+if command -v ml > /dev/null 2>&1; then ml load miniconda3; fi
+eval "$(conda shell.bash hook)"
+conda activate "${ENV:-sglangv59}"
 export PYTHONNOUSERSITE=1        # ignore ~/.local
 export PYTHONUNBUFFERED=1
 export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
 
-arm_switches() {
-  # Cleared every time; an arm that does not set one gets the empty value.
-  export SUBCTX_OFF= SUBCTX_ROTATE= SUBCTX_ACROSS= SUBCTX_INDEX= SUBCTX_SPLIT=blocks
-  # The ratio applies to idx and cdc only.
-  export SUBCTX_TOPK_RATIO=0
-  local ratio
-  ratio=$(arm_ratio "$1")
-  case "$(arm_name "$1")" in
-    off) export SUBCTX_OFF=1 ;;
-    on)  ;;
-    rot) export SUBCTX_ROTATE=1 SUBCTX_ACROSS=1 ;;
-    idx) export SUBCTX_ROTATE=1 SUBCTX_INDEX=1 SUBCTX_TOPK_RATIO=$ratio ;;
-    cdc) export SUBCTX_ROTATE=1 SUBCTX_INDEX=1 SUBCTX_SPLIT=cdc SUBCTX_TOPK_RATIO=$ratio ;;
-    *)   echo "unknown arm '$1'; want any of: off on rot idx cdc"; exit 1 ;;
-  esac
-}
-
-# File stem per arm, as `summary` expects: off -> base, on -> sub, others as named. A
-# non-zero ratio on idx/cdc appends _rNN (percent).
+# File stem per arm, as `summary` expects: off -> base, on -> sub, others by their tag.
 arm_stem() {
-  local stem name ratio
-  name=$(arm_name "$1")
-  ratio=$(arm_ratio "$1")
-  case "$name" in
-    off) stem=base ;;
-    on)  stem=sub ;;
-    *)   stem="$name" ;;
-  esac
-  case "$name" in
-    idx|cdc)
-      if ratio_positive "$ratio"; then
-        echo "${stem}_r$(printf '%02d' "$(python -c "print(round($ratio*100))")")"
-      else
-        echo "$stem"
-      fi ;;
-    *) echo "$stem" ;;
+  case "${1%%@*}" in
+    off) echo base ;;
+    on)  echo sub ;;
+    *)   ARM=$1 bash "$SERVER" check ;;
   esac
 }
 
 # Ask the server what it is rather than trusting the switches.
 verify_arm() {
-  local split rotate index
-  case "$(arm_name "$1")" in
-    off) split=false; rotate=false; index=false ;;
-    on)  split=true;  rotate=false; index=false ;;
-    rot) split=true;  rotate=true;  index=false ;;
-    idx) split=true;  rotate=true;  index=true  ;;
-    cdc) split=true;  rotate=true;  index=true  ;;
-  esac
-  python "$CHECK_ARM" "http://127.0.0.1:$PORT" \
-    --split $split --rotate $rotate --index $index \
-    --split-mode "${SUBCTX_SPLIT:-blocks}" \
-    --topk-ratio "${SUBCTX_TOPK_RATIO:-0}" \
-    --audit "$([ -n "$AUDIT" ] && echo true || echo false)"
+  python "$CHECK_ARM" "http://127.0.0.1:$PORT" --arm "$1" \
+    --audit "$([ -n "${AUDIT:-}" ] && echo true || echo false)"
 }
 
 # `sglang::scheduler` holds the weights and the KV pool, and setproctitle renames it out
 # of reach of a "sglang.launch_server" match. `[s]` stops the pattern matching this shell.
 SGLANG_PROCS='[s]glang::|[s]glang\.launch_server|[s]glang\.bench|[s]glang\.srt'
 
-launch() {
-  pkill -TERM -f "$SGLANG_PROCS" 2>/dev/null || true
+stop() {
+  pkill -TERM -f "$SGLANG_PROCS" 2>/dev/null || true   # TERM so timers flush
   sleep 10
-  if [ -n "${TRACE:-}" ]; then rm -f "$TRACE"; fi
+}
+
+# Starts ARM $1 through sglang_server.sh and waits for it. Callers set LOG, and
+# optionally CAPTURE, FWD_TRACE, STAGE.
+launch() {
+  stop
+  if [ -n "${FWD_TRACE:-}" ]; then rm -f "$FWD_TRACE"; fi
   if [ -n "${STAGE:-}" ]; then rm -f "$STAGE".*; fi
-  SGLANG_CAPTURE_REQUESTS=${CAPTURE:-} \
-  SGLANG_FORWARD_TRACE=${TRACE:-} \
-  SGLANG_STAGE_TRACE=${STAGE:-} \
-  SGLANG_DISABLE_SUBCONTEXT=${SUBCTX_OFF:-} \
-  SGLANG_SUBCONTEXT_ROTATE=${SUBCTX_ROTATE:-} \
-  SGLANG_SUBCONTEXT_ROTATE_ACROSS=${SUBCTX_ACROSS:-} \
-  SGLANG_SUBCTX_INDEX=${SUBCTX_INDEX:-} \
-  SGLANG_SUBCTX_SPLIT=${SUBCTX_SPLIT:-blocks} \
-  SGLANG_SUBCTX_TOPK_RATIO=${SUBCTX_TOPK_RATIO:-0} \
-  SGLANG_SUBCTX_TOPK_LAYER=${TOPK_LAYER:-1} \
-  SGLANG_SUBCTX_AUDIT=${AUDIT:-} \
-  SGLANG_SUBCTX_TRACE=${SUBCTX_TRACE:-} \
-  nohup python -u -m sglang.launch_server \
-    --model-path $MODEL \
-    --context-length $CTXLEN \
-    ${CHUNKED_PREFILL:+--chunked-prefill-size $CHUNKED_PREFILL} \
-    ${QUANT:+--quantization $QUANT} \
-    ${TOOL_PARSER:+--tool-call-parser $TOOL_PARSER} \
-    --attention-backend $BACKEND \
-    --enable-cache-report \
-    --port $PORT \
-    --mem-fraction-static ${MEMFRAC:-0.90} \
-    > "$LOG" 2>&1 &
+  rm -f "$LOG"
+  ARM=$1 SERVER_LOG=$LOG CAPTURE=${CAPTURE:-} FWD_TRACE=${FWD_TRACE:-} STAGE=${STAGE:-} \
+    nohup bash "$SERVER" > "$LOG.start" 2>&1 &
+  local pid=$!
   echo -n "  waiting"
   for _ in $(seq 1 300); do
-    if grep -q "fired up and ready" "$LOG"; then echo " ready"; return 0; fi
-    if ! pgrep -f "[s]glang\.launch_server" > /dev/null; then
-      echo " DIED"; tail -30 "$LOG"; exit 1
+    if [ -f "$LOG" ] && grep -q "fired up and ready" "$LOG"; then echo " ready"; return 0; fi
+    if ! kill -0 $pid 2>/dev/null; then
+      echo " DIED"; cat "$LOG.start"; [ ! -f "$LOG" ] || tail -30 "$LOG"; exit 1
     fi
     echo -n .; sleep 2
   done
   echo " TIMEOUT"; tail -30 "$LOG"; exit 1
 }
 
-stop() {
-  pkill -TERM -f "$SGLANG_PROCS" 2>/dev/null || true   # TERM so timers flush
-  sleep 10
-}
-
-# Callers set CLIENT (+ TRACE/STAGE). --model is pinned to what the server holds.
+# Callers set CLIENT (+ FWD_TRACE/STAGE). --model is pinned to what the server holds.
 replay() {
   python $REPO/subcontext_bench.py replay "$REQUESTS" \
     --url http://127.0.0.1:$PORT \
-    --trace "${TRACE:-}" --stage-trace "${STAGE:-}" --out "$CLIENT" \
+    --trace "${FWD_TRACE:-}" --stage-trace "${STAGE:-}" --out "$CLIENT" \
     --model $MODEL --gen-tokens $GEN_TOKENS --concurrency $CONC --save-text \
     ${FULL:+--full}
 }
@@ -234,7 +125,7 @@ replay() {
 # The tables at the end are written nowhere else. CONSOLE= disables the tee.
 CONSOLE=${CONSOLE-$OUT/${1:-run}.txt}
 if [ -n "$CONSOLE" ]; then
-  echo "### $(date -Is)  $0 ${*:-}  ARMS='$ARMS' BACKEND=$BACKEND AUDIT=${AUDIT:-off} CONC=$CONC GEN_TOKENS=$GEN_TOKENS" >> "$CONSOLE"
+  echo "### $(date -Is)  $0 ${*:-}  ARMS='$ARMS' AUDIT=${AUDIT:-off} CONC=$CONC GEN_TOKENS=$GEN_TOKENS" >> "$CONSOLE"
   exec > >(tee -a "$CONSOLE") 2>&1
   TEE_PID=$!
   trap 'exec 1>&- 2>&-; wait $TEE_PID 2>/dev/null || true' EXIT
@@ -250,9 +141,8 @@ case "${1:-}" in
       exit 1
     }
     rm -f "$REQUESTS"
-    arm_switches "${ARM:-on}"
-    LOG=$OUT/server_record.log CAPTURE=$REQUESTS launch
-    verify_arm "${ARM:-on}"
+    LOG=$OUT/server_record.log CAPTURE=$REQUESTS launch "$ARM"
+    verify_arm "$ARM"
     cat <<TXT
 
 Recording every chat request. This does NOT run SWE-bench -- drive it yourself:
@@ -267,20 +157,19 @@ TXT
   toggle)
     [ -s "$REQUESTS" ] || { echo "no capture at $REQUESTS; run '$0 record' first"; exit 1; }
     echo "captured $(wc -l < "$REQUESTS") requests"
-    echo "arms: $ARMS   backend: $BACKEND   audit: ${AUDIT:-off}"
+    echo "arms: $ARMS   audit: ${AUDIT:-off}"
     baseline=$(echo $ARMS | awk '{print $1}')
 
     for arm in $ARMS; do
       stem=$(arm_stem "$arm")
       echo; echo "======== ARM: $arm ========"
-      arm_switches "$arm"
-      log=$OUT/server_${arm//@/_}.log
-      LOG=$log TRACE=$OUT/trace_$stem.jsonl STAGE=$OUT/stage_$stem launch
+      log=$OUT/server_$(ARM=$arm bash "$SERVER" check).log
+      LOG=$log FWD_TRACE=$OUT/trace_$stem.jsonl STAGE=$OUT/stage_$stem launch "$arm"
       verify_arm "$arm"
-      TRACE=$OUT/trace_$stem.jsonl STAGE=$OUT/stage_$stem \
+      FWD_TRACE=$OUT/trace_$stem.jsonl STAGE=$OUT/stage_$stem \
         CLIENT=$OUT/client_$stem.json replay
       # The index's own counters.
-      case "$(arm_name "$arm")" in
+      case "${arm%%@*}" in
         idx|cdc) grep "sub-context index:" "$log" | tail -1 || true ;;
       esac
     done
@@ -322,15 +211,14 @@ TXT
     echo "  record  server records SWE-bench traffic; you run $SWE_TEST"
     echo "  toggle  replay that capture once per arm  ->  $OUT"
     echo
-    echo "  ARMS='off idx'        which arms, in order; the first is the baseline"
-    echo "                        off|on|rot|idx|cdc"
+    echo "  ARM=on                the arm 'record' runs"
+    echo "  ARMS='off cdc@0.15'   which arms 'toggle' replays, in order; the first is the"
+    echo "                        baseline. off|on|rot|idx|cdc, idx/cdc@ratio (sglang_server.sh)"
     echo "  AUDIT=1               turn on the leak/ownership audits (timings unusable)"
     echo "  FULL=1                let requests stop naturally, so one can stop during"
     echo "                        prefill -- the path a pinned replay never reaches"
-    echo "  BACKEND=triton        attention backend, pinned across arms"
-    echo "  MODEL= CTXLEN= PORT=  override for a smaller smoke run"
     echo "  REQUESTS=<path>       replay a capture recorded elsewhere (e.g. the H200)"
-    echo "  QUANT= TOOL_PARSER=   empty to drop the flag (a non-MoE model has neither)"
-    echo "  MEMFRAC=0.90          KV pool share"
+    echo "  MODEL CTXLEN PORT MEMFRAC BACKEND CHUNKED_PREFILL TOOL_PARSER QUANT ..."
+    echo "                        server knobs, passed through to sglang_server.sh"
     exit 1;;
 esac

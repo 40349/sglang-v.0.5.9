@@ -8,45 +8,107 @@
 #SBATCH --output=sglang_%j.log
 #SBATCH --error=sglang_%j.err
 #
-# sglang server for the sub-context A/B, run on the H200 while MASLab stays local.
+# sglang server for the sub-context experiments, one arm per start. This is the only
+# place an arm becomes server settings; run_swe.sh starts it once per arm as well.
 #
-#   ARM=off   no split -- the stock radix cache, the baseline
-#   ARM=on    split into per-block namespaces (the default)
-#   ARM=rot   + rotate a displaced block into place, + Stage 2
-#   ARM=idx   + find blocks by content anywhere in the prompt, prefill the gaps
-#   ARM=cdc   + cut the blocks on content too, not on the roles the prompt was built from
+#   ARM=cdc@0.15 CTXLEN=40960 CHUNKED_PREFILL=40960 sbatch sglang_server.sh   a job
+#   ARM=cdc@0.15 CTXLEN=40960 CHUNKED_PREFILL=40960 bash sglang_server.sh     this box
+#   ARM=cdc@0.15 bash sglang_server.sh check      validate, print the arm's file tag
 #
-# One job per arm. The compute node's address is printed in the job log.
+# Arms:
 #
-# Diagnostics, off by default; each makes the timings unusable for the A/B:
-# SUBCTX_TRACE=1 (per-match tracing), SUBCTX_AUDIT=1 (slot-ownership audits),
-# DUMP_TREE=1, ROTATE_GPU=1 (CUDA events around the rotation).
+#   off   no split -- the stock single-namespace radix cache
+#   on    split into per-block namespaces, displaced hits dropped
+#   rot   + rotate a displaced hit to where it is reused, + Stage 2
+#   idx   + find blocks by content anywhere in the prompt, and prefill the gaps
+#   cdc   + cut the blocks on content too, not on the roles the prompt was built from
+#
+# idx and cdc take a recompute ratio after `@`: cdc@0.15 recomputes 15% of the tokens
+# it reuses. The arm is the only place a ratio is set.
+#
+# Knobs:
+#
+#   MODEL=Qwen/Qwen3-30B-A3B CTXLEN=32768 PORT=30000 MEMFRAC=0.90 BACKEND=triton
+#   CHUNKED_PREFILL        required by a ratio > 0: at least the longest prompt, and the
+#                          same value for every arm compared
+#   TOOL_PARSER=qwen REASONING_PARSER=qwen3 QUANT=    empty drops the flag
+#   TOPK_LAYER CDC_TARGET CDC_MIN CDC_MAX             unset keeps the server default
+#   AUDIT TRACE ROTATE_GPU DUMP_TREE                  diagnostics; timings then unusable
+#   SERVER_LOG CAPTURE FWD_TRACE STAGE                output paths; empty turns one off
+#
+# By default every request is recorded to $WORK_DIR/traces/requests_<tag>_<job>.jsonl.
 
 set -euo pipefail
 
-REPO=/home/m11402151/work/sglang-v.0.5.9
-WORK_DIR=/home/m11402151/work
-PORT=${PORT:-30000}
-MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-30B-A3B}
-CTXLEN=${CTXLEN:-16384}
-ARM=${ARM:-on}
+# sbatch runs a spool copy of this file; the checkout is then where it was submitted.
+REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+[ -d "$REPO/python/sglang" ] || REPO=${SLURM_SUBMIT_DIR:-}
+[ -d "$REPO/python/sglang" ] || { echo "REFUSING: no checkout found; submit from it"; exit 1; }
+WORK_DIR=${WORK_DIR:-$(dirname "$REPO")}
 
+ARM=${ARM:-on}
+MODEL=${MODEL:-Qwen/Qwen3-30B-A3B}
+CTXLEN=${CTXLEN:-32768}
+PORT=${PORT:-30000}
+MEMFRAC=${MEMFRAC:-0.90}
 # Same backend for every arm; idx/cdc need triton (per-position mask).
 BACKEND=${BACKEND:-triton}
-
-# run_swe.sh spells these AUDIT and TRACE; accept both.
-SUBCTX_AUDIT=${SUBCTX_AUDIT:-${AUDIT:-}}
-SUBCTX_TRACE=${SUBCTX_TRACE:-${TRACE:-}}
-SPLIT=blocks
-
-# Fraction of the reused tokens to recompute (idx/cdc only), and the scored layer.
-TOPK_RATIO=${TOPK_RATIO:-0}
-TOPK_LAYER=${TOPK_LAYER:-1}
 CHUNKED_PREFILL=${CHUNKED_PREFILL:-}
+# No colon: an explicitly empty value drops the flag.
+TOOL_PARSER=${TOOL_PARSER-qwen}
+REASONING_PARSER=${REASONING_PARSER-qwen3}
+QUANT=${QUANT:-}
+AUDIT=${AUDIT:-}
+TRACE=${TRACE:-}
 
-ml load miniconda3
+for v in "TOPK_RATIO|write the ratio into the arm, e.g. ARM=cdc@0.15" \
+         "MODEL_PATH|use MODEL" "SUBCTX_AUDIT|use AUDIT" "SUBCTX_TRACE|use TRACE"; do
+  if [ -n "$(printenv "${v%%|*}")" ]; then
+    echo "REFUSING: ${v%%|*} is no longer read; ${v#*|}."; exit 1
+  fi
+done
+for v in SGLANG_DISABLE_SUBCONTEXT SGLANG_SUBCONTEXT_ROTATE SGLANG_SUBCONTEXT_ROTATE_ACROSS \
+         SGLANG_SUBCTX_INDEX SGLANG_SUBCTX_SPLIT SGLANG_SUBCTX_TOPK_RATIO \
+         SGLANG_SUBCTX_TOPK_LAYER SGLANG_SUBCTX_CDC_TARGET SGLANG_SUBCTX_MIN_CHUNK \
+         SGLANG_SUBCTX_CDC_MAX SGLANG_SUBCTX_AUDIT SGLANG_SUBCTX_TRACE \
+         SGLANG_SUBCTX_ROTATE_GPU SGLANG_DUMP_TREE; do
+  if [ -n "$(printenv "$v")" ]; then
+    echo "REFUSING: $v is set in the environment; the arm and the knobs above set it."
+    exit 1
+  fi
+done
+
+NAME=${ARM%%@*}
+RATIO=0
+case "$ARM" in *@*) RATIO=${ARM#*@} ;; esac
+case "$NAME" in
+  off|on|rot|idx|cdc) ;;
+  *) echo "REFUSING: unknown ARM='$ARM'; want off|on|rot|idx|cdc, idx/cdc@ratio"; exit 1 ;;
+esac
+if [ "$ARM" != "$NAME" ]; then
+  case "$NAME" in
+    idx|cdc) ;;
+    *) echo "REFUSING: ARM=$ARM: only idx and cdc take a ratio"; exit 1 ;;
+  esac
+  awk -v r="$RATIO" 'BEGIN { exit !(r ~ /^[0-9]*\.?[0-9]+$/ && r >= 0 && r <= 1) }' || {
+    echo "REFUSING: ARM=$ARM: the ratio must be a number in [0, 1]"; exit 1; }
+fi
+TAG=$NAME
+if awk -v r="$RATIO" 'BEGIN { exit !(r > 0) }'; then
+  if [ -z "$CHUNKED_PREFILL" ]; then
+    echo "REFUSING: ARM=$ARM recomputes with no CHUNKED_PREFILL. The probe runs the whole"
+    echo "  prompt, so a prompt longer than the budget silently takes the stitch instead."
+    echo "  Set it to at least the longest prompt (e.g. $CTXLEN), the same for every arm."
+    exit 1
+  fi
+  TAG=${NAME}_r$(awk -v r="$RATIO" 'BEGIN { printf "%02d", int(r * 100 + 0.5) }')
+fi
+
+if [ "${1:-}" = check ]; then echo "$TAG"; exit 0; fi
+
+if command -v ml > /dev/null 2>&1; then ml load miniconda3; fi
 eval "$(conda shell.bash hook)"
-conda activate sglangv59
+conda activate "${ENV:-sglangv59}"
 
 export PYTHONPATH=$REPO/python
 export PYTHONNOUSERSITE=1
@@ -61,32 +123,14 @@ esac
 # Token goes in ~/.cache/huggingface/token, not here.
 export SGLANG_DISABLE_CUDNN_CHECK=1
 
-mkdir -p "$WORK_DIR/logs" "$WORK_DIR/traces"
-SUF="${ARM}_${SLURM_JOB_ID:-manual}"
-SERVER_LOG="$WORK_DIR/logs/sglang_${SUF}.log"
-
-# Per-arm switches; everything else about the binary is identical across arms.
-case "$ARM" in
-  on)  SUBCTX_OFF=""; ROT=""; ROT_ACROSS=""; INDEX="" ;;
-  off) SUBCTX_OFF="1"; ROT=""; ROT_ACROSS=""; INDEX="" ;;
-  rot) SUBCTX_OFF=""; ROT="1"; ROT_ACROSS="1"; INDEX="" ;;
-  idx) SUBCTX_OFF=""; ROT="1"; ROT_ACROSS=""; INDEX="1" ;;
-  cdc) SUBCTX_OFF=""; ROT="1"; ROT_ACROSS=""; INDEX="1"; SPLIT="cdc" ;;
-  *)   echo "REFUSING: unknown ARM='$ARM' (want on|off|rot|idx|cdc)"; exit 1 ;;
-esac
-
-# A ratio > 0 needs CHUNKED_PREFILL >= the longest prompt: a longer prompt falls back
-# to the stitch path.
-if awk -v r="$TOPK_RATIO" 'BEGIN { exit !(r > 0) }' && [ -z "$CHUNKED_PREFILL" ]; then
-  echo "REFUSING: TOPK_RATIO=$TOPK_RATIO needs CHUNKED_PREFILL set to at least the"
-  echo "  longest prompt you will send (the probe pass runs full length, so anything"
-  echo "  above the budget silently falls back to the stitch and reuses less)."
-  echo "  e.g. CHUNKED_PREFILL=$CTXLEN -- and set it for EVERY arm in the comparison,"
-  echo "  or the arms differ in their chunking as well as in the thing under test."
-  exit 1
-fi
-
-NODE_IP=$(hostname -I | awk '{print $1}')
+SUF="${TAG}_${SLURM_JOB_ID:-manual}"
+SERVER_LOG=${SERVER_LOG:-$WORK_DIR/logs/sglang_${SUF}.log}
+CAPTURE=${CAPTURE-$WORK_DIR/traces/requests_${SUF}.jsonl}
+FWD_TRACE=${FWD_TRACE-$WORK_DIR/traces/trace_${SUF}.jsonl}
+STAGE=${STAGE-$WORK_DIR/traces/stage_${SUF}}
+for p in "$SERVER_LOG" "$CAPTURE" "$FWD_TRACE" "$STAGE"; do
+  [ -z "$p" ] || mkdir -p "$(dirname "$p")"
+done
 
 # Refuse if something already serves this port.
 if curl -sf --max-time 5 "http://127.0.0.1:${PORT}/health" > /dev/null 2>&1; then
@@ -97,47 +141,55 @@ if curl -sf --max-time 5 "http://127.0.0.1:${PORT}/health" > /dev/null 2>&1; the
   exit 1
 fi
 
+export SGLANG_DISABLE_SUBCONTEXT= SGLANG_SUBCONTEXT_ROTATE= SGLANG_SUBCONTEXT_ROTATE_ACROSS= \
+  SGLANG_SUBCTX_INDEX= SGLANG_SUBCTX_SPLIT=blocks SGLANG_SUBCTX_TOPK_RATIO=0
+case "$NAME" in
+  off) SGLANG_DISABLE_SUBCONTEXT=1 ;;
+  on)  ;;
+  rot) SGLANG_SUBCONTEXT_ROTATE=1 SGLANG_SUBCONTEXT_ROTATE_ACROSS=1 ;;
+  idx) SGLANG_SUBCONTEXT_ROTATE=1 SGLANG_SUBCTX_INDEX=1 SGLANG_SUBCTX_TOPK_RATIO=$RATIO ;;
+  cdc) SGLANG_SUBCONTEXT_ROTATE=1 SGLANG_SUBCTX_INDEX=1 SGLANG_SUBCTX_SPLIT=cdc \
+         SGLANG_SUBCTX_TOPK_RATIO=$RATIO ;;
+esac
+export SGLANG_SUBCTX_AUDIT=$AUDIT SGLANG_SUBCTX_TRACE=$TRACE \
+  SGLANG_SUBCTX_ROTATE_GPU=${ROTATE_GPU:-} SGLANG_DUMP_TREE=${DUMP_TREE:-}
+[ -z "${TOPK_LAYER:-}" ] || export SGLANG_SUBCTX_TOPK_LAYER=$TOPK_LAYER
+[ -z "${CDC_TARGET:-}" ] || export SGLANG_SUBCTX_CDC_TARGET=$CDC_TARGET
+[ -z "${CDC_MIN:-}" ] || export SGLANG_SUBCTX_MIN_CHUNK=$CDC_MIN
+[ -z "${CDC_MAX:-}" ] || export SGLANG_SUBCTX_CDC_MAX=$CDC_MAX
+
+# A job serves other machines; on this box only this box needs it.
+HOST=${HOST:-$([ -n "${SLURM_JOB_ID:-}" ] && echo 0.0.0.0 || echo 127.0.0.1)}
+NODE_IP=$(hostname -I | awk '{print $1}')
+
 cat <<EOF
 ==========================================
 sglang server -- arm: $ARM
-model:  $MODEL_PATH
-backend:$BACKEND
-split:  $SPLIT   audit: ${SUBCTX_AUDIT:-off}   ctxlen: $CTXLEN
-topk:   ratio $TOPK_RATIO at layer $TOPK_LAYER   chunked prefill: ${CHUNKED_PREFILL:-default}
+model:  $MODEL
+backend:$BACKEND   audit: ${AUDIT:-off}   ctxlen: $CTXLEN   chunked prefill: ${CHUNKED_PREFILL:-default}
 node:   $(hostname)  ip: $NODE_IP
-URL:    http://${NODE_IP}:${PORT}/v1
+URL:    http://$([ "$HOST" = 0.0.0.0 ] && echo "$NODE_IP" || echo "$HOST"):${PORT}/v1
 log:    $SERVER_LOG
-trace:  $WORK_DIR/traces/*_${SUF}.*
+capture:${CAPTURE:- off}
 ==========================================
 EOF
 
-# --reasoning-parser qwen3 keeps the <think> block out of the scored content.
 # --enable-cache-report puts cached_tokens in the usage payload.
-SGLANG_DISABLE_SUBCONTEXT=$SUBCTX_OFF \
-SGLANG_SUBCONTEXT_ROTATE=$ROT \
-SGLANG_SUBCONTEXT_ROTATE_ACROSS=$ROT_ACROSS \
-SGLANG_SUBCTX_INDEX=$INDEX \
-SGLANG_SUBCTX_SPLIT=$SPLIT \
-SGLANG_SUBCTX_TOPK_RATIO=${TOPK_RATIO:-0} \
-SGLANG_SUBCTX_TOPK_LAYER=${TOPK_LAYER:-1} \
-SGLANG_SUBCTX_TRACE=$SUBCTX_TRACE \
-SGLANG_SUBCTX_ROTATE_GPU=${ROTATE_GPU:-} \
-SGLANG_SUBCTX_AUDIT=$SUBCTX_AUDIT \
-PYTHONUNBUFFERED=${SUBCTX_TRACE:+1} \
-SGLANG_DUMP_TREE=${DUMP_TREE:-} \
-SGLANG_CAPTURE_REQUESTS=$WORK_DIR/traces/requests_${SUF}.jsonl \
-SGLANG_FORWARD_TRACE=$WORK_DIR/traces/trace_${SUF}.jsonl \
-SGLANG_STAGE_TRACE=$WORK_DIR/traces/stage_${SUF} \
+PYTHONUNBUFFERED=${TRACE:+1} \
+SGLANG_CAPTURE_REQUESTS=$CAPTURE \
+SGLANG_FORWARD_TRACE=$FWD_TRACE \
+SGLANG_STAGE_TRACE=$STAGE \
 python -u -m sglang.launch_server \
-    --model-path "$MODEL_PATH" \
-    --host 0.0.0.0 \
+    --model-path "$MODEL" \
+    --host "$HOST" \
     --port "$PORT" \
     --tp-size 1 \
     --context-length "$CTXLEN" \
     ${CHUNKED_PREFILL:+--chunked-prefill-size "$CHUNKED_PREFILL"} \
-    --mem-fraction-static 0.9 \
+    --mem-fraction-static "$MEMFRAC" \
     --enable-cache-report \
     --attention-backend "$BACKEND" \
-    --tool-call-parser qwen \
-    --reasoning-parser qwen3 \
+    ${TOOL_PARSER:+--tool-call-parser "$TOOL_PARSER"} \
+    ${REASONING_PARSER:+--reasoning-parser "$REASONING_PARSER"} \
+    ${QUANT:+--quantization "$QUANT"} \
     > "$SERVER_LOG" 2>&1
