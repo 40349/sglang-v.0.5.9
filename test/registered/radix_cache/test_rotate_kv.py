@@ -1,15 +1,8 @@
-"""
-GPU test for the sub-context KV rotation kernel.
+"""GPU test for the sub-context KV rotation kernel.
 
-The claim under test is the one the whole feature rests on: because RoPE's angle is
-linear in the position, re-rotating a cached key by ``delta`` reproduces the key that
-would have been written at ``position + delta``. Everything else about the feature is
-bookkeeping around that identity, covered on CPU by ``test_sub_context_unit.py``.
-
-The oracle is the model's own ``RotaryEmbedding.forward_native``: the same raw key is
-RoPE'd at ``p`` (and cached) and at ``p + delta`` (the target), and the kernel has to
-turn the first into the second. V must come through byte-identical -- it carries no
-position at all.
+Re-rotating a cached key by ``delta`` must reproduce the key RoPE writes at
+``position + delta``, checked against the model's own ``forward_native``; V must be
+copied byte-identical.
 
 Usage:
     python test_rotate_kv.py
@@ -165,13 +158,7 @@ class TestRotateKV(unittest.TestCase):
             self.assertTrue(torch.equal(pool.k_buffer[layer][src], before[layer]))
 
     def test_in_place_rotation_matches_the_copying_one(self):
-        """``dst is src``: the write path rotates a block where it already lies.
-
-        Nothing new is allocated there -- the slots are the finishing request's own --
-        so the kernel has to be correct when source and destination are the same row.
-        Each program loads its row before it stores to it, so this holds, and it is
-        cheap enough to keep proving.
-        """
+        """``dst is src`` (in-place rotation) gives the same result as copying."""
         device = "cuda"
         for native in (False, True):
             with self.subTest(native=native):
@@ -220,12 +207,8 @@ class TestRotateKV(unittest.TestCase):
 
 
 class TestDeltaComposableSelfTest(unittest.TestCase):
-    """The startup gate that decides which RoPEs may be rotated at all.
-
-    It replaced a list of class names, so what has to be shown is that it is a real
-    discriminator and not a rubber stamp: the ropes that do compose pass, and two
-    ropes that do not are rejected -- one whose law changes with the position, and
-    one with a scale factor left in the row.
+    """The startup self-test that decides which RoPEs may be rotated: composing
+    ropes pass; a position-dependent law and an undivided scale factor are rejected.
     """
 
     HEAD = 128
@@ -265,9 +248,7 @@ class TestDeltaComposableSelfTest(unittest.TestCase):
                 self.assertIsNone(rope_delta_composable_reason(self.rope(scaling)))
 
     def test_a_law_that_changes_with_position_is_rejected(self):
-        """Phi3LongRoPE's shape: one inv_freq below a threshold, another above it.
-
-        Near the origin such a cache is indistinguishable from a plain one, so the
+        """Phi3LongRoPE's shape: one inv_freq below a threshold, another above it. The
         samples reach past 8192.
         """
         rope = RotaryEmbedding(self.HEAD, self.HEAD, 40960, 1000000, True, torch.float32)
@@ -295,11 +276,7 @@ class TestDeltaComposableSelfTest(unittest.TestCase):
         torch.testing.assert_close(unit, torch.ones_like(unit), rtol=1e-6, atol=1e-6)
 
     def test_the_self_test_catches_an_undivided_mscale(self):
-        """The negative control for the line above: skip the division, get rejected.
-
-        Without it every reuse would multiply K by mscale -- 1.14x per hop here, and
-        silently, since nothing else in the system inspects the cached values.
-        """
+        """Without the mscale division, the self-test rejects the rope."""
         import sglang.srt.mem_cache.rotate_kv as rotate_kv
 
         def raw_row(cache, rotary_dim, delta):
@@ -318,11 +295,8 @@ class TestDeltaComposableSelfTest(unittest.TestCase):
         self.assertIn("not delta-composable", reason)
 
     def test_mrope_passes_numerically_and_is_excluded_structurally(self):
-        """Why ``rotation_unsupported_reason`` still names mrope by class.
-
-        Fed scalar positions, mrope *is* plain RoPE and passes -- the self-test never
-        sees the case that breaks it, a 3-vector position from an image. A measurement
-        can only refuse what it can reach, so that one stays a structural veto.
+        """With scalar positions mrope passes the self-test, so
+        ``rotation_unsupported_reason`` refuses it by class.
         """
         mrope = self.rope({"rope_type": "default", "mrope_section": [16, 24, 24]})
         self.assertIsNone(rope_delta_composable_reason(mrope))

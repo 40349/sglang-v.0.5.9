@@ -6,7 +6,7 @@
 #   ARM=on TAG=ag_he  ./run_mas.sh eval     pass@1 for a record run's results
 #
 # Arms, same words as sglang_server.sh: off (no split), on (split), rot (+ rotation
-# and Stage 2). `toggle` drives all three itself and refuses to be told one.
+# and Stage 2). `toggle` runs off and on (and rot with ROTATE=1) itself; do not set ARM.
 #
 # An arm's results land in ab_out/maslab/<arm>/ named ..._<tag>_<arm>, both halves from
 # $ARM. Everything printed is also appended to
@@ -20,9 +20,7 @@
 # per-request number.
 #
 # REMOTE SERVER. SERVER_URL runs MASLab here against a server on another box (the
-# H200); ARM must match how that server was started, and `record` reads /server_info
-# and refuses if it does not. `toggle` restarts the server per arm and reads traces on
-# its own disk: run it on the server box.
+# H200); `record` checks /server_info against ARM. `toggle` must run on the server box.
 #
 #   SERVER_URL=http://140.118.202.100:30000 ARM=rot \
 #     METHOD=agentverse MAS_CONFIG= DATASET=humaneval TAG=av_he ./run_mas.sh record
@@ -215,13 +213,12 @@ report_gpu() {
   return 0
 }
 
-# Callers set LOG, and optionally CAPTURE / TRACE / STAGE / SUBCTX_* / ROTATE_GPU.
-# ROTATE_GPU=1 fills the summary's [GPU] row and adds an event pair per rotation.
+# Callers set LOG, and optionally CAPTURE / TRACE / STAGE / SUBCTX_OFF / SUBCTX_TRACE /
+# SUBCTX_ROTATE / SUBCTX_ROTATE_ACROSS / ROTATE_GPU (CUDA events per rotation).
 launch() {
   kill_servers
   require_free_vram
-  # `nohup ... &` outlives this shell, Ctrl-C included. Armed here so only a run that
-  # started a server tears one down.
+  # on_exit stops the server only if this run started one.
   LAUNCHED=1
   if [ -n "${TRACE:-}" ]; then rm -f "$TRACE"; fi
   if [ -n "${STAGE:-}" ]; then rm -f "$STAGE".*; fi
@@ -322,10 +319,8 @@ case "${1:-}" in
         --model_name $MAS_MODEL \
         --model_temperature $MAS_TEMP \
         --output_path "$INFER" )
-    # Refuse a run whose server went away mid-flight: it writes a full-length results
-    # file with `None` where the calls failed. An unparseable answer is not that --
-    # AgentVerse's parse_solver raises IndexError on a reply that ran out of tokens
-    # mid-fence -- so keep those and score them.
+    # Refuse a run in which requests never reached the server; answers the method could
+    # not parse are kept and scored as failures.
     python - "$INFER" <<'EOF' || exit 1
 import json, sys
 rows = [json.loads(l) for l in open(sys.argv[1])]
@@ -369,7 +364,7 @@ EOF
     ;;
 
   toggle)
-    [ -z "$ARM" ] || { echo "REFUSING: toggle runs all three arms; do not set ARM"; exit 1; }
+    [ -z "$ARM" ] || { echo "REFUSING: toggle runs every arm itself; do not set ARM"; exit 1; }
     [ "$REMOTE" = 1 ] && {
       echo "REFUSING: 'toggle' restarts the server per arm and reads traces it writes"
       echo "locally, so it must run ON the server box. The capture is already there;"
@@ -401,8 +396,7 @@ EOF
         TRACE=$OUT/trace_rot$SUF.jsonl STAGE=$OUT/stage_rot$SUF launch
       grep -q "Sub-context KV rotation ENABLED" $OUT/server_rot$SUF.log \
         || { echo "REFUSING: rotation did not report itself enabled"; exit 1; }
-      # ACROSS decides whether prefill is cut at block edges: ~4.5 pp of hit rate and
-      # ~10% of prefill GPU time.
+      # ACROSS: whether prefill chunks are cut at block edges (Stage 2).
       want_across=$([ -n "${ACROSS:-}" ] && echo True || echo False)
       grep -q "across-recompute=$want_across" $OUT/server_rot$SUF.log \
         || { echo "REFUSING: asked for ACROSS=${ACROSS:-<unset>} but the server reported"; \
@@ -421,8 +415,7 @@ EOF
     python $REPO/subcontext_bench.py parity \
       $OUT/client_base$SUF.json $OUT/client_sub$SUF.json || true
 
-    # With rotation in the run the headline is baseline vs rotation. `--arms
-    # base,sub,rot` puts the plain split's column back.
+    # With ROTATE the summary shows base,rot; `--arms base,sub,rot` adds the split.
     echo; echo "======== SUMMARY ========"
     python $REPO/subcontext_bench.py summary "$OUT" --suffix "$SUF" \
       ${ROTATE:+--arms base,rot}
@@ -434,8 +427,6 @@ EOF
       python $REPO/subcontext_bench.py report $OUT/trace_base$SUF.jsonl $OUT/trace_rot$SUF.jsonl
       echo; echo "======== ROTATE host cost ========"
       python $REPO/subcontext_bench.py stages $OUT/stage_sub$SUF $OUT/stage_rot$SUF
-      # Rotation fixes the position a block is reused at, not the context it was
-      # computed under. pass@1 prices the divergence.
       echo; echo "======== PARITY: rotate vs split (divergence EXPECTED) ========"
       python $REPO/subcontext_bench.py parity \
         $OUT/client_sub$SUF.json $OUT/client_rot$SUF.json || true
@@ -443,8 +434,7 @@ EOF
     ;;
 
   eval)
-    # Separate from toggle: the replay pins the length with ignore_eos. Quality comes
-    # from the record run.
+    # Scores a record run (the replay pins the length with ignore_eos).
     : "${TAG:?set TAG to the run you want scored}"
     [ -s "$INFER" ] || { echo "no results at $INFER; run '$0 record' first"; exit 1; }
     echo ">> scoring $INFER${ARM:+ (arm $ARM)}"
@@ -454,8 +444,7 @@ EOF
         --tested_dataset_name "$DATASET" \
         --tested_infer_path "$INFER" \
         --overwrite )
-    # evaluate.py leaves eval_score None where the method produced nothing and reports
-    # accuracy over the rest, giving each arm its own denominator. Score every row.
+    # Re-score over every row, counting eval_score None as a failure.
     python - "$OUT/xverify_eval$SUF.jsonl" <<'EOF'
 import json, os, sys
 p = sys.argv[1]
@@ -464,7 +453,7 @@ if not os.path.exists(p):
 rows = [json.loads(l) for l in open(p)]
 ok = sum(1 for r in rows if r.get("eval_score") == 1)
 unscored = sum(1 for r in rows if r.get("eval_score") is None)
-print(f"  pass@1 over ALL {len(rows)}: {ok}/{len(rows)} = {ok / len(rows):.2%}"
+print(f"  pass@1 over ALL {len(rows)}: {ok}/{len(rows)} = {ok / max(len(rows), 1):.2%}"
       f"   ({unscored} unanswered, counted as failures)")
 EOF
     ;;
@@ -473,7 +462,7 @@ EOF
     echo "usage: ARM=on|off|rot METHOD=.. DATASET=.. TAG=.. $0 {record|toggle|eval}"
     echo "  record  ARM=on METHOD=autogen MAS_CONFIG=config_code DATASET=humaneval TAG=ag_he $0 record"
     echo "  eval    ARM=on TAG=ag_he DATASET=humaneval $0 eval"
-    echo "  toggle  REQUESTS=<capture> TAG=ag_he_ab $0 toggle   (no ARM: it runs all three)"
+    echo "  toggle  REQUESTS=<capture> TAG=ag_he_ab $0 toggle   (no ARM; ROTATE=1 adds rot)"
     echo "  CONC=N replays with N requests in flight; the summary's throughput row"
     echo "  is 1/latency at the default CONC=1"
     echo "  an arm's files live in ab_out/maslab/<arm>/ and are suffixed _<tag>_<arm>"

@@ -86,11 +86,9 @@ class FakeAllocator:
 
 
 class FakeRotator:
-    """Stands in for the Triton kernel: records the deltas, moves no real KV.
+    """Stands in for the Triton kernel: records the calls, moves no KV.
 
-    The kernel's arithmetic is covered on GPU by ``test_rotate_kv.py``; what these
-    tests check is the bookkeeping around it -- which slots get allocated, what ends up
-    in prefix_indices, and that everything is freed exactly once.
+    The kernel's arithmetic is tested on GPU by ``test_rotate_kv.py``.
     """
 
     def __init__(self, max_delta: int = 10**6):
@@ -164,9 +162,8 @@ def prefill(cache, pool, req: Req, first_slot: int) -> None:
 def prefill_chunk(cache, pool, req: Req, upto: int, first_slot: int) -> None:
     """One chunked-prefill pass covering origin_input_ids[:upto].
 
-    Mirrors `prefill`, but stops short of the prompt so the next pass picks up where
-    `cache_unfinished_req` left `prefix_indices` -- which is the whole point of the
-    Stage 2 path, since the scheduler does not re-match a chunked request.
+    Like `prefill`, but the next pass continues from the `prefix_indices` that
+    `cache_unfinished_req` left (the scheduler does not re-match a chunked request).
     """
     reused = len(req.prefix_indices)
     pool.req_to_token[req.req_pool_idx, :reused] = req.prefix_indices
@@ -449,11 +446,7 @@ class TestRotatedBlocks(unittest.TestCase):
         self.assertEqual(req.sub_context_tree_owned, [True, False, True])
 
     def test_restitch_clears_stale_ownership(self):
-        """A re-scheduled request must not inherit last attempt's tree ownership.
-
-        Retraction frees the request's KV, so a block that was tree-owned then may be
-        this request's to free now; a stale True would leak it at finish.
-        """
+        """A re-scheduled request does not inherit the last attempt's tree ownership."""
         rotator = FakeRotator()
         cache, pool, allocator = self._seed(rotator)
         req = self._shifted_req()
@@ -473,10 +466,9 @@ class TestRotatedBlocks(unittest.TestCase):
         allocator.freed.clear()
         decode_and_finish(cache, pool, req, [9], first_slot=400)
 
-        # Only the rotated copy of [7,8], which the re-file handed back as a duplicate
-        # of what the namespace already held. The generated token 400 is NOT here: the
-        # re-file closed the hole [7,8] left, so the reply could be cached. The tree
-        # owns the head and the tail block, and nothing is freed twice.
+        # Freed: only the rotated copy of [7,8], a duplicate of what the namespace held.
+        # Token 400 is cached with the reply, since the re-file made the prompt
+        # tree-owned.
         self.assertEqual(sorted(allocator.freed), [900, 901])
         self.assertEqual(len(allocator.freed), len(set(allocator.freed)))
 
@@ -518,11 +510,8 @@ class TestRotatedBlocks(unittest.TestCase):
             subctx_config.ROTATE_ACROSS_RECOMPUTE = original
 
     def test_block_after_a_recompute_is_rotated_in(self):
-        """Stage 2: block 0 partially hits, and block 1 is still reused after it.
-
-        The stitch cannot take block 1 -- the tokens before it do not exist yet -- so
-        the chunk is cut at block 1's offset, and once the gap is computed the block is
-        rotated onto the end of the prefix instead of being recomputed.
+        """Stage 2: block 0 partially hits; the chunk is cut at block 1's offset and
+        block 1 is rotated onto the end of the prefix.
         """
         import sglang.srt.utils.subctx_config as subctx_config
 
@@ -576,15 +565,7 @@ class TestSubContextLifecycle(unittest.TestCase):
     """Match -> per-namespace insert -> finish, and the reuse it enables."""
 
     def test_read_and_write_gates_agree(self):
-        """The read path and the write paths must answer "is this request split?"
-        identically, in every state that has ever pulled them apart.
-
-        Both times this failed, the write gate carried a condition the read gate did
-        not -- a length clause, then a `sub_context_last_nodes` check -- and the request
-        was stitched out of the namespaces by one and filed under the DEFAULT namespace
-        by the other. `serves_sub_contexts` is now the single gate; this holds the three
-        call sites to it.
-        """
+        """The read path and both write paths make the same `serves_sub_contexts` decision in every state."""
         for label, page_size, mutate in (
             ("fresh request", 1, lambda r: None),
             # `fill_ids = origin_input_ids + output_ids`, so a retracted request comes
@@ -613,17 +594,8 @@ class TestSubContextLifecycle(unittest.TestCase):
                 )
 
     def test_finishing_without_an_unfinished_pass_files_nothing_by_default_key(self):
-        """A split request can reach finish without ever running an unfinished pass --
-        it emitted its stop token during prefill, or was aborted while queued.
-
-        `cache_finished_req` used to gate the sub-context branch on
-        `sub_context_last_nodes`, which only that pass sets, so such a request fell
-        through to the default branch and filed whatever `req_to_token` held under
-        `req.extra_key` -- None. The stitch had just pointed that prefix at the
-        namespace nodes' own slots, so the tree served them under two keys at once and
-        evicting either handed a live slot back to the pool. Job 441's
-        `dup_within_tree`, and a replay with ignore_eos cannot produce it because no
-        request can finish at prefill.
+        """A split request that finishes without an unfinished pass (stop token at
+        prefill, or aborted while queued) files nothing under the default namespace.
         """
         cache, pool, allocator = make_cache()
         seed = make_req("r1", [[1, 2, 3], [7, 8]], [SYS_KEY, MSG_KEY])
@@ -798,13 +770,7 @@ class TestSubContextLifecycle(unittest.TestCase):
 
 
 class TestReverseRotateInsert(unittest.TestCase):
-    """A block the namespace refused is rotated back to its position and filed there.
-
-    The read path can rescue a displaced block for *this* request; the write path could
-    not, so the block stayed a hole, the prompt was never fully tree-owned, and
-    `_cache_sub_context_output` refused the reply. In an agent loop that costs a whole
-    turn: the next round re-prefills every reply it was meant to have cached.
-    """
+    """A block the namespace refused is rotated to the namespace's position and filed there at finish."""
 
     TOOLS_KEY = "tools_key"
 
@@ -896,16 +862,10 @@ class TestReverseRotateInsert(unittest.TestCase):
         self.assertEqual(cache.matched_canonical_position(m.last_device_node, 4), 3)
 
     def _declined_block_with_shared_head(self):
-        """A block the write path refused whose head is the TREE's own slots.
-
-        Seen on H200 job 429: `tree_owned=[True, False]` with `owned_lens=[259, 2197]`
-        -- the stitch took the messages block's head straight from the tree at a plain
-        hit, and only afterwards did another writer move that namespace, so the write
-        path declined the block. From finish's point of view the block is "not tree
-        owned", yet part of it is, and that is the whole trap.
+        """A block the write path declined whose head is the tree's own slots.
 
         Returns the pieces both regressions need, with the request stitched, written to
-        req_to_token, and already through `cache_unfinished_req`.
+        req_to_token, and through `cache_unfinished_req`.
         """
         rotator = FakeRotator()
         cache, pool, allocator = make_cache(rotator=rotator)
@@ -939,12 +899,7 @@ class TestReverseRotateInsert(unittest.TestCase):
         return cache, pool, allocator, rotator, second, tree_slots
 
     def test_a_tree_reused_head_is_never_handed_back(self):
-        """Freeing a declined block from its start returns the tree's own slots.
-
-        Its node still points at them, so the allocator reissues them while the tree
-        goes on serving them as cache -- which is how the KV cache ends up claiming
-        more tokens than the pool holds.
-        """
+        """Finishing a declined block does not free the tree's slots at its head."""
         cache, pool, allocator, _rot, second, tree_slots = (
             self._declined_block_with_shared_head()
         )
@@ -957,17 +912,8 @@ class TestReverseRotateInsert(unittest.TestCase):
         )
 
     def test_a_tree_held_slot_is_kept_wherever_it_sits(self):
-        """The overlap with the tree is not a prefix, so a leading run cannot find it.
-
-        Job 432: `double_pos` began one slot AFTER the block's offset -- the first slot
-        differed and the ~2000 behind it did not. Counting the leading run of agreement
-        gave 0, and the whole matched prefix went back to the pool while the tree went
-        on serving it; three different requests handed back the same slots (212, 213,
-        214 ...) that way, and the pool then issued live KV.
-
-        The head is diverged here directly rather than through whatever produced it on
-        the H200 -- a recomputed first token, a node another writer replaced. What has
-        to hold is the response to the shape, not the shape's provenance.
+        """Tree-held slots are kept even when they do not start at the block's offset
+        (the overlap is compared per position, not as a leading run).
         """
         cache, pool, allocator, _rot, second, tree_slots = (
             self._declined_block_with_shared_head()
@@ -985,15 +931,7 @@ class TestReverseRotateInsert(unittest.TestCase):
         self.assertIn(999, allocator.freed, "this request's own slot was not freed")
 
     def test_a_shared_head_is_never_rotated_in_place(self):
-        """In-place rotation is only ever safe on slots this request allocated.
-
-        The re-file rotates a block where it lies, which is sound for KV this request
-        computed and catastrophic for KV it merely borrowed: the shared node would come
-        away rotated for somewhere else while still advertising its old canonical
-        position, so every later hit on it reads K rotated for nowhere. Unlike a double
-        free this leaves the accounting perfect -- nothing but output quality shows it,
-        which is why it gets its own test rather than riding on the free assertion.
-        """
+        """A declined block holding any of a node's slots is never rotated in place."""
         cache, pool, allocator, rotator, second, tree_slots = (
             self._declined_block_with_shared_head()
         )
@@ -1114,14 +1052,7 @@ class TestSubContextTruncation(unittest.TestCase):
 
 
 class TestContentAddressedNamespaces(unittest.TestCase):
-    """Addressing a block by its tokens instead of the role it played.
-
-    A role name is one namespace for every content that ever plays that role, and a
-    namespace is pinned to the position its first occupant was inserted at. So the one
-    block that changes every turn -- the conversation tail -- is frozen out of the
-    cache from request #2 onwards. Content addressing dissolves that: different tokens
-    are a different namespace and carry their own position.
-    """
+    """Namespaces named by a block's tokens instead of by its role."""
 
     def setUp(self):
         self._saved = subctx_config.HASH_SUBCONTEXT_KEYS
@@ -1148,12 +1079,7 @@ class TestContentAddressedNamespaces(unittest.TestCase):
         self.assertNotEqual(same.sub_context_extra_keys[1], req.sub_context_extra_keys[1])
 
     def test_the_adapter_reaches_the_block_keys(self):
-        """``extra_key`` carries cache_salt with lora_id concatenated onto it.
-
-        The role names dropped it, so one adapter's KV was served to a request using
-        another -- the same tokens do not produce the same keys and values under a
-        different adapter.
-        """
+        """``extra_key`` (cache_salt + lora_id) is part of every block's namespace."""
         subctx_config.HASH_SUBCONTEXT_KEYS = True
         blocks = [[1, 2, 3], [7, 8, 9]]
         plain = make_req("r1", blocks, [SYS_KEY, MSG_KEY])
@@ -1169,12 +1095,8 @@ class TestContentAddressedNamespaces(unittest.TestCase):
         self.assertNotEqual(plain.sub_context_extra_keys, salted.sub_context_extra_keys)
 
     def test_a_block_that_grew_is_no_longer_frozen_out(self):
-        """The failure content addressing exists to fix.
-
-        Turn 1 files its tail at offset 6. Turn 2's tail extends it but starts at
-        offset 4, and under one shared namespace the write path finds the earlier
-        canonical position, refuses the block, and goes on refusing it for the rest of
-        the conversation -- so the only block worth caching never is.
+        """A tail that grew and moved is a new namespace, so it is inserted rather than
+        refused for the old one's position.
         """
         first_blocks = [[1, 2, 3, 4, 5, 6], [50, 51, 52, 53]]
         grown_blocks = [[1, 2, 3, 4], [50, 51, 52, 53, 54, 55]]
@@ -1195,14 +1117,7 @@ class TestContentAddressedNamespaces(unittest.TestCase):
 
 
 class TestScanCeiling(unittest.TestCase):
-    """What a content scan finds that a prefix-only reuse cannot reach.
-
-    The stitch can only hand prefill a run starting at position 0, so the moment one
-    block misses, every block behind it is refused however well it is cached. Scanning
-    the prompt against the index finds those blocks wherever they sit. The dry run
-    measures the gap without changing what the server does, which is what makes it
-    worth running on a real workload before the prefill path is touched.
-    """
+    """Dry run: what a content scan finds beyond the stitched prefix, with nothing changed."""
 
     def setUp(self):
         self._saved = (subctx_config.HASH_SUBCONTEXT_KEYS, subctx_config.INDEX_DRYRUN)
@@ -1265,12 +1180,7 @@ class TestScanCeiling(unittest.TestCase):
 
 
 def tree_slot_owners(cache):
-    """Every slot the tree holds, and which namespaces claim it.
-
-    A slot with two claimants is the worst failure this mechanism can produce: evict
-    either owner and the survivor goes on serving KV the pool has handed to someone
-    else. It is silent -- no crash, no NaN -- so it has to be asserted, not observed.
-    """
+    """Every slot the tree holds, and the namespaces that hold it."""
     owners = {}
     stack = [(child, key[0] if isinstance(key, tuple) else None)
              for key, child in cache.root_node.children.items()]
@@ -1290,13 +1200,7 @@ def wide_pool(pool, width: int = 512):
 
 
 class TestScanDrivenReuse(unittest.TestCase):
-    """Reuse that does not have to be a prefix.
-
-    The stitch can only hand prefill a run starting at position 0, so the first block
-    that misses discards every block behind it. Scanning finds each block wherever it is
-    cached and the prefill computes the gaps, which is what these exercise -- along with
-    the accounting that has to hold while it does.
-    """
+    """Scan path: reused runs anywhere in the prompt, the gaps computed."""
 
     HEAD_A = list(range(1, 41))
     HEAD_B = list(range(900, 910))
@@ -1357,12 +1261,8 @@ class TestScanDrivenReuse(unittest.TestCase):
         self.assertEqual(second.sub_context_no_insert, [True, True, True])
 
     def test_a_grown_tail_reuses_its_earlier_self(self):
-        """The agent case: this turn's conversation contains last turn's.
-
-        Content addressing is what makes it findable -- the two are different chunks, so
-        probing this turn's address would never turn up last turn's -- and re-cutting is
-        what keeps it affordable, since the new work is stored as its own chunk rather
-        than as another copy of everything before it.
+        """This turn's conversation contains last turn's: the earlier tail is found and
+        reused, and only the new tokens are computed, as a block of their own.
         """
         cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
 
@@ -1382,14 +1282,7 @@ class TestScanDrivenReuse(unittest.TestCase):
         self.assertEqual([len(b) for b in grown.sub_context_ids], [40, 40, 40])
 
     def test_no_slot_ends_up_with_two_owners(self):
-        """The regression this design exists to prevent.
-
-        Reusing a run from chunk X inside a larger block, then filing that block under
-        its own address, hands X's slots to a second namespace -- and the first eviction
-        of either then frees KV the other is still serving. Re-cutting the prompt around
-        what was found is what makes the block's address and its slots' namespace the
-        same one.
-        """
+        """After a scan-driven prefill and finish, no slot is held by two namespaces."""
         cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
 
         grown = make_req(
@@ -1406,14 +1299,8 @@ class TestScanDrivenReuse(unittest.TestCase):
         self.assertEqual(shared, {}, f"slots claimed by two namespaces: {shared}")
 
     def test_a_trimmed_run_at_its_own_position_is_not_freed(self):
-        """The case where a trimmed block's slots belong to the tree.
-
-        When the run is already at the position it was computed for there is nothing to
-        rotate, so it is reused in place and those slots are a node's. The block is then
-        cut short to leave prefill a token, which gives it an address no namespace was
-        ever filed under -- and the free path asks the tree who holds a slot before
-        giving it back. Asked under that address it would find nothing and hand the
-        node's own KV to the pool, which reissues it while the node goes on serving it.
+        """A run reused in place and trimmed by one token: its slots stay with the tree
+        (freed only after asking the namespace that holds them).
         """
         cache, pool, allocator = self._seeded([self.HEAD_A, self.TAIL])
         cached = cache.match_prefix(
@@ -1469,20 +1356,83 @@ class TestScanDrivenReuse(unittest.TestCase):
         self.assertEqual(len(fresh), second.extend_input_len)
         self.assertEqual(fresh[-1], len(second.origin_input_ids) - 1)
 
+    def test_the_finish_audit_counts_a_trimmed_run_as_tree_owned(self):
+        """A trimmed run reused in place is held by its source namespace, so the
+        finish audit reports nothing lost."""
+        from sglang.srt.mem_cache import radix_cache
 
+        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
+        again = make_req("r2", [self.HEAD_A, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        prefill(cache, pool, again, first_slot=1000)
+        self.assertIsNotNone(again.sub_context_source_key[1])
 
-if __name__ == "__main__":
-    unittest.main()
+        self.addCleanup(setattr, radix_cache, "AUDIT_ON", radix_cache.AUDIT_ON)
+        radix_cache.AUDIT_ON = True
+        with self.assertNoLogs(radix_cache.logger, level="ERROR"):
+            decode_and_finish(cache, pool, again, [], first_slot=2000)
+
+    def test_a_rotated_run_is_counted_as_rotated_not_moved(self):
+        """`moved` counts displaced hits that were not rotated in, as on the stitch."""
+        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
+        second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        second.init_next_round_input(cache)
+        self.addCleanup(second.release_sub_context_match_locks, cache)
+
+        self.assertEqual(second.sub_context_rotated, 39)
+        self.assertEqual(second.sub_context_moved, 0)
+        self.assertEqual(second.sub_context_discarded, 0)
+
+    def test_a_retracted_request_reuses_nothing_past_its_prompt(self):
+        """A retracted request's fill_ids hold its output after the prompt. A run
+        reaching into that output is trimmed to the prompt, here below the minimum."""
+        cache, pool, allocator = self._seeded([self.HEAD_A, self.TAIL])
+        second = make_req(
+            "r2", [self.HEAD_B, self.TAIL[:30]], [SYS_KEY, MSG_KEY], req_pool_idx=1
+        )
+        second.output_ids = list(self.TAIL[30:])  # retracted after generating these
+        second.init_next_round_input(cache)
+        self.addCleanup(second.release_sub_context_match_locks, cache)
+
+        self.assertEqual(cache.kv_rotator.calls, [], "rotated a run past the prompt")
+        self.assertEqual(allocator.allocated, [])
+        prompt = len(second.origin_input_ids)
+        for start, end, _ in second.sub_context_layout or []:
+            self.assertLessEqual(end, prompt)
+
+    def test_a_trimmed_run_is_marked_when_its_trimmed_span_is_a_chunk_too(self):
+        """Chunk B (registered first) trimmed by one token covers the same span as
+        chunk A == B[:-1]. The selected B must still be marked as trimmed, or finish
+        rotates B's tree slots in place and frees them."""
+        cache, pool, allocator = self._seeded([self.HEAD_A, self.TAIL])
+        # A == TAIL[:-1], registered at another position.
+        other = make_req(
+            "r2", [self.HEAD_B, self.TAIL[:-1]], [SYS_KEY, MSG_KEY], req_pool_idx=1
+        )
+        prefill(cache, pool, other, first_slot=1000)
+        decode_and_finish(cache, pool, other, [], first_slot=2000)
+        tail_key = sub_context_chunk_id(self.TAIL, None)
+        tail_slots = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(self.TAIL, tail_key))
+        ).device_indices.tolist()
+        self.assertEqual(len(tail_slots), len(self.TAIL))
+
+        again = make_req("r3", [self.HEAD_A, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=2)
+        again.init_next_round_input(cache)
+        self.assertEqual(again.sub_context_source_key[1], tail_key)
+        self.assertTrue(again.sub_context_no_insert[1])
+
+        prefill(cache, pool, again, first_slot=3000)
+        decode_and_finish(cache, pool, again, [], first_slot=4000)
+        self.assertEqual(set(allocator.freed) & set(tail_slots), set())
+        self.assertEqual(cache.kv_rotator.calls, [])
 
 
 class TestRetractedRequest(unittest.TestCase):
     """A retracted request re-enters prefill with its generated tokens in fill_ids.
 
-    `init_next_round_input` sets ``fill_ids = origin_input_ids + output_ids``
-    (`schedule_batch.py:1029`), so once a request has produced anything its fill_ids are
-    longer than the prompt the split describes. The read path stitches per namespace
-    regardless -- its gate never looks at that length -- so the request comes back
-    holding the namespaces' own slots.
+    `init_next_round_input` sets ``fill_ids = origin_input_ids + output_ids``, longer
+    than the prompt the split describes. The read path still stitches per namespace, so
+    the request holds the namespaces' own slots.
     """
 
     def _retracted(self, cache, pool):
@@ -1517,13 +1467,7 @@ class TestRetractedRequest(unittest.TestCase):
         return slots
 
     def test_a_namespace_slot_never_gets_a_second_owner(self):
-        """The write path must follow the read path into the namespaces.
-
-        Writing this request to the default namespace instead files the KV the
-        namespaces already own under a second node. Nothing is freed at that moment, so
-        no audit fires -- but from then on either owner can free it while the other goes
-        on serving it, which is how the pool starts handing out live KV.
-        """
+        """The write path inserts into the namespaces, never also into the default namespace."""
         cache, pool, allocator = make_cache()
         second = self._retracted(cache, pool)
         cache.cache_unfinished_req(second)
@@ -1538,13 +1482,12 @@ class TestRetractedRequest(unittest.TestCase):
         )
 
     def test_it_still_reaches_the_audited_finish_path(self):
-        """...and therefore finishes through the audited branch rather than around it.
-
-        `cache_finished_req` picks its branch on `sub_context_last_nodes`, which only
-        the per-namespace insert sets. A request that wrote to the default namespace
-        finishes through the ordinary path, where the conservation check never runs.
-        """
+        """...and the per-namespace insert ran, setting `sub_context_last_nodes`."""
         cache, pool, allocator = make_cache()
         second = self._retracted(cache, pool)
         cache.cache_unfinished_req(second)
         self.assertIsNotNone(second.sub_context_last_nodes)
+
+
+if __name__ == "__main__":
+    unittest.main()

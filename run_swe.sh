@@ -4,8 +4,7 @@
 #   ./run_swe.sh record   server records every chat request; you drive swe_test.sh
 #   ./run_swe.sh toggle   replay that capture once per arm and print the tables
 #
-# Arms. Same words as sglang_server.sh and run_mas.sh; `rot` is rotation and Stage 2
-# in all three:
+# Arms (same words as sglang_server.sh and run_mas.sh):
 #
 #   off  no split at all -- the stock single-namespace radix cache
 #   on   split into per-block namespaces, displaced hits dropped
@@ -13,10 +12,8 @@
 #   idx  + find blocks by content anywhere in the prompt, and prefill the gaps
 #   cdc  + cut the blocks on content too, not on the roles the prompt was built from
 #
-# TOPK_RATIO recomputes that fraction of the reused tokens on idx and cdc, chosen by
-# how far their key moved. It is a dial rather than an arm, and it joins the file stem.
-#
-# Default is "off cdc". on, rot and idx are the rungs between them and run when named.
+# TOPK_RATIO recomputes that fraction of the reused tokens on idx and cdc; a non-zero
+# ratio is appended to the file stem. Default ARMS is "off cdc".
 #
 #   ARMS="off rot idx cdc" ./run_swe.sh toggle          put the middle rungs back
 #   AUDIT=1 FULL=1 ./run_swe.sh toggle                  correctness pass, timings unusable
@@ -42,20 +39,15 @@ TOOL_PARSER=${TOOL_PARSER-qwen}
 
 ARMS=${ARMS:-"off cdc"}
 
-# Fraction of the tokens a prompt reuses that get recomputed anyway, scored by how far
-# their key has moved. Applies to idx and cdc, the arms that have reused tokens to
-# score; 0 is those arms as they stand. Sweeping it is the point:
+# Selective recompute (idx and cdc only). A ratio > 0 needs CHUNKED_PREFILL >= the
+# longest prompt, set for every arm in the comparison:
 #
 #   ARMS="off idx" TOPK_RATIO=0.15 CHUNKED_PREFILL=$CTXLEN ./run_swe.sh toggle
-#
-# The probe pass runs the whole prompt through the first layers, so a prompt above the
-# chunked-prefill budget falls back to the stitch and quietly reuses less. Set the
-# budget for EVERY arm in a comparison, not just the one being swept.
 TOPK_RATIO=${TOPK_RATIO:-0}
 TOPK_LAYER=${TOPK_LAYER:-1}
 CHUNKED_PREFILL=${CHUNKED_PREFILL:-}
 
-if [ "$TOPK_RATIO" != "0" ] && [ -z "$CHUNKED_PREFILL" ]; then
+if awk -v r="$TOPK_RATIO" 'BEGIN { exit !(r > 0) }' && [ -z "$CHUNKED_PREFILL" ]; then
   echo "REFUSING: TOPK_RATIO=$TOPK_RATIO with no CHUNKED_PREFILL. The probe runs the"
   echo "  whole prompt, so anything longer than the budget takes the stitch instead --"
   echo "  which is exactly the long, heavily-reused prompt this is for, and the arm"
@@ -63,15 +55,13 @@ if [ "$TOPK_RATIO" != "0" ] && [ -z "$CHUNKED_PREFILL" ]; then
   exit 1
 fi
 
-# Pinned for every arm: triton is the only backend that takes a per-position mask.
+# Same backend for every arm; idx/cdc need triton (per-position mask).
 BACKEND=${BACKEND:-triton}
 
-# The finish-path audits walk the whole tree once per pass; the numbers below then
-# include the audit.
+# Slot-ownership audits (a full tree walk per pass; timings then include it).
 AUDIT=${AUDIT:-}
 
-# Let each request stop where it wants instead of pinning the length with ignore_eos.
-# The arms then generate different amounts and the timings stop being comparable.
+# Use each request's own max_tokens instead of pinning the length with ignore_eos.
 FULL=${FULL:-}
 
 # conda.sh, resolved from CONDA_EXE rather than hardcoded.
@@ -108,8 +98,7 @@ export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
 arm_switches() {
   # Cleared every time; an arm that does not set one gets the empty value.
   export SUBCTX_OFF= SUBCTX_ROTATE= SUBCTX_ACROSS= SUBCTX_INDEX= SUBCTX_SPLIT=blocks
-  # Only the arms that place blocks freely have reused tokens to score. Setting it on
-  # the others is refused at launch, so clear it rather than leaving it to leak in.
+  # The ratio applies to idx and cdc only.
   export SUBCTX_TOPK_RATIO=0
   case "$1" in
     off) export SUBCTX_OFF=1 ;;
@@ -121,10 +110,8 @@ arm_switches() {
   esac
 }
 
-# The bench names files by stem: client_base.json is the off arm, client_sub.json the
-# on arm. The stems are what `summary` looks for. A non-zero ratio joins the stem --
-# it is not part of the arm's name but it is part of what the run measured, and a
-# sweep would otherwise write every ratio over the last one.
+# File stem per arm, as `summary` expects: off -> base, on -> sub, others as named. A
+# non-zero ratio on idx/cdc appends _rNN (percent).
 arm_stem() {
   local stem
   case "$1" in
@@ -132,9 +119,14 @@ arm_stem() {
     on)  stem=sub ;;
     *)   stem="$1" ;;
   esac
-  case "$1:$TOPK_RATIO" in
-    idx:0|cdc:0|off:*|on:*|rot:*) echo "$stem" ;;
-    *) echo "${stem}_r$(printf '%02d' "$(python -c "print(round($TOPK_RATIO*100))")")" ;;
+  case "$1" in
+    idx|cdc)
+      if awk -v r="$TOPK_RATIO" 'BEGIN { exit !(r > 0) }'; then
+        echo "${stem}_r$(printf '%02d' "$(python -c "print(round($TOPK_RATIO*100))")")"
+      else
+        echo "$stem"
+      fi ;;
+    *) echo "$stem" ;;
   esac
 }
 
@@ -259,8 +251,7 @@ TXT
       verify_arm "$arm"
       TRACE=$OUT/trace_$stem.jsonl STAGE=$OUT/stage_$stem \
         CLIENT=$OUT/client_$stem.json replay
-      # The index's own counters; a request that did not fit one prefill pass reports
-      # as having found nothing.
+      # The index's own counters.
       case "$arm" in
         idx|cdc) grep "sub-context index:" $OUT/server_$arm.log | tail -1 || true ;;
       esac
@@ -304,7 +295,7 @@ TXT
     echo "  toggle  replay that capture once per arm  ->  $OUT"
     echo
     echo "  ARMS='off idx'        which arms, in order; the first is the baseline"
-    echo "                        off|on|rot|idx; on and rot are the rungs between"
+    echo "                        off|on|rot|idx|cdc"
     echo "  AUDIT=1               turn on the leak/ownership audits (timings unusable)"
     echo "  FULL=1                let requests stop naturally, so one can stop during"
     echo "                        prefill -- the path a pinned replay never reaches"

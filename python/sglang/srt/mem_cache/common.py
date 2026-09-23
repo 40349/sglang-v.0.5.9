@@ -134,16 +134,9 @@ def write_cache_indices_sparse(
     fresh_positions: list[list[int]],
     req_to_token_pool: ReqToTokenPool,
 ):
-    """Place each reused run at the position it belongs to, and the new tokens in the gaps.
-
-    ``write_cache_indices`` writes two slices -- reused, then new -- because reuse used
-    to be a prefix by construction. Sub-context reuse is not: a block cached under an
-    earlier prompt can land anywhere this one puts it, with fresh tokens on both sides.
-
-    What does not change is that every position in ``[0, seq_len)`` ends up mapped, and
-    mapped exactly once. That is what attention reads, and it is the invariant the
-    ownership accounting is written against -- a position left unmapped reads whatever
-    slot the row held last, which is silent and wrong rather than loud.
+    """``write_cache_indices`` for a sparse layout: each reused run at its position,
+    the new slots at the fresh positions. Every position in ``[0, seq_len)`` is written
+    exactly once.
     """
     pt = 0
     for i in range(req_pool_indices_cpu.shape[0]):
@@ -155,7 +148,7 @@ def write_cache_indices_sparse(
 
         layout = reqs[i].sub_context_layout
         if layout is None:
-            # Sharing the batch with a sparse request, but ordinary itself.
+            # An ordinary request in a batch with a sparse one.
             prefix_len = seq_len - extend_len
             req_to_token_pool.write((req_idx, slice(0, prefix_len)), prefix_tensors[i])
             req_to_token_pool.write((req_idx, slice(prefix_len, seq_len)), fresh)
@@ -166,10 +159,7 @@ def write_cache_indices_sparse(
         positions = torch.tensor(
             fresh_positions[i], dtype=torch.int64, device=fresh.device
         )
-        # Scattering by an index tensor is index_put_, which will not cast: the pool
-        # holds int32 slot numbers and the allocator hands out int64. The contiguous
-        # writes above are ordinary slice assignment and do cast, which is why this is
-        # the only place that has to say so.
+        # index_put_ does not cast: match req_to_token's dtype.
         req_to_token_pool.write(
             (req_idx, positions), fresh.to(req_to_token_pool.req_to_token.dtype)
         )
@@ -405,10 +395,8 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
-    # Reused tokens that will be recomputed need somewhere of their own to be written:
-    # the rows they are reusing belong to the radix tree and are shared with everyone
-    # else holding that block. How many is a fixed fraction, so it is known here; which
-    # positions they turn out to be is decided in the forward.
+    # Extra slots for the reused tokens selective recompute will rewrite; which
+    # positions get them is decided in the forward.
     topk_counts = [r.sub_context_topk_count() for r in batch.reqs]
     num_topk = sum(topk_counts)
 

@@ -1,21 +1,11 @@
-"""Recompute the reused tokens whose keys moved the most, and keep the rest cached.
+"""Selective recompute: recompute the reused tokens whose keys moved most.
 
-Rotation (``rotate_kv.py``) corrects a reused block's *position*. It cannot correct the
-*context*: the block's KV was computed with different tokens in front of it, and no
-rotation expresses that. This module buys the difference back for a fixed fraction of
-the reused tokens -- the ones whose key, recomputed here, has moved furthest from what
-the cache holds.
+Layers ``[0, check_layer]`` run the whole prompt (the probe). At ``check_layer`` each
+reused token's fresh key is compared with its cached key, the top ``TOPK_RATIO`` per
+request are selected, and the remaining layers run only the fresh plus selected tokens.
 
-The obstacle is that the reuse path never recomputes a reused token, so there is no
-fresh key to compare the cached one against. So the first layers run the whole prompt,
-one layer is enough to have mixed the new context in, and the token dimension is cut
-back down immediately after. The extra rows exist to produce keys; their KV is thrown
-away.
-
-Everything in here is shaped by one rule: **no host sync in the middle of a forward.**
-The fraction is fixed, so every count, offset and allocation is known before the pass
-starts. Only which positions win is decided on the device, and nothing downstream needs
-to read that on the host.
+Counts, offsets and allocations are fixed before the forward; only the choice of
+positions is made on the device, with no host sync.
 """
 
 from __future__ import annotations
@@ -30,40 +20,31 @@ import torch
 class BlendPlan:
     """Everything the forward needs to score, select, and cut down.
 
-    Built on the host in ``prepare_for_extend``; the ``sel_*`` fields are the only ones
-    filled during the forward, by ``select``.
+    Built by ``build_plan`` before the forward; ``select`` fills the ``sel_*`` fields.
     """
 
     check_layer: int
 
-    # Rows per request in each of the two token sets. Host-known: the probe is the
-    # whole prompt, and the selection is the fresh tokens plus a fixed fraction of the
-    # reused ones.
+    # Rows per request: the probe (whole prompt), and the selection (fresh tokens plus
+    # the recomputed ones).
     probe_lens: List[int]
     sel_lens: List[int]
 
-    # Where layers up to and including the scored one write their KV. One entry per
-    # probe row; reused rows point at the padded dummy slot, because their real slots
-    # belong to the radix tree and are shared with every other request holding that
-    # block.
+    # Where the probe layers write KV, per probe row; reused rows go to dummy slot 0.
     probe_cache_loc: torch.Tensor
 
-    # The reused positions, as three parallel views of the same ordering: the probe row
-    # holding this position's fresh key, the cache row holding its stale one, and the
-    # flat offset into ``req_to_token`` that addresses it. A score index means all
-    # three.
+    # Per reused position, in the same order: its probe row, its cached slot, and its
+    # flat offset into ``req_to_token``. ``reused_ptr`` splits them per request.
     reused_rows: torch.Tensor
     reused_slots: torch.Tensor
     reused_r2t: torch.Tensor
     reused_ptr: List[int]
 
-    # Whether each reused row sits on a copy made for this request (a rotated block)
-    # rather than on the tree's own row. A recomputed position moves off its row, and
-    # a copy nobody else holds is unreferenced the moment it does.
+    # Per reused position: whether its slot is this request's rotated copy.
     reused_ours: torch.Tensor
 
-    # Per request: how many reused tokens are recomputed, the slots held for them, and
-    # the fresh positions they will be merged with.
+    # Per request: recomputed-token count, and fresh positions. `topk_slots` holds the
+    # new slots for all of them.
     topk_counts: List[int]
     topk_slots: torch.Tensor
     topk_ptr: List[int]
@@ -77,8 +58,7 @@ class BlendPlan:
     sel_positions: Optional[torch.Tensor] = None
     sel_topk_rows: Optional[torch.Tensor] = None
     sel_topk_slots: Optional[torch.Tensor] = None
-    # Rows the selection displaced that belonged to this request. Nothing points at
-    # them any more; the caller hands them back after the scored range.
+    # Rotated-copy slots the selection displaced; freed by the caller.
     orphaned_slots: Optional[torch.Tensor] = None
 
     @property
@@ -90,17 +70,12 @@ class BlendPlan:
         return self.topk_ptr[-1]
 
     def select(self, k: torch.Tensor, key_buffer: torch.Tensor) -> None:
-        """Score the reused positions against the cache and pick the top fraction.
+        """Score the reused positions and select the top ``topk_counts`` per request.
 
-        ``k`` is this layer's freshly computed key for every probe row, already rotated
-        to its new position; ``key_buffer`` is the pool's key for this layer, which at
-        the reused slots still holds what the block was cached with. Their squared
-        difference, summed over the head dimension, is the deviation the recompute is
-        meant to undo.
-
-        Sorted ascending before it is used anywhere: the extend kernel takes each
-        query's position as its whole causal rule, and the row order has to agree with
-        the position order for the last row of a request to still be its last token.
+        The score is ``sum((k_fresh - k_cached) ** 2)`` over heads and dims, where
+        ``k`` is this layer's post-RoPE key per probe row and ``key_buffer`` still holds
+        the cached key at the reused slots. Selected positions are merged with the fresh
+        ones and sorted ascending.
         """
         if self.reused_rows.numel() == 0 or self.total_topk == 0:
             self._select_nothing()
@@ -121,8 +96,6 @@ class BlendPlan:
                 chosen_pos = fresh.new_empty((0,))
                 chosen_idx = self.reused_rows.new_empty((0,))
             else:
-                # Indices into this request's slice of the reused arrays, which is also
-                # an index into its cache rows and its req_to_token offsets.
                 local = torch.topk(score[lo:hi], k=count).indices
                 chosen_idx = local + lo
                 chosen_pos = (
@@ -139,19 +112,12 @@ class BlendPlan:
         self.sel_topk_slots = self.topk_slots
 
     def commit(self, k: torch.Tensor, v: torch.Tensor, forward_batch, layer) -> None:
-        """Give the selected positions rows of their own, and fill every layer of them.
+        """Move each selected position to a slot of its own, and fill that slot.
 
-        Called *after* the scored layer's own attention, which is still reading the
-        cache rows being replaced here.
-
-        A selected position is about to stop pointing at the radix tree's row and start
-        pointing at one of this request's, which decode will then read at **every**
-        layer -- not just the ones recomputed after the cut. So the layers before the
-        scored one are seeded from the cache first. Miss that and decode reads
-        uninitialised pool memory for those layers, silently.
-
-        The writes below use the same ordering of ``sel_topk_rows`` throughout, which is
-        what pairs a chosen position with the slot that will hold it.
+        Called after the scored layer's attention. Layers before ``check_layer`` are
+        copied from the cached slot, this layer gets the fresh K/V, and later layers are
+        written by the second range. Then req_to_token is re-pointed. The j-th selected
+        position gets ``topk_slots[j]``.
         """
         from sglang.srt.mem_cache.memory_pool import move_kv_cache_native
 
@@ -162,10 +128,7 @@ class BlendPlan:
         chosen = self.sel_topk_rows
         slots = self.topk_slots
 
-        # Layers before this one: whatever the cache holds is the best available, and
-        # for layer 0 it is exactly right -- that key is a function of the token and
-        # its position alone. Layers after this one are written by the second range,
-        # and this layer is written just below, so neither needs copying.
+        # Layers before this one: copy from the cached slot.
         move_kv_cache_native(
             pool.k_buffer[: self.check_layer],
             pool.v_buffer[: self.check_layer],
@@ -180,12 +143,8 @@ class BlendPlan:
         displaced = self.reused_slots[chosen]
         req_to_token.view(-1)[self.reused_r2t[chosen]] = slots.to(req_to_token.dtype)
 
-        # What the position was pointing at a moment ago. A tree row stays where it is
-        # -- other requests are still served from it -- but a rotated copy was made for
-        # this request alone, and the write above was the last thing referencing it.
-        # The free paths walk `req_to_token`, so they will never see it again: it has to
-        # be handed back explicitly, which the caller does once the pass is out of the
-        # attention backend.
+        # Displaced rotated copies are no longer in req_to_token; the caller frees them.
+        # Displaced tree slots stay with the tree.
         self.orphaned_slots = displaced[self.reused_ours[chosen]]
 
     def _select_nothing(self) -> None:
@@ -209,11 +168,10 @@ def build_plan(
     topk_slots: torch.Tensor,
     check_layer: int,
 ) -> BlendPlan:
-    """Lay out the two token sets before the forward runs.
+    """Build the plan for one extend batch.
 
-    Called once per extend batch, with the slots the allocator has just handed out:
-    ``out_cache_loc`` for the tokens that were going to be computed anyway, and
-    ``topk_slots`` for the reused ones that will be recomputed on top.
+    ``out_cache_loc`` holds the fresh tokens' slots, ``topk_slots`` the slots for the
+    reused tokens that will be recomputed.
     """
     device = out_cache_loc.device
     req_to_token = batch.req_to_token_pool.req_to_token
@@ -250,9 +208,7 @@ def build_plan(
         fresh_t = torch.tensor(fresh, dtype=torch.int64, device=device)
         fresh_positions.append(fresh_t)
 
-        # The padded slot 0 absorbs every row whose KV must not be written. Duplicate
-        # indices race each other there and the result is garbage nobody reads, which
-        # is what that slot is for.
+        # Reused rows write to the padded dummy slot 0.
         loc = torch.zeros(n, dtype=out_cache_loc.dtype, device=device)
         loc[fresh_t] = out_cache_loc[fresh_cursor : fresh_cursor + len(fresh)]
         fresh_cursor += len(fresh)

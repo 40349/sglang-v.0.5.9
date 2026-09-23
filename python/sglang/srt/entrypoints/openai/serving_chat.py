@@ -67,14 +67,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# A/B switch from `SGLANG_DISABLE_SUBCONTEXT`, defined in subctx_config so the
-# launcher can consult the same value.
 if DISABLE_SUBCONTEXT:
     logger.info("Sub-context split DISABLED (baseline mode)")
 
-# Dump every incoming chat body so one agent run can be replayed verbatim against
-# both arms. Without a fixed request sequence the runs diverge after the first
-# sampled token and the timings compare different conversations.
+# Append every incoming chat body to this JSONL, for `subcontext_bench.py replay`.
 _CAPTURE_PATH = os.environ.get("SGLANG_CAPTURE_REQUESTS", "")
 _capture_file = None
 
@@ -406,21 +402,12 @@ class OpenAIServingChat(OpenAIServingBase):
         tools: Optional[List[Dict]],
         prompt_ids: List[int],
     ) -> tuple[Optional[List[List[int]]], Optional[List[str]]]:
-        """Split ``prompt_ids`` into blocks, each matched and inserted in its own
-        radix namespace so it is reused independently of what surrounds it.
+        """Split ``prompt_ids`` into blocks, each cached in its own radix namespace.
 
-        Two ways to choose the boundaries, see ``SPLIT_MODE``. ``"blocks"`` takes them
-        from the roles the prompt was built from -- system prompt, tool definitions,
-        conversation -- so the fixed head of an agent trajectory is reused apart from
-        the tail that grows every turn. ``"cdc"`` takes them from the content, so a run
-        of tokens is cut the same way wherever it appears; that is what lets a block be
-        found at a new offset, or found when only part of it was quoted.
-
-        Either way the split is made on the already-rendered token ids, so
-        ``concat(segments) == prompt_ids`` holds exactly. ``"blocks"`` re-renders the
-        leading messages to locate its boundary and gets a coarser split, or none, from
-        templates that do not render the system block as a literal prefix; ``"cdc"``
-        needs no render at all.
+        ``SPLIT_MODE == "blocks"``: system prompt, tool definitions, conversation,
+        located by re-rendering the leading messages (no split if the template does not
+        render them as a literal prefix). ``"cdc"``: ``cut_points`` on the token ids.
+        Either way ``concat(segments) == prompt_ids``.
         """
 
         def _is_prefix(head: List[int], full: List[int]) -> bool:
@@ -437,8 +424,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 return None, None
             bounds = [0, *cuts, len(prompt_ids)]
             segments = [prompt_ids[a:b] for a, b in zip(bounds, bounds[1:])]
-            # Placeholder keys: `Req.__init__` replaces each one with a hash of that
-            # block's own tokens.
+            # Placeholders; `Req.__init__` replaces them with content hashes.
             return segments, [f"cdc_{i}" for i in range(len(segments))]
 
         n_sys = 0
@@ -461,19 +447,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 logger.debug("Sub-context: sub-context boundary render failed: %s", e)
                 return None
 
-        # Candidate boundaries for the fixed head, narrowest first. The wider one
-        # covers templates that render tool definitions into the *first user message*
-        # (Llama 3.x tools_in_user_message), where system messages alone cannot be
-        # rendered with tools at all -- there system + first user is the part that
-        # stays fixed for a whole trajectory.
+        # Head candidates, narrowest first: the system messages, then also the first
+        # user message (templates that put tools there, e.g. Llama 3.x).
         head = None
         head_with_tools = None
         for k in ([n_sys, n_sys + 1] if n_sys else [1, 2]):
             if k > len(messages):
                 continue
-            # k == len(messages) is allowed: on turn 1 the whole list is the head and
-            # the tail is just the generation prompt. Still useful -- it seeds the head
-            # namespace so turn 2 hits it. An empty tail is dropped below.
+            # k == len(messages) is allowed (the tail is then the generation prompt).
             rendered = render(messages[:k], tools)
             if rendered is not None and _is_prefix(rendered, prompt_ids):
                 head, head_with_tools = messages[:k], rendered
@@ -485,8 +466,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if tools:
             head_no_tools = render(head, None)
             if head_no_tools is not None and _is_prefix(head_no_tools, head_with_tools):
-                # Template appends the tool definitions after the system content, so
-                # they can live in a namespace of their own.
+                # Tools rendered after the system content: a block of their own.
                 segments.append((head_no_tools, "system_prompt_key"))
                 segments.append((head_with_tools[len(head_no_tools) :], "tools_key"))
         if not segments:
@@ -651,8 +631,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if is_multimodal:
                 prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
             else:
-                # Only the token-id path is split; the multimodal path hands decoded
-                # text back to the tokenizer, breaking concat(segments) == input_ids.
+                # Not split on the multimodal path, which re-tokenizes decoded text.
                 sub_context_ids, sub_context_extra_keys = self._compute_sub_context_ids(
                     request, openai_compatible_messages, tools, prompt_ids
                 )

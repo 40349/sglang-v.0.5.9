@@ -793,8 +793,7 @@ def _fwd_kernel_unified(
     deno = tl.zeros([BLOCK_M], dtype=tl.float32)
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
-    # This block's query positions, read once: entry j of the gather list is position j,
-    # so the causal test against them is the same for every tile.
+    # This block's query positions (KV entry j is position j).
     if USE_POSITION_MASK:
         q_pos = tl.load(
             q_pos_ptr + cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m,
@@ -824,8 +823,7 @@ def _fwd_kernel_unified(
             )
             final_mask &= custom_mask
 
-        # Positions, not indices: a sparse prefill's queries sit at positions the
-        # kernel's index-based causal rule would place them elsewhere.
+        # Causal by query position: key j is visible when j <= q_pos.
         if USE_POSITION_MASK:
             final_mask &= q_pos[:, None] >= (start_n + offs_n)[None, :]
 
@@ -867,7 +865,7 @@ def _fwd_kernel_unified(
         # Check if we can skip this tile
         SKIP_TILE = False
         if USE_POSITION_MASK:
-            # Every position in the tile is ahead of every query in this block.
+            # Skip when every key in the tile is after every query in the block.
             SKIP_TILE = q_pos_hi < start_n
         elif USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
@@ -996,10 +994,8 @@ def extend_attention_fwd_unified(
         max_len_extend: Maximum extend length
         custom_mask: Custom attention mask (for speculative decoding tree attention)
         mask_indptr: Mask offsets [batch_size + 1]
-        q_positions: Position of every query token [num_tokens], replacing the causal
-                     rule with "this query's position >= this key's index". The kernel
-                     compares against it in registers, so it costs no mask to hold and
-                     lets a tile every query is behind be skipped outright.
+        q_positions: Position of every query token [num_tokens]. When set, a query
+                     sees key j iff j <= its position (replaces the causal rule).
         sm_scale: Softmax scale
         logit_cap: Logit capping value
         is_causal: Whether to apply causal mask

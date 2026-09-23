@@ -1,23 +1,12 @@
-"""
-Unit tests for selective recompute of reused sub-context tokens.
+"""Unit tests for selective recompute of reused sub-context tokens.
 
-Reuse is cheap because a reused token is never recomputed. That is also why its KV
-still carries the context it was cached under: rotation moves a block to a new
-position, it does not move it to a new neighbourhood. Selective recompute buys a
-fraction of that back by running the whole prompt through the first layers -- purely to
-obtain a key to compare against the cache -- scoring the reused positions, and keeping
-only the highest scorers alongside the tokens that were going to be computed anyway.
+Checked:
 
-The properties below are the ones whose failure is silent:
-
-- the selection is the fresh tokens plus the top scorers, ascending, and ends on the
-  prompt's last position -- the logits processor takes the last row of each request,
-- a reused row's KV is never written to the cache row it is reusing, which belongs to
-  the radix tree and is shared with every other request holding that block,
-- a selected position gets **every** layer filled, not just the ones recomputed after
-  the cut, because decode reads all of them,
-- at ratio 0 the selection is exactly the fresh set, which is what makes the arm
-  bit-identical to reuse-without-recompute.
+- the selection is the fresh tokens plus the top scorers, ascending, ending on the
+  prompt's last position,
+- a reused row's KV is never written to the cache row it reuses,
+- a selected position gets every layer filled,
+- at ratio 0 the selection is exactly the fresh set.
 
 Usage:
     python test_subctx_blend.py
@@ -55,11 +44,7 @@ class FakeReqToTokenPool:
 
 
 class FakeKVPool:
-    """A per-layer K/V buffer and the one write the backend makes into it.
-
-    ``set_kv_buffer`` is a scatter by slot id, which is all the real pool does once the
-    dtype handling is stripped out.
-    """
+    """A per-layer K/V buffer with ``set_kv_buffer`` as a scatter by slot id."""
 
     def __init__(self):
         self.k_buffer = [
@@ -98,9 +83,8 @@ class FakeBatch:
 def make_req(prompt_len: int, layout, req_pool_idx: int = 0, ours=None) -> Req:
     """A request whose reuse lands at ``layout``: (start, end, slots) runs.
 
-    ``ours`` says, per run, whether those rows are a rotated copy made for this
-    request (True) or the tree's own rows (False). With rotation on, which it must be
-    for the index, most runs are copies.
+    ``ours``, per run: whether the slots are this request's rotated copy (True) or the
+    tree's (False).
     """
     ids = list(range(1, prompt_len + 1))
     req = Req(
@@ -258,10 +242,8 @@ class TestSelection(unittest.TestCase):
         cached = kv_pool.get_key_buffer(plan.check_layer)
         k = torch.zeros(sum(plan.probe_lens), NUM_HEADS, HEAD_DIM)
         k[plan.reused_rows] = cached[plan.reused_slots]
-        # Every deviation is in the second request. Its quota must not spill into the
-        # first, and the first must still fill its own from a flat score. Distinct
-        # magnitudes, so the four that should win are the four that do rather than
-        # whichever four a tie happened to order first.
+        # All deviation is in the second request, with distinct magnitudes (no ties).
+        # Each request fills its own quota.
         for rank, position in enumerate((5, 6, 7, 8, 9, 10)):
             k[plan.row_offsets[1] + position] += 6.0 - rank
         plan.select(k, cached)
@@ -397,11 +379,7 @@ class TestCommit(unittest.TestCase):
         self.assertEqual(row[untouched].tolist(), [500 + p - 4 for p in untouched])
 
     def test_displaced_copies_of_our_own_are_handed_back(self):
-        # The row a selected position leaves is only reachable through req_to_token, and
-        # the selection has just overwritten that entry. A rotated copy is this
-        # request's alone, so unless it is reported here nothing ever frees it -- which
-        # shows up minutes later as a pool leak of exactly ratio x reused tokens, far
-        # from the code that caused it.
+        # A displaced rotated copy is reported in orphaned_slots, to be freed.
         req = make_req(32, [(4, 20, 500)], ours=[True])
         plan, pool, _fresh_loc, _topk = build([req])
         kv_pool = FakeKVPool()

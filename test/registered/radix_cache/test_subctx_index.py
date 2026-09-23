@@ -1,18 +1,12 @@
-"""
-Unit tests for the sub-context index.
+"""Unit tests for the sub-context index.
 
-The index answers one question -- *which registered sub-contexts occur in this query,
-and where* -- and everything downstream trusts that answer. These tests hold it to the
-three properties the rest of the feature is built on:
+Checked:
 
-- a chunk's identity is its token ids (and ``extra_key``) and **nothing else**, because
-  finding the same run of tokens at a new position is the entire point; where it lands
-  is the rotation's problem, not the index's,
-- scanning finds every occurrence, checked against brute force on random inputs, since
-  the fingerprint that drives it is a filter and a filter that silently drops a match
-  costs reuse with no symptom,
-- the subset chosen for reuse covers as many tokens as any non-overlapping subset
-  could, checked against exhaustive enumeration.
+- a chunk's identity is its token ids and ``extra_key``, not its position,
+- the scan finds every occurrence (against brute force on random inputs),
+- ``select`` covers as many tokens as any non-overlapping subset (against exhaustive
+  enumeration),
+- ``cut_points`` cuts the same tokens the same way wherever they sit.
 
 Usage:
     python test_subctx_index.py
@@ -59,12 +53,7 @@ class TestChunkId(unittest.TestCase):
         self.ids = [self.rng.randrange(150000) for _ in range(100)]
 
     def test_position_is_not_part_of_the_identity(self):
-        """The property the whole index rests on.
-
-        A chunk cached at position 120 in one prompt has to be *the same chunk* when it
-        turns up at position 100 in the next, or the scan finds nothing and every
-        prompt is prefilled from scratch. Folding the offset in would be the bug.
-        """
+        """The same tokens at another position are the same chunk."""
         head = [self.rng.randrange(150000) for _ in range(37)]
         index = SubContextIndex(min_chunk_tokens=ANCHOR_TOKENS)
         cid = index.register(self.ids)
@@ -76,12 +65,7 @@ class TestChunkId(unittest.TestCase):
         self.assertEqual([(m.start, m.chunk_id) for m in displaced], [(37, cid)])
 
     def test_extra_key_separates_tenants(self):
-        """``extra_key`` carries cache_salt *and* lora_id (see ``Req.__init__``).
-
-        A LoRA adapter's keys and values are not the base model's, so the same tokens
-        under a different adapter must be a different chunk. The pre-index code keyed
-        blocks by role and dropped ``extra_key`` entirely, which shared them.
-        """
+        """The same tokens under another ``extra_key`` (cache_salt / lora_id) are another chunk."""
         self.assertNotEqual(chunk_id(self.ids), chunk_id(self.ids, "salt:a"))
         self.assertNotEqual(chunk_id(self.ids, "salt:a"), chunk_id(self.ids, "salt:b"))
 
@@ -96,12 +80,8 @@ class TestChunkId(unittest.TestCase):
         self.assertNotEqual(chunk_id([300, 1]), chunk_id([1, 300]))
 
     def test_a_collision_does_not_reuse_the_wrong_kv(self):
-        """Why a 64-bit address is safe here.
-
-        ``chunk_id`` only picks the namespace; the radix tree still walks the token ids
-        inside it, and the scan verifies them too. So two different runs of tokens
-        forced onto one id find their own KV, not each other's -- a collision costs a
-        wasted comparison, never a wrong reuse.
+        """Two runs forced onto one chunk id still find their own KV: the tree and the
+        scan both compare the token ids.
         """
         first = [self.rng.randrange(150000) for _ in range(80)]
         second = [self.rng.randrange(150000) for _ in range(80)]
@@ -156,12 +136,7 @@ class TestScan(unittest.TestCase):
     """Finding occurrences, held against brute force."""
 
     def test_matches_brute_force_on_random_inputs(self):
-        """A small alphabet so overlaps and nesting actually occur.
-
-        The fingerprint is only a filter, and a filter that drops a real match costs
-        reuse without ever failing -- so the check has to be exhaustive equality, not a
-        spot test of a case someone thought of.
-        """
+        """Scan against brute force; a small alphabet so overlaps and nesting occur."""
         rng = random.Random(20260915)
         for trial in range(300):
             alphabet = list(range(6))
@@ -233,12 +208,7 @@ class TestSelect(unittest.TestCase):
     """Choosing which of the overlapping occurrences to actually reuse."""
 
     def test_covers_as_many_tokens_as_any_disjoint_subset(self):
-        """Against exhaustive enumeration.
-
-        Covered tokens is the quantity to maximise because it is exactly the prefill
-        skipped. Greedy-by-length and greedy-by-leftmost both lose to it, so the check
-        is the optimum rather than a plausible-looking answer.
-        """
+        """``select`` against exhaustive enumeration."""
         rng = random.Random(777)
         for trial in range(400):
             matches = [
@@ -299,11 +269,8 @@ class TestCutPoints(unittest.TestCase):
             self.assertEqual(flat, ids)
 
     def test_a_run_is_cut_the_same_way_wherever_it_sits(self):
-        """The property the whole scheme rests on.
-
-        Only the interior is claimed: the bounds make the first and last boundary of an
-        occurrence depend on where the previous one fell, so those can differ. A
-        content-defined cut in the middle may not.
+        """Interior cuts of a run are the same at any offset (the first and last may
+        differ, since the bounds depend on the previous cut).
         """
         doc = self.toks(3000)
         alone = {c for c in cut_points(doc, 256) if 600 < c < len(doc) - 600}
@@ -354,6 +321,12 @@ class TestCutPoints(unittest.TestCase):
         for _ in range(10):
             ids = self.toks(self.rng.randrange(3000, 9000))
             self.assertGreaterEqual(len(self.chunks(ids, 256, 64, 1024)[-1]), 64)
+
+    def test_a_zero_minimum_still_terminates(self):
+        """min_tokens=0 is treated as 1, so no cut repeats."""
+        cuts = cut_points(self.toks(5000), 256, 0)
+        self.assertEqual(cuts, sorted(set(cuts)))
+        self.assertTrue(all(0 < c < 5000 for c in cuts))
 
 
 if __name__ == "__main__":

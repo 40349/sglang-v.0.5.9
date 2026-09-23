@@ -2305,11 +2305,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def _set_extend_lens(self, forward_batch: ForwardBatch, lens: List[int]) -> None:
-        """Retarget the per-request row counts at a different token set.
-
-        Two things read these: the sparse extend metadata, which turns them into
-        ``qo_indptr``, and the logits processor, which takes ``cumsum(...) - 1`` as the
-        last row of each request. Both have to mean the set that is actually being run.
+        """Set the per-request row counts (read by the attention metadata and the
+        logits processor) to the token set being run.
         """
         forward_batch.extend_seq_lens_cpu = lens
         forward_batch.extend_seq_lens = torch.tensor(
@@ -2319,21 +2316,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def forward_subctx_blend(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> LogitsProcessorOutput:
-        """Run a prefill that recomputes the reused tokens whose keys moved most.
+        """Selective-recompute prefill in two layer ranges.
 
-        Two layer ranges with different token sets. The first carries every position in
-        the prompt, because scoring a reused token needs a key computed here and the
-        reuse path never computes one; the scored layer picks the top fraction and
-        gives those positions rows of their own. The second carries only the tokens
-        being kept -- the ones that were going to be computed anyway, plus the ones
-        just selected -- and is the pass the rest of the model sees.
-
-        The attention metadata is rebuilt in between because both of its inputs have
-        changed: the row count, and ``req_to_token``, which now sends the selected
-        positions to this request's rows instead of the tree's. Rebuilding is also what
-        keeps ``kv_indices`` honest -- it was gathered before the swap, and a stale one
-        would quietly leave the whole pass reading the cached keys it just decided to
-        replace.
+        Layers ``[0, check_layer]`` run every prompt position; the scored layer selects
+        the tokens to recompute. Layers after it run only the fresh plus selected
+        tokens. The attention metadata is rebuilt in between, since the row count and
+        req_to_token have both changed.
         """
         plan = forward_batch.subctx_blend_plan
         model = self.model
@@ -2355,9 +2343,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         if plan.orphaned_slots is not None and plan.orphaned_slots.numel():
-            # Rows the selection displaced that were this request's own rotated copies.
-            # They left `req_to_token` when the selection landed, so no free path can
-            # reach them any more.
+            # Displaced rotated copies, no longer in req_to_token.
             self.token_to_kv_pool_allocator.free(plan.orphaned_slots)
 
         forward_batch.hidden_states = forward_batch.hidden_states[plan.sel_rows]
@@ -2376,12 +2362,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def _gather_sel_cache_loc(self, forward_batch: ForwardBatch, plan) -> torch.Tensor:
-        """The slot behind every row of the selected set, in row order.
-
-        Read back out of ``req_to_token`` rather than reassembled from the two
-        allocations it came from: that table is the one place that says where a
-        position's KV lives, and ``commit`` has just finished updating it.
-        """
+        """The slot of every selected row, read from req_to_token after ``commit``."""
         req_to_token = forward_batch.req_to_token_pool.req_to_token
         parts = []
         cursor = 0
@@ -2408,9 +2389,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kwargs["get_embedding"] = True
 
         if forward_batch.subctx_blend_plan is not None:
-            # Runs the layer stack in two ranges over two different token sets, which
-            # neither the piecewise graph nor a compiled model can express. Both are
-            # refused at launch when this is on.
+            # No graph: piecewise CUDA graphs and torch.compile are refused at launch.
             return (
                 self.forward_subctx_blend(
                     forward_batch,

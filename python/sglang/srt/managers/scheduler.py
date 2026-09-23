@@ -220,9 +220,9 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
-# Test retract decode for debugging purposes
-# Debug: dump the whole radix tree after every extend pass. See the call site.
+# Debug: dump the whole radix tree after every extend pass.
 DUMP_TREE_AFTER_EXTEND = os.environ.get("SGLANG_DUMP_TREE", "") not in ("", "0")
+# Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
@@ -748,13 +748,9 @@ class Scheduler(
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     def _check_sub_context_support(self):
-        """Fail at launch, not per request, on a cache that cannot serve the split.
+        """Refuse to launch when the split is on and the cache cannot serve it.
 
-        The split is on unless ``SGLANG_DISABLE_SUBCONTEXT`` says otherwise, so every
-        chat request would arrive split. On a cache that cannot insert per namespace
-        they degrade silently instead of failing -- a run that looks healthy and caches
-        nothing. Explicit ``sub_contexts`` requests still fall back at runtime; this
-        only refuses the config that would split everything.
+        Then attach the rotator and the index if they are enabled.
         """
         from sglang.srt.utils.subctx_config import (
             DISABLE_SUBCONTEXT,
@@ -774,16 +770,10 @@ class Scheduler(
         self._init_sub_context_index()
 
     def _init_sub_context_index(self):
-        """Attach the index that lets a scan find a block anywhere in a prompt.
+        """Attach the sub-context index (empty until blocks are inserted).
 
-        Nothing is registered until a block is actually inserted, so a fresh server
-        finds nothing and prefills normally; the index fills from what it caches.
-
-        Rotation is a hard requirement rather than a nicety. Addressing blocks by
-        content is what lets a scan find one at a position other than the one it was
-        computed at, and the whole point of finding it there is to reuse it -- which is
-        exactly what needs the rotation. Without it every displaced hit is dropped and
-        the index buys nothing, so say so at launch instead of at the end of a run.
+        Refuses to launch without the sparse prefill, selective-recompute support when
+        a ratio is set, or rotation.
         """
         from sglang.srt.mem_cache.subctx_index import SubContextIndex
         from sglang.srt.utils.subctx_config import (
@@ -838,12 +828,9 @@ class Scheduler(
         )
 
     def _init_sub_context_rotation(self):
-        """Attach the KV rotator to the tree cache, or say why there is none.
+        """Attach the KV rotator to the tree cache when rotation is enabled.
 
-        Refusing loudly matters more here than for the split itself: an unsupported
-        RoPE would not fail, it would rotate by the wrong law and quietly degrade every
-        reused block. So an explicitly requested rotation that cannot be served raises,
-        and the default off-state just logs.
+        Raises if it is enabled but ``rotation_unsupported_reason`` refuses.
         """
         from sglang.srt.mem_cache.rotate_kv import KVRotator, find_rotary_embedding
         from sglang.srt.utils.subctx_config import (
@@ -2602,11 +2589,7 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
 
-        # Whole-tree dump per extend pass. Gated because it is O(nodes) of host work
-        # and log volume on every prefill, and the node count differs by arm -- the rot
-        # arm keeps a live `messages` namespace where the on arm keeps four nodes -- so
-        # left on it charges one arm of an A/B far more than the other. GPU timings are
-        # unaffected (this sits outside the CUDA-event bracket), wall clock is not.
+        # Whole-tree dump per extend pass (SGLANG_DUMP_TREE). Adds host time.
         if DUMP_TREE_AFTER_EXTEND and batch.forward_mode.is_extend():
             print("\n" + "=" * 50)
             print("[DEBUG] Tree State AFTER Extend")

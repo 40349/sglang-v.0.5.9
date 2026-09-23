@@ -224,39 +224,19 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return False
 
     def supports_sub_contexts(self) -> bool:
-        """Whether this cache implements both per-namespace sub-context paths.
-
-        Match and insert must both be per ``extra_key`` namespace: doing only the
-        first hits 0% forever while writes pile up in the default namespace.
-        Default False; overridden where both paths exist.
-        """
+        """Whether this cache implements both per-namespace match and insert."""
         return False
 
     def serves_sub_contexts(self, req: Any) -> bool:
-        """The one gate: is THIS request served through the per-namespace paths?
+        """Whether this request takes the per-namespace paths.
 
-        Read (`Req.init_next_round_input`) and write (`cache_unfinished_req`,
-        `cache_finished_req`) must answer this identically. When they do not, the read
-        path stitches a request out of the namespaces and the write path files what it
-        holds under the DEFAULT namespace -- so slots the namespace nodes own get a
-        second, key-less owner, and evicting either hands a live slot back to the pool.
-
-        That failure has now arrived twice, by two conditions that look nothing alike:
-        a length clause the read path did not have (a retracted request comes back with
-        `fill_ids = origin_input_ids + output_ids`), and a `sub_context_last_nodes`
-        check that a request finishing during prefill never satisfies. Both ended in
-        the same branch, and neither is reachable by a replay -- `ignore_eos` means no
-        request can finish at prefill. So the gate lives in one place and the call sites
-        read it, rather than three copies that have to be kept in step by hand.
+        The single gate read by ``Req.init_next_round_input``, ``cache_unfinished_req``
+        and ``cache_finished_req``; they must agree.
         """
         return bool(getattr(req, "has_sub_contexts", False)) and self.supports_sub_contexts()
 
     def matched_canonical_position(self, last_node: Any, hit_len: int) -> Optional[int]:
-        """Where the KV behind a match was computed, or None if not tracked.
-
-        None reads as "no reason to doubt the position": only sub-context requests
-        can be handed KV computed at a different position.
-        """
+        """Where the KV behind a match was computed, or None if not tracked."""
         return None
 
     def is_tree_cache(self) -> bool:

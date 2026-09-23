@@ -1369,9 +1369,8 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[ToolCallConstraint] = None
-    # Sub-context: prompt_ids split into per-namespace blocks (system_prompt / tools /
-    # messages) and the extra_key each block is matched under. None when the prompt
-    # was not split.
+    # Sub-context: prompt_ids split into blocks, and each block's namespace. None when
+    # the prompt was not split.
     sub_context_ids: Optional[List[List[int]]] = None
     sub_context_extra_keys: Optional[List[str]] = None
 

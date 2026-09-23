@@ -97,8 +97,8 @@ class SchedulerMetricsMixin:
 
         self.stats = SchedulerStats()
 
-        # Sub-context forward-pass GPU timing. Deliberately independent of
-        # --enable-metrics so an A/B run needs no Prometheus scrape.
+        # Sub-context stage timers and forward-pass GPU trace (independent of
+        # --enable-metrics).
         host_timer.init_host_timer("scheduler")
         self.forward_tracer = (
             ForwardTracer.maybe_create(tag=self.server_args.served_model_name)
@@ -251,10 +251,7 @@ class SchedulerMetricsMixin:
 
         index = getattr(self.tree_cache, "sub_context_index", None)
         if index is not None:
-            # Running totals, on the prefill line because that is the thing they are
-            # about. The number to read is the last one: tokens a scan located, that
-            # are still cached, and that a reuse confined to a prefix could not have
-            # reached.
+            # Running totals of the sub-context index.
             msg += f"\n{index.report()}"
 
         logger.info(msg)

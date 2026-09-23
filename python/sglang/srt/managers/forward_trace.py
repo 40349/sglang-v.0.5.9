@@ -1,12 +1,8 @@
-"""Per-forward-pass GPU timing, for A/B-ing sub-context KV reuse.
+"""Per-forward-pass GPU timing for the sub-context A/B.
 
 Set ``SGLANG_FORWARD_TRACE`` to an output path: every forward pass is bracketed by
-CUDA events and appends one JSON row, so the two arms are comparable on the same
-binary (``SGLANG_DISABLE_SUBCONTEXT=1`` for the baseline).
-
-Elapsed time is read only once the end event has completed (``Event.query()``),
-never by synchronising: under overlap scheduling the forward runs on a side stream,
-so a blocking ``elapsed_time()`` would stall the pipeline being measured.
+CUDA events and appends one JSON row. Elapsed time is read once the end event has
+completed (``Event.query()``), never by synchronising.
 """
 
 from __future__ import annotations
@@ -54,48 +50,25 @@ class ForwardTracer:
         bs = len(reqs)
 
         if batch.forward_mode.is_extend():
-            # Tokens pushed through the model this pass vs. served from the radix
-            # cache -- the quantity sub-context reuse is meant to move.
-            #
-            # `new_tokens` is already per request: a token is extended once however
-            # many chunks the prefill splits into. The cache side was not.
-            # `sum(len(req.prefix_indices))` re-counted a continuation's whole
-            # inherited prefix on every pass, so a run that chunks more looked like it
-            # cached more: on av_he with Stage 2 on, this read 46.1% where the client,
-            # counting each request once, read 36.2%. Accumulated per request below.
+            # Tokens computed this pass, and tokens served from the cache. Both count
+            # each request once however many chunks its prefill takes.
             new_tokens = batch.extend_num_tokens or 0
             cached_tokens = 0
-            # Matching can find MORE than the contiguity rule stitches: after a
-            # non-final segment misses, every later hit is dropped though matched and
-            # locked, and prefix_indices keeps no trace of it. Taken from where
-            # `_stitch_sub_contexts` recorded it and drained on read, so one stitch is
-            # counted once however many chunks prefill splits into -- deriving it from
-            # sum(sub_context_match_lens) here would go negative on continuations.
+            # Matched in the tree but not reused (drained from the request).
             discarded_tokens = 0
-            # The part of the drop caused by a *position* mismatch rather than
-            # contiguity, and still dropped: the share a rotation could have won back
-            # but did not (rotation off, delta out of range, or the pool was full).
+            # The part of `discarded` that was matched at another position.
             moved_tokens = 0
-            # Displaced hits that WERE won back, by copying the block to fresh slots
-            # with its K rotated to the position it is reused at. These are part of
-            # cached_tokens, so moved + rotated is the whole displaced population.
+            # Displaced hits rotated into place; part of `cached_tokens`.
             rotated_tokens = 0
-            # Tokens of a block the namespace had refused, rotated back to the position
-            # it holds and filed there at finish -- which is what lets the reply be
-            # cached at all. Cache-level, not per-request: the re-file happens after the
-            # request's last forward pass, so this pass reports work another request
-            # finished. The totals are right; a single row's attribution is not.
+            # Declined blocks rotated back and filed at finish. Cache-level: it is
+            # reported by whichever pass comes next, not by the request that did it.
             reinserted_tokens = 0
             cache = getattr(batch, "tree_cache", None)
             if getattr(cache, "sub_context_reinserted_tokens", 0):
                 reinserted_tokens = cache.sub_context_reinserted_tokens
                 cache.sub_context_reinserted_tokens = 0
             for req in reqs:
-                # `req.cached_tokens` is the number the client is served, advanced by
-                # `pre_len - already_computed` in `prepare_for_extend` -- the watermark
-                # that makes it per request. Charging its increment to this pass makes
-                # the trace agree with the client by construction, and still credits a
-                # block Stage 2 rotates in on a pass after the one that matched it.
+                # Charge only the increase of the client-facing `cached_tokens`.
                 c = getattr(req, "cached_tokens", 0) or 0
                 charged = getattr(req, "traced_cached_tokens", 0) or 0
                 if c > charged:
@@ -114,8 +87,7 @@ class ForwardTracer:
                     req.sub_context_rotated = 0
                     rotated_tokens += r
             matched_tokens = cached_tokens + discarded_tokens
-            # How many of these requests took the split path at all. A run with none
-            # did not observe zero drops; without this, "0 vs 0" reads as evidence.
+            # Requests in this pass that took the split path.
             sub_reqs = sum(1 for req in reqs if getattr(req, "has_sub_contexts", False))
         else:
             new_tokens = bs  # one token per sequence per decode step

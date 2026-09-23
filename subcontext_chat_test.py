@@ -1,10 +1,11 @@
 """Smoke test for sub-contexts on the OpenAI chat endpoint.
 
 Mimics the mini-swe-agent loop: a fixed system prompt plus a message list that grows
-by one assistant/user pair per turn. Watch the server log while this runs -- each
-request should print TRACE-2 with extra_keys=['system_prompt_key', 'messages_key'] and
-TRACE-4 with a per-namespace hit, where system_prompt_key hits 100% from turn 2 on and
-messages_key hits the whole previous tail.
+by one assistant/user pair per turn. With the server started under SGLANG_SUBCTX_TRACE=1
+(and role-named namespaces, i.e. no SGLANG_SUBCTX_HASH_KEYS / SGLANG_SUBCTX_INDEX), each
+request prints TRACE-2 with extra_keys=['system_prompt_key', 'messages_key'] and a
+TRACE-4 match per namespace: system_prompt_key hits in full from turn 2 on, and
+messages_key hits the previous tail.
 
 Usage: python subcontext_chat_test.py [base_url]
 """

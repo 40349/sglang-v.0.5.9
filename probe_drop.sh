@@ -1,14 +1,12 @@
 #!/bin/bash
-# Diagnostic replay: per-namespace hit lengths, to account for what the contiguity
-# rule discards. On av_he the split matched 265,398 tokens and spent 227,812.
-#
-# SUBCTX_TRACE is ON. Do not read GPU or host numbers out of this run.
+# Diagnostic replay with SGLANG_SUBCTX_TRACE on, for analyze_drop.py: per-namespace hit
+# lengths, to account for what the contiguity rule discards. Do not read timings from it.
 set -euo pipefail
 
 REPO=/home/t2503-3090/Desktop/MiaoChen/sglang-v.0.5.9
 OUT=$REPO/ab_out
 TAG=${TAG:-av_he}
-REQUESTS=${REQUESTS:-$OUT/requests_${TAG}_on.jsonl}
+REQUESTS=${REQUESTS:-$OUT/maslab/on/requests_${TAG}_on.jsonl}   # run_mas.sh ARM=on layout
 LOG=$OUT/probe_${TAG}.log
 PORT=${PORT:-30000}
 MODEL=${MODEL:-QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ}
@@ -31,9 +29,10 @@ nohup python -u -m sglang.launch_server \
 echo -n "waiting for server"
 for _ in $(seq 1 300); do
   grep -q "fired up and ready" "$LOG" && { echo " ready"; break; }
-  pgrep -f "sglang\.launch_server" > /dev/null || { echo " DIED"; tail -20 "$LOG"; exit 1; }
+  pgrep -f "[s]glang\.launch_server" > /dev/null || { echo " DIED"; tail -20 "$LOG"; exit 1; }
   echo -n .; sleep 2
 done
+grep -q "fired up and ready" "$LOG" || { echo " TIMEOUT"; tail -20 "$LOG"; exit 1; }
 grep -o "max_total_num_tokens=[0-9]*" "$LOG" | head -1
 
 python "$REPO/subcontext_bench.py" replay "$REQUESTS" \

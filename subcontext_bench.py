@@ -6,47 +6,19 @@ Subcommands:
   replay   Re-send a captured chat sequence to a server, in order.
   report   Aggregate the CUDA-event forward traces and diff baseline vs sub-context.
   stages   Diff the host-side (CPU) stage timers and cost the mechanism itself.
-  parity   Check two arms generated identical text.
+  parity   Compare two arms' generated text.
   summary  One table over all three: the serving metrics an outside reader asks for
            (hit rate, TTFT, end-to-end latency, throughput) plus what the split adds.
 
-Replay rather than timing two live agent runs: an agent loop is closed, so the
-moment one sampled token differs the runs take different actions and their GPU
-totals compare different conversations. Replaying one captured sequence fixes the
-input and leaves KV reuse as the only variable.
+`replay` re-sends one captured request sequence, so every arm sees the same input.
+Each turn is pinned to --gen-tokens with ignore_eos (--full uses each request's own
+max_tokens). Keep --gen-tokens at 2 or more: a request that finishes at prefill never
+inserts its prompt into the namespaces, so the next request misses them. Decode GPU
+time is the control and should not move between arms.
 
-Every turn is pinned to --gen-tokens (with ignore_eos); free generation makes decode
-length depend on the arm and swamps the prefill effect being measured.
-
-Do NOT lower --gen-tokens to 1 to "measure prefill only": a request that never goes
-through cache_unfinished_req gets no sub_context_last_nodes, so cache_finished_req
-files the prompt under extra_key=None and the next request misses every namespace --
-0% reuse, measuring the harness. Use --full for each request's own max_tokens.
-
-The functional floor is 2, the useful floor higher. Decode is the control: the
-mechanism cannot touch decode kernels, so the decode delta reads out this run's
-drift. Measured at 32 (1600 decode passes) drift was 0.02%/-0.11% clock-locked; at
-8 (400 passes) it was +3.4%. 32 keeps prefill at ~28% of GPU time and the control
-working.
-
---gen-tokens also caps a known asymmetry: the baseline caches its generated output
-while the split frees it, and regenerated tokens often match the recorded reply
-verbatim, so the baseline reuses them next turn -- 168 tokens at 32, 89 at 8. A real
-agent loop has no such bound.
-
-Replay streams by default, because TTFT does not exist in a non-streamed response:
-with ``stream: false`` the client learns nothing until the last token, so the only
-latency it can report is end-to-end. Streaming does not change what the server
-computes -- the GPU trace, the stage timers and the generated text are the same -- it
-only adds the per-chunk SSE cost, which both arms pay equally. ``--no-stream`` returns
-to the old behaviour and gives up TTFT.
-
-Concurrency is 1 by default and that is a measurement decision, not an oversight. The
-capture is a *sequence*: request i+1 reuses what request i left in the tree, so
-issuing several at once makes reuse depend on how the requests happen to interleave,
-and the rotation arm then diverges from itself run to run. Raise --concurrency when
-the question is serving capacity; leave it at 1 when the question is what the split
-does to a request.
+Replay streams by default so TTFT can be measured (--no-stream reports end-to-end
+latency only). --concurrency defaults to 1; above 1, reuse depends on how requests
+interleave.
 """
 
 from __future__ import annotations
@@ -82,14 +54,11 @@ def _post(url: str, payload: dict, timeout: float) -> dict:
 
 
 def _post_stream(url: str, payload: dict, timeout: float) -> dict:
-    """Send one request with SSE streaming on and time the first token.
+    """Send one request with SSE streaming and time the first token.
 
-    TTFT is the wall time to the first chunk that carries generated text. The
-    opening role-only chunk is skipped on purpose: it is sent before the model has
-    produced anything, so timing it would measure the HTTP handshake and call it
-    prefill. ``reasoning_content`` counts for the timing (the model is generating)
-    but is kept out of ``text``, which has to stay comparable to the non-streamed
-    ``message.content`` the parity hash is taken over.
+    TTFT is the time to the first chunk carrying generated text (``content`` or
+    ``reasoning_content``); the role-only opening chunk is skipped. ``text`` holds
+    ``content`` only.
     """
     payload = dict(payload)
     payload["stream"] = True
@@ -138,8 +107,7 @@ def _post_stream(url: str, payload: dict, timeout: float) -> dict:
 
 
 def _pct(values: List[float], q: float) -> Optional[float]:
-    """Nearest-rank percentile. Nearest-rank, not interpolated: with 25 requests an
-    interpolated p95 is a blend of two samples that no request actually saw."""
+    """Nearest-rank percentile (not interpolated)."""
     vals = sorted(v for v in values if v is not None)
     if not vals:
         return None
@@ -169,17 +137,12 @@ def cmd_replay(args: argparse.Namespace) -> int:
         print("--concurrency must be at least 1", file=sys.stderr)
         return 1
     if args.concurrency > 1 and args.flush_every:
-        # One client emptying the tree while another is mid-prefill does not give
-        # either of them a cold cache; it gives both an undefined one.
         print("--flush-every needs --concurrency 1 to mean anything", file=sys.stderr)
         return 1
 
     base = args.url.rstrip("/")
 
-    # Warm the GPU clocks before the measured window. Measured empirically: the
-    # first replay of a session reports ~14% more decode GPU time than an
-    # identical later one, purely from the card ramping up -- enough to swamp the
-    # effect being measured and to flip its sign depending on run order.
+    # Warm up the GPU clocks before the measured window.
     for _ in range(args.warmup):
         try:
             _post(
@@ -207,8 +170,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
         except urllib.error.URLError as e:
             print(f"warning: flush_cache failed ({e})", file=sys.stderr)
 
-    # Tell the report where the measured window starts, so the warm-up generations
-    # above are not counted. Same machine as the server, one short appended line.
+    # Mark the start of the measured window in the forward trace (same machine).
     if args.trace:
         try:
             with open(args.trace, "a", buffering=1) as f:
@@ -216,8 +178,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
         except OSError as e:
             print(f"warning: cannot mark {args.trace} ({e})", file=sys.stderr)
 
-    # The host timers live in the server processes and cannot see the line above,
-    # so they watch for this file instead. Same instant, same window.
+    # And for the host stage timers, which watch for this file.
     if args.stage_trace:
         try:
             with open(f"{args.stage_trace}.mark", "w") as f:
@@ -225,15 +186,9 @@ def cmd_replay(args: argparse.Namespace) -> int:
         except OSError as e:
             print(f"warning: cannot mark {args.stage_trace}.mark ({e})", file=sys.stderr)
 
-    # One request start to finish. Split out of the loop so --concurrency can have
-    # several in flight; the row carries its own index, so results stay in capture
-    # order however they interleave.
+    # One request start to finish; the row carries its capture index.
     def send(i: int, body: dict) -> dict:
-        # Bisection aid: with the tree emptied before every request there is no
-        # reuse in either arm, so the two arms must compute byte-identical
-        # prefills. Divergence that survives this is in the split path itself,
-        # not in what it chose to reuse. Ruins every timing number -- diagnosis
-        # only, never a measurement run.
+        # --flush-every: no reuse in any arm (diagnosis only; ruins the timings).
         if args.flush_every and i:
             try:
                 urllib.request.urlopen(f"{base}/flush_cache", timeout=30).read()
@@ -242,8 +197,6 @@ def cmd_replay(args: argparse.Namespace) -> int:
                 print(f"warning: flush_cache failed ({e})", file=sys.stderr)
         body = dict(body)
         if not args.full:
-            # Same decode length for every turn in both configs, so any difference
-            # in total GPU time comes from prefill.
             body["max_tokens"] = args.gen_tokens
             body["ignore_eos"] = True
         if args.model:
@@ -257,11 +210,6 @@ def cmd_replay(args: argparse.Namespace) -> int:
                 t0 = time.perf_counter()
                 resp = _post(f"{base}/v1/chat/completions", body, args.timeout)
                 dt = time.perf_counter() - t0
-                # Hash the completion so the two arms can be compared token-for-token.
-                # Sub-context only changes WHICH KV slots get reused; the reused KV has
-                # to be bit-identical, so at temperature 0 any divergence here is
-                # cache corruption. This is a sharper correctness test than pass@1 and
-                # it costs one hash per request.
                 try:
                     text = resp["choices"][0]["message"]["content"] or ""
                 except (KeyError, IndexError, TypeError):
@@ -279,9 +227,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
         text = res["text"]
         usage = res["usage"] or {}
         prompt = usage.get("prompt_tokens", 0) or 0
-        # Only reported when the server ran with --enable-cache-report; otherwise
-        # prompt_tokens_details is absent. Keep that distinct from a real zero --
-        # printing 0 here looks exactly like "the cache is broken".
+        # None when the server gives no prompt_tokens_details (no --enable-cache-report).
         details = usage.get("prompt_tokens_details")
         cached = None if details is None else (details.get("cached_tokens") or 0)
         row = {
@@ -319,9 +265,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
 
     tot_prompt = sum(r["prompt_tokens"] for r in rows)
     tot_completion = sum(r["completion_tokens"] for r in rows)
-    # A cold request has no `prompt_tokens_details` at all, so a single genuine zero
-    # used to turn the whole run's summary into "n/a" and hide a real hit rate.
-    # Only ALL rows missing means the server ran without --enable-cache-report.
+    # "n/a" only when no row has cache details; a missing row counts as 0.
     missing = sum(1 for r in rows if r["cached_tokens"] is None)
     tot_cached = sum(r["cached_tokens"] or 0 for r in rows)
     if missing == len(rows):
@@ -345,9 +289,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
         "cached_tokens": None if missing == len(rows) else tot_cached,
         "completion_tokens": tot_completion,
         "hit_rate_pct": hit_rate,
-        # Throughput over the measured window. At concurrency 1 this is bounded by
-        # 1/latency by construction and is a per-request number wearing a rate's
-        # units; only a run with --concurrency > 1 measures serving capacity.
+        # Over the replay's wall time; at concurrency 1 this is 1/latency.
         "requests_per_s": (len(rows) / total) if total else 0.0,
         "output_tokens_per_s": (tot_completion / total) if total else 0.0,
         "total_tokens_per_s": ((tot_prompt + tot_completion) / total) if total else 0.0,
@@ -429,45 +371,31 @@ def summarize(rows: List[dict]) -> Dict[str, float]:
     dec_ms = sum(r["gpu_ms"] for r in dec)
     new_tok = sum(r["new_tokens"] for r in ext)
     cached_tok = sum(r["cached_tokens"] for r in ext)
-    # Three trace vintages. Newest records the drop directly and is the only one
-    # that survives chunked prefill; the middle one derived it by subtracting a
-    # per-pass length from a per-request one, which goes negative by a chunk on
-    # every continuation pass; the oldest has neither field, so "matched" can
-    # only mean "reused" and the drop is unknowable rather than zero.
+    # Older traces lack `discarded_tokens`; derive it from `matched_tokens` there.
     if any("discarded_tokens" in r for r in ext):
         discarded_tok = sum(r.get("discarded_tokens", 0) for r in ext)
     else:
         discarded_tok = sum(r.get("matched_tokens", r["cached_tokens"]) for r in ext) - cached_tok
     matched_tok = cached_tok + discarded_tok
-    # The share of the drop that is a position mismatch: matched in the tree but
-    # computed at a different absolute position, so it cannot be stitched as-is.
-    # None (not 0) when the trace predates the field -- "no moved hits" and "this
-    # trace cannot say" are different claims.
+    # The fields below are None (not 0) when the trace predates them.
+    # Dropped hits that were matched at another position.
     moved_tok = (
         sum(r.get("moved_tokens", 0) for r in ext)
         if any("moved_tokens" in r for r in ext)
         else None
     )
-    # The share of the position mismatch that was WON BACK by rotating the block's K
-    # to the position it is reused at. These tokens are counted in cached_tokens, so
-    # moved + rotated is the whole displaced population and `rotated` is the arm's
-    # headline number. None (not 0) when the trace predates the field.
+    # Displaced hits rotated into place; part of cached_tokens.
     rotated_tok = (
         sum(r.get("rotated_tokens", 0) for r in ext)
         if any("rotated_tokens" in r for r in ext)
         else None
     )
-    # Tokens of a block the tree had refused, rotated back to the position it holds
-    # and filed there when the request finished. Not part of this run's cached_tokens
-    # -- the payoff lands on *later* requests, as a longer hit and a cached reply.
-    # None (not 0) when the trace predates the field.
+    # Declined blocks rotated back and filed at finish (reused by later requests).
     reinserted_tok = (
         sum(r.get("reinserted_tokens", 0) for r in ext)
         if any("reinserted_tokens" in r for r in ext)
         else None
     )
-    # None, not 0, when the trace predates the field: "no request took the split
-    # path" and "the trace cannot say" are different claims and print differently.
     sub_reqs = sum(r["sub_reqs"] for r in ext) if all("sub_reqs" in r for r in ext) else None
 
     return {
@@ -543,8 +471,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     ]
 
     def gate_absent(arm: Dict[str, float]) -> bool:
-        """True when this arm never ran the contiguity gate, so a drop of zero is
-        not a measurement. None means the trace is too old to tell."""
+        """True when no request in this arm took the split path."""
         return arm["sub_reqs"] == 0
 
     w = 26
@@ -581,18 +508,7 @@ def cmd_report(args: argparse.Namespace) -> int:
             "continuation pass reads one chunk short. Re-run to get a real number;\n"
             "the other rows are unaffected."
         )
-    # Both token columns are per request: `actually computed` always was (a token is
-    # extended once however many chunks it takes), and `from radix cache` is now, via
-    # the `cached_tokens` watermark the client is served from. So the hit rate no
-    # longer moves with the chunking regime -- it used to read 46.1% against the
-    # client's 36.2% on this capture, purely because Stage 2 cut more chunks.
-    #
-    # The pass counts still differ, and that is worth saying: it is the whole cost
-    # side of Stage 2. Print the reuse against the prompt total as a cross-check that
-    # needs no denominator from the trace at all. The prompt total is a property of
-    # the capture, which this command does not have; retraction is the only thing that
-    # can still inflate a column (a retracted request recomputes), so the smaller arm
-    # bounds it from above.
+    # Different chunking (e.g. Stage 2): cross-check reuse against the prompt total.
     if a["prefill_passes"] != b["prefill_passes"]:
         prompt = min(a["prefill_total_tokens"], b["prefill_total_tokens"])
         print(
@@ -624,35 +540,29 @@ STAGE_NOTES = {
     "subctx_split": "  DECOMPOSITION: finding the block boundaries",
     "match": "prefix match / per-namespace stitch",
     "subctx_stitch": "  the split's own match+stitch, inside match",
+    "subctx_scan": "  the index's scan + lookups, inside match",
     "subctx_lookup": "    LOOKUP: one match_prefix per namespace",
-    "subctx_rotate": "    PI-KV: rotate a displaced block before prefill reads it",
-    "subctx_rotate_finish": "  PI-KV: rotate a block back at finish, to file it",
-    "subctx_rotate_gpu": "  PI-KV on the GPU (SGLANG_SUBCTX_ROTATE_GPU=1; NOT host time)",
+    "subctx_rotate": "    ROTATE: copy a displaced block, rotated, before prefill",
+    "subctx_rotate_finish": "  ROTATE: rotate a block back at finish, to file it",
+    "subctx_rotate_gpu": "  ROTATE on the GPU (SGLANG_SUBCTX_ROTATE_GPU=1; NOT host time)",
     "cache_unfinished": "insert prompt into the tree",
     "cache_finished": "release locks / free tail",
     "subctx_rev_rotate": "  of which: reverse-rotate a refused block and file it",
 }
 
-# Stages that are a breakdown of one already counted. Reported for attribution and
-# excluded from the total, or the same microseconds would be charged twice.
+# Stages nested in another counted stage: shown, but kept out of the total.
 BREAKDOWN = {
     "subctx_stitch": "match",
     "subctx_scan": "match",
     "subctx_lookup": "subctx_stitch",
-    "subctx_rotate": "subctx_stitch",
+    "subctx_rotate": "match / cache_unfinished",
     "subctx_rev_rotate": "cache_finished",
     "subctx_rotate_finish": "cache_finished",
     "subctx_rotate_gpu": "GPU, not host",
 }
 
-# child -> enclosing stage. The two overlap, so only one may enter the total.
-#
-# Take the http-side cost from the child. subctx_split is measured directly and
-# reproduces to 0.4% across runs; tpl_render's delta is a difference between two
-# ~13 ms numbers whose own spread (~800 us) swamps the ~680 us being resolved.
-# Both estimate the same quantity -- the parent minus the nested child is the jinja
-# work, identical in both arms and duly ~0 -- so this picks the better estimator,
-# not a different number. cmd_stages prints the residual to keep that checkable.
+# child -> enclosing stage. Only the child enters the total (the parent's delta is
+# noisier); cmd_stages prints the residual parent - child for both arms.
 NESTED = {"subctx_split": "tpl_render"}
 
 
@@ -661,9 +571,8 @@ def load_stages(
 ) -> tuple[Dict[str, Dict[str, float]], bool]:
     """Merge the per-process stage files a run wrote (<prefix>.http.json, .scheduler.json).
 
-    Returns the merged stages and whether they came from the post-warm-up
-    window. ``measured`` is preferred but only when *every* process has it: a
-    mix of windows across processes is worse than one honest wide window.
+    Returns the merged stages and whether they are the post-warm-up ``measured``
+    window, used only when every process has it.
     """
     hits = sorted(glob.glob(f"{prefix}.*"))
     hits = [h for h in hits if not h.endswith(".mark")]
@@ -682,8 +591,7 @@ def load_stages(
     merged: Dict[str, Dict[str, float]] = {}
     for path, doc in docs:
         for stage, s in doc["measured" if measured else "stages"].items():
-            # Stage names are global, not per-process; a collision would have one
-            # process silently overwrite the other's numbers.
+            # A stage reported by two processes would overwrite the first.
             if stage in merged:
                 print(f"warning: stage {stage!r} reported by more than one "
                       f"process (last seen in {path}); numbers will be wrong",
@@ -715,10 +623,7 @@ def cmd_stages(args: argparse.Namespace) -> int:
               if sa else f"{'-':>5} {'-':>9} {'-':>8}")
         fb = (f"{sb['count']:>5} {sb['mean_us']:>9.1f} {sb['total_ms']:>8.1f}"
               if sb else f"{'-':>5} {'-':>9} {'-':>8}")
-        # Compare per-call cost scaled to a common call count, never raw totals.
-        # The arms can legitimately differ by a call or two -- a dump can land
-        # between a nested stage's add() and its parent's -- and subtracting
-        # unequal totals turns that off-by-one into phantom milliseconds.
+        # Per-call means scaled to a common call count, not raw totals.
         n_ref = max(sa["count"] if sa else 0, sb["count"] if sb else 0)
         norm = lambda s: (s["mean_us"] * n_ref / 1000.0) if s else 0.0
         added = norm(sb) - norm(sa)
@@ -750,8 +655,7 @@ def cmd_stages(args: argparse.Namespace) -> int:
         print(f"\n{child} is nested inside {parent}, so only one enters the total:")
         print(f"  {child:<20} counted  -- measured directly, baseline is the disabled path")
         print(f"  {parent:<20} EXCLUDED -- its delta is a difference of two ~13ms numbers")
-        # The parent minus the nested child is the work both arms do identically.
-        # It should be zero; anything else means the split is not the whole story.
+        # Parent minus child is the work both arms share; its delta should be ~0.
         for label, arm in ((label_a, a), (label_b, b)):
             if parent in arm:
                 net = arm[parent]["mean_us"] - arm.get(child, {}).get("mean_us", 0.0)
@@ -776,13 +680,7 @@ def cmd_stages(args: argparse.Namespace) -> int:
 
 
 def load_client(path: str) -> Tuple[dict, List[dict]]:
-    """Read a replay's --out file.
-
-    Two vintages: the newer one wraps the rows in {"meta", "rows"} so the run's
-    own rates and percentiles travel with them; the older one is the bare list.
-    An old file still parities and still reports latency -- it just has no TTFT
-    and no wall clock, so no throughput can be recovered from it.
-    """
+    """Read a replay's --out file: ``{"meta", "rows"}``, or an older bare row list."""
     with open(path) as f:
         doc = json.load(f)
     if isinstance(doc, list):
@@ -791,13 +689,10 @@ def load_client(path: str) -> Tuple[dict, List[dict]]:
 
 
 def cmd_parity(args: argparse.Namespace) -> int:
-    """Compare what the two arms generated, request by request.
+    """Compare the two arms' generated text, request by request (by hash).
 
-    At temperature 0 with the same weights, the arms must produce the same
-    tokens: the split changes which cached KV is reused, and reused KV that is
-    not bit-identical shows up as a different sampled token. A mismatch here is
-    a correctness bug, not noise -- unlike a pass@1 difference, which a single
-    flipped token can cause without anything being wrong.
+    Identical text is expected only where the reused KV is exact (e.g. an arm against
+    itself); rotated or cross-namespace reuse changes the KV and can change the text.
     """
     _, a = load_client(args.baseline)
     _, b = load_client(args.treatment)
@@ -835,8 +730,7 @@ def cmd_parity(args: argparse.Namespace) -> int:
 # summary
 # --------------------------------------------------------------------------- #
 
-# stem -> label, in the order run_mas.sh runs them. The stems are the filenames
-# `toggle` writes, so `summary` reads a completed A/B with no arguments but a suffix.
+# File stem -> column label, in table order.
 ARM_STEMS = (
     ("base", "baseline"),
     ("sub", "sub-context"),
@@ -874,11 +768,9 @@ def _load_arm(dirname: str, suffix: str, stem: str) -> Optional[dict]:
 
 
 def _client_stat(arm: dict, *path: str) -> Optional[float]:
-    """Read a value out of the replay's own summary, falling back to the rows.
+    """Read a value from the replay's ``meta``, else recompute it from the rows.
 
-    A file written before `meta` existed still has the per-request rows, so
-    latency and the hit rate are recoverable from it; TTFT and anything divided by
-    wall time are not, and stay None rather than being guessed at.
+    Only the request count, hit rate and latency can be recomputed; others are None.
     """
     meta, rows = arm["meta"], arm["rows"]
     node: object = meta
@@ -922,11 +814,8 @@ def _stage_us_per_req(arm: dict, stage: str, n_req: Optional[float]) -> Optional
 def _added_us_per_req(
     arm: dict, base: dict, stage: str, n_req: Optional[float]
 ) -> Optional[float]:
-    """Per-request cost this arm added at ``stage``, over what the baseline spent.
-
-    Per-call means scaled to a common call count, never raw totals: the arms can
-    legitimately differ by a call or two and subtracting unequal totals turns that
-    off-by-one into phantom microseconds. Same rule as `stages`.
+    """Per-request cost this arm added at ``stage`` over the baseline (per-call
+    means scaled to a common call count, as in `stages`).
     """
     sa, sb = base["stages"].get(stage), arm["stages"].get(stage)
     if sb is None and sa is None:
@@ -956,12 +845,7 @@ _SUMMARY_METRICS = (
      lambda a, b, n: _gpu_stat(a, "prefill_new_tokens"), "pct"),
     ("prefill tokens from the cache", "tok",
      lambda a, b, n: _gpu_stat(a, "prefill_cached_tokens"), "pct"),
-    # The one rotation row this table carries, and the only one whose indent is
-    # true: a rotated-in hit IS part of the line above it. `matched but dropped`
-    # and `dropped as MOVED` sat here at the same indent and are the opposite side
-    # of the ledger -- tokens NOT served -- which reads as a breakdown and is not
-    # one. They stay in `report`'s ROTATE vs BASELINE table, where the whole
-    # partition is laid out and the reader is looking for it.
+    # Part of the row above; the dropped rows are in `report`.
     ("  MOVED but rotated in", "tok",
      lambda a, b, n: _gpu_stat(a, "rotated_tokens"), "pct"),
 
@@ -988,27 +872,23 @@ _SUMMARY_METRICS = (
     ("total", "ms", lambda a, b, n: _gpu_stat(a, "total_gpu_ms"), "pct"),
 )
 
-# The overhead section is already a difference, so it has no delta column: every
-# number is what this arm added over the baseline, per request.
+# Host cost each arm added over the baseline, per request.
 #
-# (label, stage, own, counted). `own` marks a stage the baseline does not run at
-# all, so its whole cost is the addition; the others are shared and get the
-# baseline subtracted. `counted` is what enters the total, and it is not the same
-# question: `match` is shared and counted, while the split's own lookup, assembly
-# and rotation all happen *inside* match and would be charged twice if they were.
-# subctx_split is counted despite living inside tpl_render for the reason NESTED
-# gives -- the child is measured directly, the parent's delta is noise.
+# (label, stage, own, counted). `own`: the baseline does not run the stage, so its
+# whole cost is added; otherwise the baseline's cost is subtracted. `counted`: enters
+# the total (nested stages do not; subctx_split does, see NESTED).
 _OVERHEAD_METRICS = (
     ("decomposition (subctx_split)", "subctx_split", True, True),
     ("match, total added", "match", False, True),
+    ("  index scan (subctx_scan)", "subctx_scan", True, False),
     ("  lookup (subctx_lookup)", "subctx_lookup", True, False),
     ("  assembly (stitch - lookup - rotate)", None, True, False),
-    ("  PI-KV rotate, before prefill", "subctx_rotate", True, False),
+    ("  rotate, before prefill", "subctx_rotate", True, False),
     ("insert into tree, added", "cache_unfinished", False, True),
     ("release / free, added", "cache_finished", False, True),
     ("  reverse-rotate and re-file", "subctx_rev_rotate", True, False),
-    ("  PI-KV rotate, at finish", "subctx_rotate_finish", True, False),
-    ("[GPU] PI-KV rotation kernel", "subctx_rotate_gpu", True, False),
+    ("  rotate, at finish", "subctx_rotate_finish", True, False),
+    ("[GPU] rotation kernel", "subctx_rotate_gpu", True, False),
 )
 
 
@@ -1028,11 +908,7 @@ def _overhead_value(
 
 
 def _split_ratio_stem(stem: str) -> Tuple[str, Optional[int]]:
-    """``"idx_r15"`` -> ``("idx", 15)``. Any other stem keeps its own name.
-
-    Selective recompute is a dial rather than an arm, so a sweep writes several files
-    under one arm name and tells them apart by the ratio they ran at.
-    """
+    """``"idx_r15"`` -> ``("idx", 15)``; any other stem -> ``(stem, None)``."""
     base, _, tail = stem.rpartition("_r")
     if base and tail.isdigit():
         return base, int(tail)
@@ -1068,8 +944,6 @@ def cmd_summary(args: argparse.Namespace) -> int:
         return 1
     base = arms[0]
     if base["label"] != dict(ARM_STEMS)["base"]:
-        # Every delta is against the leftmost column, so dropping the baseline
-        # silently re-bases the whole table on a treatment arm.
         print(f"WARNING: no baseline arm in {args.arms}; the deltas below are "
               f"against {base['label']}, not against the split being off.")
 
@@ -1193,8 +1067,7 @@ def main() -> int:
     r.add_argument("--timeout", type=float, default=1800.0)
     r.add_argument("--gen-tokens", type=int, default=64,
                    help="force exactly this many generated tokens per turn "
-                        "(default 64; values near 1 break sub-context caching, "
-                        "see module docstring)")
+                        "(default 64; keep it >= 2, see module docstring)")
     r.add_argument("--full", action="store_true",
                    help="use each captured request's own max_tokens instead")
     r.add_argument("--warmup", type=int, default=3,
@@ -1212,10 +1085,8 @@ def main() -> int:
                         "--no-stream restores the old single-response behaviour and "
                         "reports no TTFT")
     r.add_argument("--concurrency", type=int, default=1,
-                   help="requests in flight at once (default 1). Above 1 the reuse "
-                        "each request sees depends on how they interleave, so the "
-                        "rotation arm stops being reproducible; raise it only when "
-                        "the question is serving capacity")
+                   help="requests in flight at once (default 1); above 1, reuse "
+                        "depends on how requests interleave")
     r.add_argument("--flush-every", action="store_true",
                    help="empty the radix tree before every request, so neither "
                         "arm reuses anything (diagnosis only -- destroys timings)")
@@ -1232,7 +1103,7 @@ def main() -> int:
                    help="merge every run in the file instead of the last")
     s.set_defaults(func=cmd_report)
 
-    y = sub.add_parser("parity", help="check two arms generated identical text")
+    y = sub.add_parser("parity", help="compare two arms' generated text")
     y.add_argument("baseline", help="--out json from the baseline arm")
     y.add_argument("treatment", help="--out json from the sub-context arm")
     y.set_defaults(func=cmd_parity)

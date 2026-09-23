@@ -5,19 +5,16 @@ Reads an openclaw normalized-request JSON capture, splits it into the three
 sub-contexts (system_prompt / tools / messages), and POSTs one `/generate` request
 to a running sglang server with the `sub_contexts` field.
 
-This exercises Stage 0 end-to-end: the server tokenizes each block independently,
-matches/inserts it in its own radix namespace, prints the three per-namespace radix
-trees (TRACE-1..4 + pretty_print), and decodes the turn-1 output.
+The server tokenizes each block separately, matches/inserts it in its own radix
+namespace, and decodes the turn-1 output. Start the server with SGLANG_SUBCTX_TRACE=1
+to see the per-block matches, and SGLANG_DUMP_TREE=1 to print the tree.
 
 Usage:
     conda activate sglangv59
     python scripts/subcontext_sim/round1_from_json.py \
-        --json 2026-05-04T14-52-26-258Z_127_0001_chat_google_gemma-4-31b-it.json \
-        --url http://127.0.0.1:30000 --max-new-tokens 128
+        --json <capture>.json --url http://127.0.0.1:30000 --max-new-tokens 128
 
-Note: contents are concatenated as a lightly-structured prompt so each block has a
-clean boundary. Full chat-template fidelity for the target model is refined in a
-later stage; Stage 0 only needs the pipeline shape to run.
+The blocks use a hand-written Qwen-style template, not the model's chat template.
 """
 import argparse
 import json
@@ -79,7 +76,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--json",
-        default="2026-05-04T14-52-26-258Z_127_0001_chat_google_gemma-4-31b-it.json",
+        required=True,
         help="Path to the openclaw normalized-request JSON capture.",
     )
     parser.add_argument(

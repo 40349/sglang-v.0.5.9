@@ -277,13 +277,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Position information
     positions: torch.Tensor = None
-    # Sub-context sparse prefill: the reused KV is scattered through the sequence
-    # rather than sitting in front of it, so attention has to be masked by real
-    # position instead of by index. Set alongside `positions` below.
+    # Sub-context sparse prefill: attention is masked by position, not by index.
     subctx_sparse: bool = False
-    # Selective recompute: the layout for scoring the reused tokens and cutting the
-    # token dimension down to the fresh ones plus whatever scored highest. When this is
-    # set the pass runs in two layer ranges and the row count changes between them.
+    # Selective recompute plan; the forward then runs in two layer ranges.
     subctx_blend_plan: Optional[Any] = None
 
     # For extend
@@ -488,14 +484,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.positions = ret.spec_info.positions
         elif batch.subctx_positions is not None:
             ret.subctx_sparse = True
-            # Sub-context sparse prefill: the tokens being computed are the gaps
-            # between reused blocks, so their positions are not one ascending run and
-            # cannot be rebuilt from a prefix length. `compute_position` below is
-            # skipped because this is already set.
+            # Sparse prefill: explicit positions (compute_position is skipped). With
+            # selective recompute they cover the whole prompt until the cut in
+            # `ModelRunner.forward_subctx_blend`.
             ret.positions = batch.subctx_positions.to(device, non_blocking=True)
-            # While the scored layers run, `positions` covers the whole prompt rather
-            # than the tokens being computed. The cut back down happens between layer
-            # ranges, in `ModelRunner.forward_subctx_blend`.
             ret.subctx_blend_plan = batch.subctx_blend_plan
 
         # Init position information

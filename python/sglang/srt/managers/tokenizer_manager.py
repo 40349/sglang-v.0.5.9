@@ -184,24 +184,18 @@ def _clip_sub_contexts_to_input(
     input_len: int,
     rid: str,
 ) -> Tuple[Optional[List[List[int]]], Optional[List[str]]]:
-    """Restore ``concat(sub_context_ids) == input_ids``.
+    """Restore ``concat(sub_context_ids) == input_ids`` after auto-truncation.
 
-    ``_validate_one_request`` truncates an over-long prompt in place under
-    ``--allow-auto-truncate``, leaving the blocks describing more tokens than remain.
-    That invariant is what makes the per-block offsets absolute positions, so without
-    this the match path stitches KV for tokens no longer in the prompt.
-
-    Truncation only removes a suffix, so apply the same cut: keep whole blocks while
-    they fit, clip the straddling one, drop the rest. ``(None, None)`` if nothing is
-    left, which makes the request an ordinary single-namespace one.
+    Truncation removes a suffix: keep whole blocks while they fit, clip the straddling
+    one, drop the rest. ``(None, None)`` if nothing is left or the blocks are shorter
+    than the prompt.
     """
     total = sum(len(seg) for seg in sub_context_ids)
     if total == input_len:
         return sub_context_ids, sub_context_extra_keys
 
     if total < input_len:
-        # Not a truncation: something else rewrote input_ids (e.g. a multimodal
-        # processor) and the split no longer describes this prompt at all.
+        # Not a truncation (e.g. a multimodal processor rewrote input_ids).
         logger.warning(
             "Sub-context: dropping the split for rid=%s -- the blocks cover %d tokens "
             "but the prompt has %d.",
@@ -757,8 +751,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 )
 
             if isinstance(obj, GenerateReqInput) and obj.sub_contexts:
-                # Sub-context: tokenize each block independently so its token ids
-                # match its own radix namespace, then stitch into one sequence.
+                # Tokenize each block separately, then concatenate.
                 contents = [sc["content"] for sc in obj.sub_contexts]
                 sub_context_extra_keys = [sc["extra_key"] for sc in obj.sub_contexts]
                 sub_context_ids, _ = await self._tokenize_texts(
@@ -814,10 +807,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         else:
             mm_inputs = None
 
-        # The OpenAI chat path renders the template itself, so it arrives with
-        # `input_ids` set and the split alongside. Accept it only if it really
-        # reconstructs the prompt -- a mis-sliced split would feed the wrong tokens
-        # into the radix namespaces.
+        # Pre-split ids (OpenAI chat path): accept only if they concatenate to input_ids.
         if sub_context_ids is None and getattr(obj, "sub_context_ids", None):
             flat = [tok for seg in obj.sub_context_ids for tok in seg]
             if input_ids is not None and flat == list(input_ids):
@@ -832,8 +822,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 )
 
         self._validate_one_request(obj, input_ids)
-        # `_validate_one_request` may have truncated `input_ids` in place
-        # (--allow-auto-truncate); the blocks have to follow it.
+        # `_validate_one_request` may have truncated input_ids (--allow-auto-truncate).
         if sub_context_ids is not None:
             sub_context_ids, sub_context_extra_keys = _clip_sub_contexts_to_input(
                 sub_context_ids, sub_context_extra_keys, len(input_ids), obj.rid
@@ -1067,9 +1056,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 http_worker_ipc=obj.http_worker_ipc,
             )
 
-        # --- 追蹤 Tokenizer ---
-        # print(f"[TRACE-2 Tokenizer] 準備建立 Req, rid={tokenized_obj.rid}")
-        # print(f"[TRACE-2 Tokenizer] extra_key={getattr(tokenized_obj, 'extra_key', 'Lose')}")
         if TRACE_ON:
             _sc_keys = getattr(tokenized_obj, "sub_context_extra_keys", None)
             if _sc_keys:

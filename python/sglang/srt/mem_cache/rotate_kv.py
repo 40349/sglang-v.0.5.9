@@ -1,30 +1,15 @@
 """Re-rotate cached K so a block can be reused at a different absolute position.
 
-RoPE is a rotation whose angle is linear in the position, so ``R(a) . R(b) == R(a+b)``
-and a key cached at ``p`` can be moved to ``p + delta`` by applying ``R(delta)`` to it.
-Attention applies RoPE last, immediately before writing the pool, so the pool holds
-``R(p) . f(k_raw)`` for whatever normalisation ``f`` the model uses, and
+The pool holds ``R(p) . f(k_raw)``, and RoPE composes (``R(a) . R(b) == R(a+b)``), so
 
     R(p_new) . f(k_raw) == R(p_new - p) . k_cached[loc]
 
-*exactly* -- ``f`` sits before the rotation and RoPE preserves norms, so there is
-nothing to re-run. V carries no position at all and is copied unchanged. Whether a
-given model's RoPE really composes like this is measured at startup by
-:func:`rope_delta_composable_reason`, not assumed.
+V has no position and is copied unchanged. :func:`rope_delta_composable_reason` checks
+the identity on the model's RoPE at startup. Rotation fixes the position only, not the
+context the block was computed under.
 
-This fixes the *position*. It does not fix the *context*: the block's hidden states
-were produced under whatever prefix preceded it when it was computed, and no rotation
-can restore that. Reusing a rotated block therefore trades some output quality for the
-prefill it skips, which is what the pass@1 arm of the experiment measures.
-
-Where the result lands follows one rule: **source owned by the tree, copy; source
-owned by this request, rotate in place.** The read paths (the stitch, and the Stage 2
-append) rotate a node's KV that other requests hold a ``lock_ref`` on, so they must
-allocate; rotating that in place would corrupt every request hitting the same node at
-its canonical position. The write paths (re-filing a declined block, and moving the
-generated tail to follow it) rotate slots the finished request allocated itself, and
-do so in place -- guarded by ``_tree_held_mask``, because a declined block can still
-carry a node's own slots.
+Tree-owned sources are copied to fresh slots (the read paths); slots the request owns
+are rotated in place (the finish paths).
 """
 
 from __future__ import annotations
@@ -43,11 +28,8 @@ from sglang.srt.utils.device_timer import DeviceTimer
 
 logger = logging.getLogger(__name__)
 
-# GPU time for the rotation kernel, reported as the ``subctx_rotate_gpu`` stage.
-# Off by default and deliberately: it costs a CUDA event pair per call, which lands
-# inside the ``subctx_rotate`` host stage measured right beside it. Turn it on for a
-# run whose question is what the rotation costs on the GPU, and read the host numbers
-# from a run with it off.
+# Time the rotation kernel on the GPU (the ``subctx_rotate_gpu`` stage). Adds a CUDA
+# event pair per call inside the ``subctx_rotate`` host stage.
 _TIME_ROTATE_GPU = bool(os.environ.get("SGLANG_SUBCTX_ROTATE_GPU", ""))
 
 
@@ -72,9 +54,7 @@ def _rotate_copy_kv_kernel(
 ):
     """One program per (token, layer): rotate that row's K, copy its V.
 
-    Grid is ``(num_locs, num_layers)`` rather than the other way round because CUDA
-    caps grid dims 1 and 2 at 65535, and a block can be longer than that while the
-    layer count cannot.
+    Grid is ``(num_locs, num_layers)``: CUDA caps grid dims 1 and 2 at 65535.
     """
     i = tl.program_id(0)
     layer = tl.program_id(1)
@@ -105,7 +85,7 @@ def _rotate_copy_kv_kernel(
     x1 = tl.load(k_src + lo, mask=m, other=0.0).to(tl.float32)
     x2 = tl.load(k_src + hi, mask=m, other=0.0).to(tl.float32)
 
-    # Accumulate in fp32; the buffers are bf16 and round once, on store.
+    # Compute in fp32; round once on store.
     y1 = x1 * cos[None, :] - x2 * sin[None, :]
     y2 = x2 * cos[None, :] + x1 * sin[None, :]
 
@@ -124,18 +104,10 @@ def _rotate_copy_kv_kernel(
 def delta_cos_sin(
     cos_sin_cache: torch.Tensor, rotary_dim: int, delta: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """cos/sin of ``R(delta)`` as a *unit* rotation, read off the model's own cache.
+    """cos/sin of ``R(delta)`` as a unit rotation, read off the model's cos_sin_cache.
 
-    A negative delta indexes the cache at ``|delta|`` with the sine negated -- the same
-    rotation run backwards, since the cache only holds non-negative rows.
-
-    The row is then normalised per dimension. A plain cache already has unit rows (the
-    division is a no-op within fp32 noise), but the YaRN family stores ``mscale * cos``
-    and ``mscale * sin`` (``rotary_embedding.py:662-663``). That scalar is already baked
-    into the cached K we are about to rotate, so using the row as stored would multiply
-    K by ``mscale`` again on every hop. Dividing it out is exact rather than a
-    correction: mscale is a scalar, it commutes with the rotation, and it belongs to the
-    stored key, not to the delta.
+    A negative delta uses row ``|delta|`` with the sine negated. Each row is normalised
+    to unit length, which divides out YaRN's ``mscale`` (already in the cached K).
     """
     half = rotary_dim // 2
     row = cos_sin_cache[abs(delta)].float()
@@ -170,11 +142,7 @@ def rotate_copy_kv_native(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> None:
-    """Pure-torch reference for :func:`rotate_copy_kv`. Same math, no kernel.
-
-    Kept because it is the oracle the Triton kernel is tested against, and it is the
-    only path that runs on CPU (where the sub-context unit tests live).
-    """
+    """Pure-torch version of the Triton kernel. The test oracle, and the CPU path."""
     for k_cache, v_cache in zip(k_buffer, v_buffer):
         out = apply_delta_rows(k_cache[src_loc], cos, sin)
         k_cache[dst_loc] = out.to(k_cache.dtype)
@@ -182,10 +150,9 @@ def rotate_copy_kv_native(
 
 
 class KVRotator:
-    """Copies a block of cached KV to new slots, rotating K by a position delta.
+    """Rotates cached K by a position delta and copies V, to new slots or in place.
 
-    Built once per scheduler when the model's RoPE is delta-composable; see
-    ``subctx_config.rotation_unsupported_reason`` for what that rules out.
+    Built by the scheduler when ``subctx_config.rotation_unsupported_reason`` passes.
     """
 
     def __init__(
@@ -203,8 +170,7 @@ class KVRotator:
         self.max_delta = cos_sin_cache.shape[0] - 1
         self.use_native = use_native or not cos_sin_cache.is_cuda
         self.rotated_tokens = 0
-        # Elapsed time is read on a later call, once the end event has completed,
-        # never by synchronising. The last few calls of a run go unreported.
+        # Reported on a later call once the event completes; the last few are lost.
         self._gpu_timer = (
             DeviceTimer(reporter=self._report_gpu)
             if _TIME_ROTATE_GPU and host_timer.armed() and not self.use_native
@@ -232,13 +198,8 @@ class KVRotator:
     ) -> None:
         """Write ``R(delta)`` applied to the K at ``src_loc`` (and V verbatim) to ``dst_loc``.
 
-        ``dst_loc`` must come from the allocator: the caller owns those slots and is
-        responsible for freeing them. ``src_loc`` is tree-owned and is never written.
-
-        ``stage`` names the host timer this call is charged to. It exists because the
-        two call families answer different questions: rotating on the read path is
-        latency a request pays before its own prefill, while rotating at finish is
-        book-keeping for whoever comes next. Summing them would hide which.
+        ``dst_loc`` may equal ``src_loc`` (in place); otherwise ``src_loc`` is not
+        written. ``stage`` names the host timer the call is charged to.
         """
         assert dst_loc.numel() == src_loc.numel(), (
             f"{dst_loc.numel()=} != {src_loc.numel()=}"
@@ -250,8 +211,6 @@ class KVRotator:
 
         pool = self.pool
 
-        # Timed here, not at the call sites: every path that rotates comes through
-        # this method.
         gpu = (
             self._gpu_timer.wrap(metadata={"tokens": n})
             if self._gpu_timer is not None
@@ -290,17 +249,9 @@ class KVRotator:
 
 
 def find_rotary_embedding(model) -> Tuple[Optional[object], Optional[str]]:
-    """Return the model's single ``RotaryEmbedding``, or why there isn't one.
+    """Return the model's single ``RotaryEmbedding`` instance, or why there isn't one.
 
-    Walks the live model, not ``rotary_embedding._ROPE_DICT``, which is process-global
-    and holds a draft model's entry too under speculative decoding. All layers share one
-    instance via the ``_ROPE_DICT`` memo, so more than one distinct object means the
-    model mixes rotations and no single delta fits every layer.
-
-    Subclasses are deliberately *not* filtered here. Whether a particular RoPE composes
-    under a delta is measured at startup by :func:`rope_delta_composable_reason`, which
-    is both stricter than a class name and still right for classes that did not exist
-    when this was written.
+    Walks the live model's modules; more than one distinct instance is refused.
     """
     from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 
@@ -316,10 +267,8 @@ def find_rotary_embedding(model) -> Tuple[Optional[object], Optional[str]]:
     return found[0], None
 
 
-# (position, delta) samples for the startup self-test. Spread on purpose, and not only
-# near the origin: a cache that is merely *locally* linear -- one that switches inv_freq
-# past a threshold, or is several caches concatenated -- matches close to 0 and fails
-# far from it. Pairs outside a short cache are skipped, not failed.
+# (position, delta) samples for the startup self-test, near and far from the origin.
+# Pairs outside the cache are skipped.
 _SELFTEST_PAIRS = (
     (0, 1),
     (1, -1),
@@ -333,24 +282,11 @@ _SELFTEST_PAIRS = (
 
 
 def rope_delta_composable_reason(rotary, tol: float = 1e-5) -> Optional[str]:
-    """Measure ``R(p + d) . k == R(d) . (R(p) . k)`` on the model's own RoPE.
+    """Check ``R(p + d) . k == R(d) . (R(p) . k)`` on the model's own RoPE.
 
-    This is a measurement standing in for a list of class names. The identity is the
-    one thing the whole reuse rests on; it holds for reasons a class name only
-    approximates (a per-dimension angle linear in the position, and a unit rotation once
-    mscale is divided out), and a name says nothing about a subclass added later. So:
-    RoPE a random key at ``p`` through the model's own ``forward_native``, apply our
-    delta rotation to the result, and compare against the same key RoPE'd directly at
-    ``p + d``.
-
-    The budget is ``tol`` plus a position term, not a flat number. ``cos_sin_cache``
-    holds ``position * inv_freq`` in fp32, so its row at position P already carries
-    ~``P * 2**-24`` rad of rounding; the identity reads three such rows and cannot hold
-    tighter than that. Measured: a plain RoPE with a *float64* cache matches to 8e-8 at
-    every sample, and the same law with the shipped fp32 cache drifts to 6e-4 by
-    position 30000 -- noise, not a broken law, and the position term is what tells the
-    two apart. What is left over is wide: the smallest real breakage is a YaRN mscale
-    left in the row, a 13.9% error at scaling factor 4.
+    RoPEs a random key at ``p`` and at ``p + d`` with ``forward_native`` and compares
+    the delta rotation of the first against the second. The per-sample budget is
+    ``tol + 4 * max(|p|, |p + d|) * 2**-24``, the fp32 rounding of the cache rows.
 
     Returns None when every sample fits its budget, else a string naming the worst.
     """

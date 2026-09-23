@@ -1,24 +1,12 @@
-"""
-GPU test for the attention a sub-context sparse prefill runs.
+"""GPU test for the attention a sub-context sparse prefill runs.
 
-The claim under test: when reused blocks sit wherever the prompt puts them, a prefill
-can still be exact. Everything about that rests on the causal rule. The kernel's own
-compares *indices* -- query i may see key i and everything before it -- and a sparse
-prefill breaks that correspondence, because its queries are the gaps between reused
-blocks and are not at the indices their positions imply. So the kernel is given each
-query's position instead, and if that rule is wrong attention still returns a number.
+The kernel masks by each query's position (``q_positions``) instead of by index.
+Checked:
 
-The same rule can be handed over as a materialised ``custom_mask`` or as ``q_positions``
-for the kernel to compare against itself. Production uses the second; the two are held
-against each other below.
-
-Two properties, because the rule can fail in two directions:
-
-- too strict, and a query misses keys it should have attended to. Caught by comparing
-  against a reference that attends by position.
-- too permissive, and a query attends to a key *ahead* of it -- reading KV that, in a
-  real prefill, has not been computed. Caught by filling the positions behind a query
-  with garbage and requiring its output not to move.
+- against a reference that attends by position (a query misses nothing it should see),
+- with garbage ahead of every query, the output does not change (a query sees nothing
+  ahead of its position),
+- ``q_positions`` agrees with the same rule as a materialised ``custom_mask``.
 
 Usage:
     python test_sparse_extend.py
@@ -40,11 +28,7 @@ from sglang.srt.layers.attention.triton_ops.extend_attention import (
 
 
 def position_causal_mask(positions: torch.Tensor, kv_len: int) -> torch.Tensor:
-    """``mask[q, j] = positions[q] >= j``, flattened the way the kernel reads it.
-
-    This is the production rule, kept here in one line so the tests below exercise the
-    shape and the kernel's addressing of it rather than a second implementation.
-    """
+    """``mask[q, j] = positions[q] >= j``, flattened the way the kernel reads it."""
     keys = torch.arange(kv_len, device=positions.device, dtype=positions.dtype)
     return (positions[:, None] >= keys[None, :]).to(torch.uint8).view(-1)
 
@@ -143,11 +127,8 @@ class TestSparsePositionCausalAttention(unittest.TestCase):
         torch.testing.assert_close(o.float(), want, rtol=2e-2, atol=2e-2)
 
     def test_positions_and_a_materialised_mask_agree(self):
-        """Both ways of stating the same rule, over a layout with three gaps.
-
-        Not bit-identical: the two reach ``tl.where`` with a uint8 and a bool condition
-        and round differently, a couple of elements by an ulp of bfloat16. A rule that
-        actually differed would move many elements, not two.
+        """``q_positions`` and ``custom_mask`` agree over a layout with three gaps
+        (to within an ulp of bfloat16 on a few elements).
         """
         kv_len = 300
         positions = list(range(0, 40)) + list(range(90, 150)) + list(range(260, 300))
@@ -158,14 +139,7 @@ class TestSparsePositionCausalAttention(unittest.TestCase):
         torch.testing.assert_close(by_pos, by_mask, rtol=1e-2, atol=1e-3)
 
     def test_a_query_cannot_see_past_its_own_position(self):
-        """The direction a reference comparison alone would not catch.
-
-        In a real sparse prefill the positions ahead of a query hold KV that has not
-        been computed yet, or a reused block that is causally in its future. If the mask
-        let either through, attention would still return a plausible number. So: run
-        twice, changing only what sits ahead of every query, and require bit-identical
-        output.
-        """
+        """Changing only what sits ahead of every query leaves the output bit-identical."""
         kv_len = 256
         positions = list(range(0, 20)) + list(range(60, 100))
         horizon = max(positions)

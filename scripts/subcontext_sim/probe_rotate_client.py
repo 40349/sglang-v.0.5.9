@@ -14,20 +14,17 @@ the same tokens every time and can only ever differ in *where* it sits.
                       len(SYS_A) while its offset is len(SYS_B) -- STAGE 1: rotated
                       straight into the stitch.
 
-Read the numbers from the forward-trace JSONL, not the server log: the sub-context
-`print()` traces are block-buffered in the scheduler process and the tail of them is
-lost when the server is killed. The JSONL is line-buffered and always complete.
+Reads the numbers from the forward-trace JSONL, which is line-buffered, rather than
+from the server log.
 
 Usage:
-    python probe_rotate_client.py <forward-trace.jsonl> [--url URL] [--model NAME]
+    python probe_rotate_client.py <forward-trace.jsonl> [--url URL] [--model NAME] [--control]
 """
 
+import argparse
 import json
-import sys
 
 import requests
-
-import argparse
 
 DEFAULT_URL = "http://127.0.0.1:30000"
 DEFAULT_MODEL = "QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ"

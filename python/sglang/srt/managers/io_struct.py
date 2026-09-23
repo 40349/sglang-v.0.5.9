@@ -254,16 +254,12 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
-    # Ordered, logically-distinct blocks of one request (e.g. system_prompt / tools /
-    # messages), each a dict {"content": str, "extra_key": str}. Every block is
-    # tokenized and matched/inserted in its own radix namespace, then stitched into a
-    # single sequence for one decode.
+    # Sub-context blocks of the prompt, in order: [{"content": str, "extra_key": str}].
+    # Each is tokenized separately and cached in its own radix namespace.
     sub_contexts: Optional[List[Dict[str, str]]] = None
 
-    # Pre-split token ids for the same blocks, parallel to ``sub_context_extra_keys``.
-    # Used by the OpenAI chat path, which renders the template itself and so splits the
-    # rendered *ids*: ``concat(sub_context_ids) == input_ids`` holds exactly, and the
-    # split is dropped with a warning if it does not.
+    # Pre-split token ids (OpenAI chat path), parallel to ``sub_context_extra_keys``.
+    # Dropped with a warning unless ``concat(sub_context_ids) == input_ids``.
     sub_context_ids: Optional[List[List[int]]] = None
     sub_context_extra_keys: Optional[List[str]] = None
 
@@ -326,23 +322,14 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             self._normalize_batch_inputs()
 
     def _normalize_sub_contexts(self):
-        """Derive a single ``text`` prompt from ``sub_contexts``.
+        """Set ``text`` to the concatenated ``sub_contexts``.
 
-        The blocks are concatenated so batch-size detection and the rest of the
-        pipeline see one prompt; per-block tokenization happens in
-        ``TokenizerManager._tokenize_one_request``.
-
-        A request carrying ``text`` or ``input_ids`` too describes its prompt twice,
-        and ``_tokenize_one_request`` uses whichever it reaches first (``input_ids``,
-        blocks, ``text``). ``input_ids`` wins there and cannot be compared against
-        block text, so the split is dropped; ``text`` is compared and a mismatch is a
-        client error rather than a coin flip between two prompts.
+        With ``input_ids`` also given, ``sub_contexts`` is dropped. With ``text`` also
+        given, it must equal the concatenation.
         """
         if not self.sub_contexts:
             return
         if self.input_ids is not None:
-            # Pre-tokenized input wins in `_tokenize_one_request`, so the blocks
-            # would describe a prompt that is never used.
             logger.warning(
                 "Sub-context: ignoring `sub_contexts` because `input_ids` was also "
                 "provided; use `sub_context_ids` to split a pre-tokenized prompt."
@@ -807,9 +794,8 @@ class TokenizedGenerateReqInput(BaseReq):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
 
-    # Sub-context: per-block token ids and their radix namespaces (extra_keys),
-    # parallel lists in prompt order. ``concat(sub_context_ids) == input_ids``.
-    # None when the request was not split into sub-contexts.
+    # Sub-context: per-block token ids and namespaces, in prompt order.
+    # ``concat(sub_context_ids) == input_ids``. None when not split.
     sub_context_ids: Optional[List[List[int]]] = None
     sub_context_extra_keys: Optional[List[str]] = None
 

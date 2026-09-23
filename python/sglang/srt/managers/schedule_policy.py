@@ -193,9 +193,8 @@ class SchedulePolicy:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             # NOTE: the prefix_indices must always be aligned with last_node
-            # Sub-context requests are matched per-namespace in
-            # Req.init_next_round_input (which always runs, unlike this LPM-only
-            # path), so this match is for sorting only and is overwritten there.
+            # Sub-context requests are re-matched per namespace in
+            # Req.init_next_round_input; this match only orders the queue.
             match_result = self.tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
@@ -769,10 +768,8 @@ class PrefillAdder:
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
 
-            # Tokens this pass would have to compute to land on the block edge that
-            # makes the next block rotatable. Given up on when the gap does not fit the
-            # prefill budget: splitting there would cost an extra pass without reaching
-            # the boundary, and the ordinary chunking rules do better.
+            # Stage 2: tokens to compute up to the next rotatable block edge, if that
+            # fits the remaining prefill budget.
             boundary_trunc = None
             if req.sub_context_next_boundary is not None:
                 gap = req.sub_context_next_boundary - prefix_len
@@ -805,10 +802,8 @@ class PrefillAdder:
                     or boundary_trunc <= self.rem_chunk_tokens
                 )
             ):
-                # Sub-context Stage 2: end this pass on a block edge so the block behind
-                # it can be rotated into the prefix instead of recomputed. Skipped when
-                # a truncation alignment is in force -- that constraint is about
-                # attention-kernel determinism and outranks a cache heuristic.
+                # Stage 2: end this chunk on the block edge (not under a truncation
+                # alignment).
                 req.set_extend_input_len(boundary_trunc)
                 req.fill_ids = req.fill_ids[: prefix_len + boundary_trunc]
 
@@ -831,11 +826,8 @@ class PrefillAdder:
                     ),
                 )
             elif req.sub_context_layout is not None:
-                # A sparse reuse cannot be chunked: chunking declares everything before
-                # a position to be the prefix, and this request's reuse has holes in it.
-                # Wait for a pass with room for the whole thing -- the scan already
-                # refused any request too big to ever fit, so this is a delay, not a
-                # deadlock.
+                # A sparse layout cannot be chunked: wait for a pass with room. The scan
+                # already sent requests that can never fit to the stitch.
                 return AddReqResult.OTHER
             else:
                 # Make sure at least one page is available

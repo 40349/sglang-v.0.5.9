@@ -4,26 +4,26 @@
 Goal: reproduce the cross-context approximation error (the WCA baseline). Two requests
 share the SAME `tools` and `messages` sub-contexts but have DIFFERENT `system_prompt`.
 
-Because each block is cached in its own radix namespace, the second request's
-`tools`/`messages` KV is silently replaced (in `RadixCache._cache_unfinished_sub_contexts`)
-with the FIRST request's cached slots -- which were computed under a different preceding
-system_prompt. So the second request decodes against out-of-context KV.
+The second request stitches nothing past its (different) system block, but when its
+blocks sit at the same positions, `RadixCache._cache_unfinished_sub_contexts` re-points
+its tools/messages to the FIRST request's cached slots after prefill -- computed under
+the other system_prompt -- so it decodes against out-of-context KV.
 
 How to use (two server sessions, to get a clean comparison):
 
   # (1) CORRECT baseline: run only the varied request on a fresh server.
-  python scripts/subcontext_sim/crosscontext_test.py --order B
+  python scripts/subcontext_sim/crosscontext_test.py --json <capture>.json --order B
 
   # (2) CONTAMINATED: restart the server, then prime with A and run B.
-  python scripts/subcontext_sim/crosscontext_test.py --order A,B
+  python scripts/subcontext_sim/crosscontext_test.py --json <capture>.json --order A,B
 
 Compare B's output between (1) and (2). If they differ, the tools/messages KV cached
 under system_prompt_A leaked into B -> cross-context contamination reproduced.
 
 Notes:
-  * Keep A's and B's system_prompt the SAME TOKEN LENGTH to isolate context
-    contamination from RoPE position-shift. Use --pad-system to pad the shorter one.
-    (A rough char-based pad; exact token-length matching is a later refinement.)
+  * The replacement needs A's and B's system_prompt at the SAME TOKEN LENGTH (at another
+    position the namespace is left alone). --pad-system pads by characters, which only
+    approximates it.
 """
 import argparse
 import json
@@ -106,7 +106,7 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--json",
-        default="2026-05-04T14-52-26-258Z_127_0001_chat_google_gemma-4-31b-it.json",
+        required=True,
         help="Base openclaw normalized-request JSON capture.",
     )
     parser.add_argument("--url", default="http://127.0.0.1:30000")

@@ -603,10 +603,8 @@ async def server_info():
     if hasattr(_global_state.tokenizer_manager.server_args, "model_config"):
         del _global_state.tokenizer_manager.server_args.model_config
 
-    # The sub-context arm is selected by env vars, not server_args, so it would not
-    # show up here otherwise -- and a client on another machine cannot read the server
-    # log to find out which arm it is talking to. Reporting it is what lets a remote
-    # `run_mas.sh record` refuse an arm that is not the one it was asked for.
+    # The sub-context switches (env vars, so not in server_args), for remote clients
+    # to check which arm they reach.
     from sglang.srt.mem_cache import radix_cache
     from sglang.srt.utils import subctx_config
 
@@ -624,19 +622,12 @@ async def server_info():
             "index": subctx_config.INDEX_SUBCONTEXTS,
             "index_dryrun": subctx_config.INDEX_DRYRUN,
             "min_chunk": subctx_config.MIN_CHUNK_TOKENS,
-            # Which boundaries the blocks were cut on.
             "split_mode": subctx_config.SPLIT_MODE,
             "cdc_target": subctx_config.CDC_TARGET_TOKENS,
             "cdc_max": subctx_config.CDC_MAX_TOKENS,
-            # How much of what the prompt reuses is recomputed anyway, and where the
-            # deviation that decides it is measured. A dial, so the arm name does not
-            # carry it and a run has to read it from here.
             "topk_ratio": subctx_config.TOPK_RATIO,
             "topk_layer": subctx_config.TOPK_LAYER,
-            # Lets a client tell a stale server apart from the one it just started.
-            # A job whose port bind failed leaves the PREVIOUS job serving; the arm
-            # flags match, so only something that changed between the two builds can
-            # distinguish them.
+            # With `pid`, tells a stale server from the one just started.
             "audit": radix_cache.AUDIT_ON,
             "pid": os.getpid(),
         },
@@ -684,9 +675,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     if TRACE_ON:
         _keys = [sc["extra_key"] for sc in obj.sub_contexts] if obj.sub_contexts else None
-        trace(f"[TRACE-1 HTTP] 收到請求 rid={obj.rid}")
+        trace(f"[TRACE-1 HTTP] received rid={obj.rid}")
         trace(f"[TRACE-1 HTTP] sub_context extra_keys={_keys}")
-
 
     if obj.stream:
 

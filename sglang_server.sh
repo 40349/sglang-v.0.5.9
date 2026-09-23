@@ -16,12 +16,11 @@
 #   ARM=idx   + find blocks by content anywhere in the prompt, prefill the gaps
 #   ARM=cdc   + cut the blocks on content too, not on the roles the prompt was built from
 #
-# The arm is read once at start: one job per arm. The compute node's address is in
-# the job log.
+# One job per arm. The compute node's address is printed in the job log.
 #
-# Diagnostics, off by default, each one makes the timings unusable for the A/B:
-# SUBCTX_TRACE=1 (per-match tracing), SUBCTX_AUDIT=1 (leak / ownership check on the
-# finish path), DUMP_TREE=1, ROTATE_GPU=1 (CUDA events around the rotation).
+# Diagnostics, off by default; each makes the timings unusable for the A/B:
+# SUBCTX_TRACE=1 (per-match tracing), SUBCTX_AUDIT=1 (slot-ownership audits),
+# DUMP_TREE=1, ROTATE_GPU=1 (CUDA events around the rotation).
 
 set -euo pipefail
 
@@ -32,7 +31,7 @@ MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-30B-A3B}
 CTXLEN=${CTXLEN:-16384}
 ARM=${ARM:-on}
 
-# Pinned for every arm: triton is the only backend that takes a per-position mask.
+# Same backend for every arm; idx/cdc need triton (per-position mask).
 BACKEND=${BACKEND:-triton}
 
 # run_swe.sh spells these AUDIT and TRACE; accept both.
@@ -40,8 +39,7 @@ SUBCTX_AUDIT=${SUBCTX_AUDIT:-${AUDIT:-}}
 SUBCTX_TRACE=${SUBCTX_TRACE:-${TRACE:-}}
 SPLIT=blocks
 
-# Fraction of the reused tokens that get recomputed anyway. A dial, not part of the
-# arm name: 0 is the arm as it stands, and the interesting runs sweep it.
+# Fraction of the reused tokens to recompute (idx/cdc only), and the scored layer.
 TOPK_RATIO=${TOPK_RATIO:-0}
 TOPK_LAYER=${TOPK_LAYER:-1}
 CHUNKED_PREFILL=${CHUNKED_PREFILL:-}
@@ -77,13 +75,9 @@ case "$ARM" in
   *)   echo "REFUSING: unknown ARM='$ARM' (want on|off|rot|idx|cdc)"; exit 1 ;;
 esac
 
-# Scoring a reused token needs a key computed for it, so the first layers run the whole
-# prompt -- and a prompt longer than the chunked-prefill budget takes the stitch path
-# instead, which is exactly the long, heavily-reused prompt this is for. It would still
-# serve, and the arm would quietly be measuring something else, so refuse instead of
-# picking a budget: changing it changes every arm's chunking and the caller has to
-# decide that for the whole comparison, not for one run.
-if [ "$TOPK_RATIO" != "0" ] && [ -z "$CHUNKED_PREFILL" ]; then
+# A ratio > 0 needs CHUNKED_PREFILL >= the longest prompt: a longer prompt falls back
+# to the stitch path.
+if awk -v r="$TOPK_RATIO" 'BEGIN { exit !(r > 0) }' && [ -z "$CHUNKED_PREFILL" ]; then
   echo "REFUSING: TOPK_RATIO=$TOPK_RATIO needs CHUNKED_PREFILL set to at least the"
   echo "  longest prompt you will send (the probe pass runs full length, so anything"
   echo "  above the budget silently falls back to the stitch and reuses less)."

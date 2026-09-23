@@ -377,11 +377,8 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = None
             attn_lse = None
         elif forward_batch.subctx_sparse:
-            # The KV for this request is its whole prompt, in position order, because
-            # `req_to_token` is indexed by position -- so entry j of the gather list is
-            # position j, and the causal test is just "this query's position >= j".
-            # The kernel is given the positions and applies that itself; its own causal
-            # rule compares *indices*, which a sparse prefill's queries are not at.
+            # Gather each request's whole [0, seq_len) from req_to_token, so KV entry j
+            # is position j; the kernel masks by query position (q_positions).
             kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(
@@ -474,17 +471,8 @@ class TritonAttnBackend(AttentionBackend):
 
     @staticmethod
     def _extend_cache_loc(forward_batch: ForwardBatch) -> torch.Tensor:
-        """Where this layer's KV goes, which is not always ``out_cache_loc``.
-
-        While the reused tokens are being scored, the pass carries a row for every
-        position in the prompt, but only the tokens it actually computes have a slot of
-        their own. The reused rows are sent to the padded slot 0 instead: their real
-        rows belong to the radix tree and are shared with every other request holding
-        that block, and this layer's key for them is wanted as a comparison, not as a
-        cache entry.
-
-        Once the selection is made the row count changes to match ``out_cache_loc``
-        again, and this returns it unchanged.
+        """Where this layer's KV goes: the probe's slots (reused rows to dummy slot 0)
+        before the selection is made, ``out_cache_loc`` otherwise.
         """
         plan = forward_batch.subctx_blend_plan
         if plan is not None and plan.sel_rows is None:
@@ -494,15 +482,10 @@ class TritonAttnBackend(AttentionBackend):
     def _forward_extend_sparse(
         self, q, o, layer, forward_batch: ForwardBatch, logits_soft_cap
     ):
-        """Attend over the whole prompt, with the mask deciding what each query sees.
+        """Sparse prefill: attend over ``[0, seq_len)``, masked by query position.
 
-        Everything is read through one gather list covering ``[0, seq_len)``, which is
-        already materialised: the reused blocks were written into ``req_to_token`` at
-        their positions before the pass, and this layer's new KV went into its slots
-        just above. Entry j of that list is position j, so each query's position is the
-        whole causal rule, and the kernel compares against it in registers.
-        ``prefix_lens`` is zero because the kernel only consults it for the index-based
-        rule those positions replace.
+        KV entry j is position j; a query at position p sees keys ``j <= p``.
+        ``prefix_lens`` is zero, as only the index-based causal rule reads it.
         """
         bs = forward_batch.batch_size
         self.extend_attention_fwd_unified(
@@ -906,11 +889,7 @@ class TritonAttnBackend(AttentionBackend):
 
         plan = forward_batch.subctx_blend_plan
         if plan is not None and layer.layer_id == plan.check_layer:
-            # The pool still holds the *cached* key at the reused slots -- the write
-            # above deliberately skipped those rows -- so this is the one moment where
-            # both keys for a reused position exist. Scoring happens here; the slots
-            # and the token set are not touched until this layer's own attention has
-            # run below, because it is still reading the cache rows being scored.
+            # Score now: the reused slots still hold the cached key.
             plan.select(
                 k, forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             )
@@ -933,8 +912,7 @@ class TritonAttnBackend(AttentionBackend):
                 q, o, layer, forward_batch, logits_soft_cap
             )
             if plan is not None and layer.layer_id == plan.check_layer:
-                # Only now: the attention above read the cache rows this is about to
-                # stop pointing at.
+                # After this layer's attention, which read the rows being replaced.
                 plan.commit(k, v, forward_batch, layer)
             return out
 

@@ -5,8 +5,7 @@
 #   ./probe_rotate.sh            rotation on  (both stages)
 #   ROTATE=0 ./probe_rotate.sh   control: same requests, same binary, rotation off
 #
-# Run both. Diagnostic only: SGLANG_SUBCTX_TRACE sits inside the regions host_timer
-# measures.
+# Run both. Diagnostic only (SGLANG_SUBCTX_TRACE is on).
 set -euo pipefail
 
 REPO=/home/t2503-3090/Desktop/MiaoChen/sglang-v.0.5.9
@@ -27,7 +26,7 @@ source /home/t2503-3090/miniconda3/etc/profile.d/conda.sh
 conda activate $ENV
 export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
 
-# The scheduler renames itself and holds the pool. See run_mas.sh.
+# `sglang::` is the renamed scheduler process.
 stop() { pkill -TERM -f '[s]glang::|[s]glang\.launch_server' 2>/dev/null || true; sleep 10; }
 trap stop EXIT
 
@@ -56,6 +55,7 @@ for _ in $(seq 1 300); do
   fi
   echo -n .; sleep 2
 done
+grep -q "fired up and ready" "$LOG" || { echo " TIMEOUT"; tail -30 "$LOG"; exit 1; }
 
 # Ask the server whether the rotation is actually on.
 if [ "$ROTATE" = "0" ]; then

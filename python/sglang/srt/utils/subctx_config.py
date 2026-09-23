@@ -1,8 +1,7 @@
-"""Switches and support rules for the sub-context path.
+"""Switches and support checks for the sub-context path.
 
-Env-var driven (flipped between runs, not per request), and only supported on the
-plain device-side radix tree with ``page_size == 1``. Read by ``server_args``, the chat
-serving path and the radix cache.
+Read once from env vars at import. Only the plain device-side radix tree with
+``page_size == 1`` is supported.
 """
 
 from __future__ import annotations
@@ -10,74 +9,52 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-# A/B switch: when set, chat requests carry no split and take the stock
-# single-namespace radix path. The baseline arm, same binary and weights.
+# Baseline arm: chat requests carry no split and take the stock radix path.
 DISABLE_SUBCONTEXT = os.environ.get("SGLANG_DISABLE_SUBCONTEXT", "") not in ("", "0")
 
-# Whether generated tokens are written back into the last block's namespace, so the
-# next agent turn hits them. Off frees the tail at finish.
+# Insert the generated tokens into the last block's namespace at finish. Off frees them.
 CACHE_SUBCONTEXT_OUTPUT = os.environ.get(
     "SGLANG_SUBCONTEXT_CACHE_OUTPUT", "1"
 ) not in ("", "0")
 
-# Stage 1: re-rotate a block's cached K by `offset - canonical`, so a hit computed at
-# another position is reused instead of dropped. Changes which KV the model sees.
+# Stage 1: rotate a displaced hit's cached K by `offset - canonical` and reuse it.
 ROTATE_SUBCONTEXT = os.environ.get("SGLANG_SUBCONTEXT_ROTATE", "") not in ("", "0")
 
-# Stage 2: force a chunk boundary at a block edge so a block *after* a partially
-# recomputed one can still be rotated in. Implies ROTATE_SUBCONTEXT.
+# Stage 2: end a prefill chunk at a block edge so the next block can be rotated in.
 ROTATE_ACROSS_RECOMPUTE = os.environ.get(
     "SGLANG_SUBCONTEXT_ROTATE_ACROSS", ""
 ) not in ("", "0")
 
-# Debug: take the pure-torch rotation path instead of the Triton kernel.
+# Debug: pure-torch rotation instead of the Triton kernel.
 ROTATE_NATIVE = os.environ.get("SGLANG_SUBCONTEXT_ROTATE_NATIVE", "") not in ("", "0")
 
-# Address each block by a hash of its own tokens instead of the role it played
-# ("system_prompt_key" and friends). A namespace then holds one content rather than one
-# role, and `extra_key` -- cache_salt with lora_id concatenated -- reaches the block
-# keys, which the role names dropped.
-#
-# Separate from INDEX: it changes which hits the stitch path can use without changing
-# how a prompt is prefilled.
+# Name each block's namespace by a hash of its tokens and the request's `extra_key`
+# instead of by role ("system_prompt_key", ...). Prefill still takes the stitch path.
 HASH_SUBCONTEXT_KEYS = os.environ.get("SGLANG_SUBCTX_HASH_KEYS", "") not in ("", "0")
 
-# Find blocks by scanning the query against an index of every registered chunk, rather
-# than looking up fixed roles at fixed offsets, and prefill the result in one pass with
-# the reused blocks wherever they land. Implies HASH_SUBCONTEXT_KEYS.
+# Find cached blocks anywhere in the prompt by scanning it against the chunk index, and
+# prefill only the gaps between them in one pass. Implies HASH_SUBCONTEXT_KEYS.
 INDEX_SUBCONTEXTS = os.environ.get("SGLANG_SUBCTX_INDEX", "") not in ("", "0")
 
-# Scan and report, then take the stock path anyway. Reports the tokens the index finds
-# that the contiguity rule cannot reach.
+# Scan and report what the index would find, but serve through the stitch path.
 INDEX_DRYRUN = os.environ.get("SGLANG_SUBCTX_INDEX_DRYRUN", "") not in ("", "0")
 
-# Shortest run of tokens the index will take.
+# Shortest chunk the index registers or reuses.
 MIN_CHUNK_TOKENS = int(os.environ.get("SGLANG_SUBCTX_MIN_CHUNK", "64"))
 
-# Where block boundaries come from. "blocks" uses the roles the prompt was built from
-# (system / tools / messages). "cdc" cuts where the token window at a position hashes to
-# zero mod CDC_TARGET_TOKENS, which puts the same boundaries in a run of tokens wherever
-# that run appears.
+# Block boundaries: "blocks" cuts at the roles (system / tools / messages); "cdc" cuts
+# where the fingerprint of the next tokens is 0 mod CDC_TARGET_TOKENS, i.e. by content.
 SPLIT_MODE = os.environ.get("SGLANG_SUBCTX_SPLIT", "blocks")
 
-# Average chunk length "cdc" aims for, rounded down to a power of two, and the length at
-# which it forces a boundary the content did not produce.
+# "cdc" average chunk length (rounded down to a power of two), and the forced-cut length.
 CDC_TARGET_TOKENS = int(os.environ.get("SGLANG_SUBCTX_CDC_TARGET", "256"))
 CDC_MAX_TOKENS = int(os.environ.get("SGLANG_SUBCTX_CDC_MAX", "1024"))
 
-# Fraction of the tokens a prompt reuses that get recomputed anyway, chosen by how far
-# their key has moved. Rotation fixes a block's position; it does not fix the context it
-# was computed under, and this is what buys that back.
-#
-# A dial, not a switch. 0.0 recomputes nothing and is the arm as it stands; 1.0
-# recomputes every reused token, which is a correctness configuration rather than a
-# useful one.
+# Fraction of the reused tokens to recompute, picked by how far their key moved.
+# 0 recomputes nothing; 1.0 recomputes every reused token.
 TOPK_RATIO = float(os.environ.get("SGLANG_SUBCTX_TOPK_RATIO", "0"))
 
-# The layer whose keys are compared. Layer 0's key is a function of the token and its
-# position alone, so a rotated cache row already equals what a full prefill would
-# produce there and the deviation is identically zero -- the comparison needs at least
-# one layer of attention to have mixed the new context in.
+# Layer whose fresh and cached keys are compared. At layer 0 every score is 0.
 TOPK_LAYER = int(os.environ.get("SGLANG_SUBCTX_TOPK_LAYER", "1"))
 
 
@@ -119,20 +96,16 @@ if TOPK_LAYER < 0:
 if TOPK_LAYER == 0 and 0.0 < TOPK_RATIO < 1.0:
     raise ValueError(
         "SGLANG_SUBCTX_TOPK_LAYER=0 would score every token identically: layer 0's "
-        "key is a function of the token and its position alone, so a rotated cache "
-        "row already equals what a full prefill computes there and every deviation "
-        "is zero. Use layer 1 or later. (Layer 0 is allowed at ratio 1.0, where the "
-        "score decides nothing -- that is the end-to-end correctness configuration.)"
+        "key depends only on the token and its position, so every deviation is zero. "
+        "Use layer 1 or later. (Layer 0 is allowed at ratio 1.0, where the score "
+        "decides nothing.)"
     )
 
 
 def unsupported_reason(tree_cache) -> Optional[str]:
     """Return why ``tree_cache`` cannot serve sub-contexts, or None if it can.
 
-    Read (``Req._stitch_sub_contexts``) and write
-    (``RadixCache._cache_unfinished_sub_contexts``) must agree: matching per
-    namespace while inserting into the default one hits 0% forever. Both gate on
-    ``supports_sub_contexts``; this turns a False into the actual reason.
+    Explains a False from ``supports_sub_contexts``.
     """
     from sglang.srt.mem_cache.radix_cache import RadixCache
 
@@ -165,17 +138,13 @@ def unsupported_reason(tree_cache) -> Optional[str]:
 def sparse_prefill_unsupported_reason(model_runner) -> Optional[str]:
     """Return why a prefill cannot place reused blocks freely, or None if it can.
 
-    Refusing loudly, as everywhere else on this path. Every one of these produces a
-    *quietly* wrong answer rather than an error: the backends below decide what a query
-    may attend to by comparing indices, and a sparse prefill's queries are not at the
-    indices their positions imply, so they would silently attend to the wrong keys --
-    including keys ahead of themselves.
+    Each case below would attend to the wrong keys without raising.
     """
-    backend = model_runner.server_args.attention_backend
-    if backend not in (None, "triton"):
+    backend = model_runner.server_args.get_attention_backends()[0]
+    if backend != "triton":
         return (
-            f"the {backend} attention backend applies causality by index; only triton "
-            "takes the explicit per-position mask a scattered prefill needs "
+            f"the {backend} prefill attention backend applies causality by index; "
+            "only triton takes the per-position mask a scattered prefill needs "
             "(--attention-backend triton)"
         )
     if model_runner.sliding_window_size is not None and model_runner.sliding_window_size > 0:
@@ -195,15 +164,8 @@ def sparse_prefill_unsupported_reason(model_runner) -> Optional[str]:
 def rotation_unsupported_reason(model_runner, tree_cache) -> Optional[str]:
     """Return why cached K cannot be re-rotated here, or None if it can.
 
-    Rotating by a delta is only valid when the cache row for a position is a rotation
-    through an angle linear in that position. Which RoPEs have that property is
-    *measured* here (``rope_delta_composable_reason`` runs the identity on the model's
-    own module at startup) rather than listed by class name, so a scaled RoPE that does
-    compose -- llama3's remap, dynamic NTK, YaRN once its ``mscale`` is divided out --
-    is admitted on evidence instead of being refused on a guess.
-
-    Two exclusions still come first, because they are invisible to a measurement that
-    can only feed the model scalar positions from one cache.
+    Structural checks first; then ``rope_delta_composable_reason`` tests the identity
+    on the model's own RoPE module.
     """
     from sglang.srt.layers.rotary_embedding import (
         LinearScalingRotaryEmbedding,
@@ -230,9 +192,9 @@ def rotation_unsupported_reason(model_runner, tree_cache) -> Optional[str]:
         )
     if isinstance(rotary, LinearScalingRotaryEmbedding):
         return (
-            "linear scaling concatenates one cos_sin_cache per LoRA scaling factor "
-            "(rotary_embedding.py:471-504), so a row index is a position plus a "
-            "per-request offset and a delta can cross into a different cache"
+            "linear scaling concatenates one cos_sin_cache per scaling factor, so a "
+            "row index is a position plus a per-request offset and a delta can "
+            "cross into a different cache"
         )
 
     if not rotary.is_neox_style:
@@ -254,22 +216,16 @@ def rotation_unsupported_reason(model_runner, tree_cache) -> Optional[str]:
     if pool.head_dim != rotary.head_size:
         return f"pool head_dim {pool.head_dim} != rope head_size {rotary.head_size}"
 
-    # Last, because it runs the model's own RoPE: everything above is a cheap structural
-    # veto, and none of it should be reached through a forward pass.
+    # Last: runs the model's RoPE.
     return rope_delta_composable_reason(rotary)
 
 
 def topk_unsupported_reason(model_runner) -> Optional[str]:
     """Return why reused tokens cannot be selectively recomputed, or None if they can.
 
-    Scoring a token needs a *freshly computed* key for a position the reuse path never
-    recomputes, so the probe runs the whole prompt through the first layers and the
-    token dimension is then cut down to what was selected. Everything refused here
-    either moves that cut (the model must be able to run a layer range, and the layer
-    boundary must hold every token on every rank) or reads a token count the cut has
-    just changed.
-
-    All of it is quiet when wrong. Nothing below raises on its own.
+    The probe runs the whole prompt through layers ``[0, TOPK_LAYER]``, then the token
+    dimension is cut down to the selected rows. Each case below either cannot run a
+    layer range, splits the tokens across ranks, or reads a token count the cut changes.
     """
     from sglang.srt.layers.dp_attention import get_attention_tp_size
 
@@ -295,11 +251,7 @@ def topk_unsupported_reason(model_runner) -> Optional[str]:
             "layer's id is then offset from its index in this rank's stack"
         )
 
-    # The score sums over the head dimension, which is the dimension TP splits, so each
-    # rank scores only its own heads and `topk` picks a *different* token set per rank.
-    # The shapes still agree, so nothing fails -- the later all-reduces just mix tokens
-    # that are not the same tokens. Reconstructing the global score is one SUM
-    # all-reduce over the attention TP group; until that is written and tested, refuse.
+    # Each TP rank scores only its own heads, so ranks would select different tokens.
     if get_attention_tp_size() > 1:
         return (
             "the deviation score sums over the head dimension, which tensor "
@@ -308,9 +260,7 @@ def topk_unsupported_reason(model_runner) -> Optional[str]:
             "(--tp-size 1)"
         )
 
-    # Unlike TP, these do not become supportable with a reduction: they scatter the
-    # tokens themselves across ranks, so a row index chosen from the global score does
-    # not address the same token on every rank.
+    # These scatter the tokens themselves across ranks.
     if args.enable_dp_attention:
         return (
             "data-parallel attention gives each rank its own slice of the tokens, so "

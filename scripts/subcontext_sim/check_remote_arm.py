@@ -1,23 +1,13 @@
-"""Verify a remote sglang server is the sub-context arm the caller asked for.
+"""Verify a sglang server is the sub-context arm the caller asked for.
 
-The single-machine flow greps the server log for "Sub-context split DISABLED". With
-MASLab on one box and the server on another that log is unreadable, so this asks
-``/server_info`` instead -- the same guard by another route.
-
-The guard is not ceremony. An arm that silently ran as a different arm is worse than
-no arm at all, because it still produces a table that looks like a valid comparison.
-Two ways that happens here:
-
-- the server was started with ``sglang serve`` and no PYTHONPATH, so it imported the
-  pip-installed sglang, which has no sub-context code at all; and
-- MASLab reaches the server through its own ``model_api_config.json``, not through the
-  URL this script was given, so a stale entry there sends the traffic elsewhere.
-
-Both are checked. Exits non-zero with the reason on any mismatch.
+Reads the ``sub_context`` block of ``/server_info`` (absent on a server not running
+this fork), and optionally checks that MASLab's ``model_api_config.json`` points at the
+same URL. Exits non-zero with the reason on any mismatch.
 
 Usage:
     check_remote_arm.py URL --split true|false --rotate true|false \
-        [--index true|false] [--maslab-config PATH --model NAME]
+        [--index B] [--split-mode blocks|cdc] [--topk-ratio R] [--audit B] \
+        [--maslab-config PATH --model NAME]
 """
 
 from __future__ import annotations
@@ -47,25 +37,20 @@ def main() -> int:
         "--index",
         type=_bool,
         default=None,
-        help="require the content-addressed index (and the sparse prefill that goes "
-        "with it) to be on or off. Left unchecked by default so callers written "
-        "before it existed keep meaning what they meant.",
+        help="require the content-addressed index on or off (unchecked by default)",
     )
     ap.add_argument(
         "--topk-ratio",
         type=float,
         default=None,
-        help="require the server to be recomputing this fraction of the tokens it "
-        "reuses. The arm name does not carry the ratio, so a run swept over several "
-        "of them has nothing else to tell its own results apart.",
+        help="require this selective-recompute ratio",
     )
     ap.add_argument(
         "--audit",
         type=_bool,
         default=None,
-        help="require the server to report the finish-path audit as on/off. The arm "
-        "flags alone cannot tell a freshly started server from a previous job that "
-        "still owns the port -- they match either way.",
+        help="require the slot-ownership audit on or off (also catches a stale "
+        "server still holding the port)",
     )
     ap.add_argument("--maslab-config")
     ap.add_argument("--model")
@@ -141,8 +126,6 @@ def main() -> int:
 
     print(f"  arm OK: {sub}")
     print(f"  model:  {info.get('model_path')}")
-    # The KV pool size decides whether the A/B measures the split or the eviction
-    # policy, and it is not comparable across boxes -- record what this server got.
     print(f"  KV pool: max_total_num_tokens={info.get('max_total_num_tokens')}")
 
     if args.maslab_config and args.model:

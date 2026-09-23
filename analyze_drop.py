@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Explain the contiguity rule's discards from a SUBCTX_TRACE server log.
+"""Explain the contiguity rule's discards from a SGLANG_SUBCTX_TRACE server log
+(role-named namespaces; see probe_drop.sh).
 
 With a [system][messages] split the contiguity rule collapses to one condition: the
 messages hit is spendable iff the system segment hit in full. So every discarded
@@ -12,8 +13,9 @@ that block ever misses. Two causes with different fixes:
 Eviction predicts discards that start LATE and track KV-pool occupancy; a broken
 insert predicts them spread evenly from the first request.
 """
-import re, sys
-from collections import OrderedDict, defaultdict
+import re
+import sys
+from collections import OrderedDict
 
 MATCH = re.compile(
     r"sub-context match rid=(\S+)\s+extra_key='([^']+)'\s+hit=(\d+)/(\d+)")
