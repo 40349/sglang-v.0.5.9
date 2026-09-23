@@ -125,12 +125,16 @@ for p in "$SERVER_LOG" "$CAPTURE" "$FWD_TRACE" "$STAGE"; do
   [ -z "$p" ] || mkdir -p "$(dirname "$p")"
 done
 
-# Refuse if something already serves this port.
-if curl -sf --max-time 5 "http://127.0.0.1:${PORT}/health" > /dev/null 2>&1; then
-  echo "REFUSING: something is already serving 127.0.0.1:${PORT} on $(hostname)."
-  echo "  A previous sglang job is still up. Its server would take this run's traffic"
-  echo "  and this job would hold a GPU for nothing. Check with: squeue -u \$USER"
-  echo "  then scancel the old job before resubmitting."
+# Refuse if anything holds this port, a draining server's 503 included. curl exit 7:
+# nothing listening.
+rc=0
+curl -s -o /dev/null --max-time 5 "http://127.0.0.1:${PORT}/health" || rc=$?
+if [ "$rc" != 7 ]; then
+  echo "REFUSING: something already holds 127.0.0.1:${PORT} on $(hostname)."
+  echo "  Another sglang is still up here: another job's, or one draining after a"
+  echo "  SIGTERM (it answers 503 and never finishes). Its server would take this run's"
+  echo "  traffic. Check with: squeue -u \$USER, then scancel the old job, or pick"
+  echo "  another PORT= to run beside it."
   exit 1
 fi
 

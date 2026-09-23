@@ -83,13 +83,28 @@ verify_arm() {
     --audit "$([ -n "${AUDIT:-}" ] && echo true || echo false)"
 }
 
-# `sglang::scheduler` holds the weights and the KV pool, and setproctitle renames it out
-# of reach of a "sglang.launch_server" match. `[s]` stops the pattern matching this shell.
-SGLANG_PROCS='[s]glang::|[s]glang\.launch_server|[s]glang\.bench|[s]glang\.srt'
+# The pid of the sglang_server.sh this script started; `record` leaves it running for a
+# later run to stop.
+PIDFILE=$OUT/server.pid
 
+# The process tree under $1, the root last.
+tree() { local c; for c in $(pgrep -P "$1"); do tree "$c"; done; echo "$1"; }
+
+# Stops the server in PIDFILE and nothing else: another job's server on this node stays up.
 stop() {
-  pkill -TERM -f "$SGLANG_PROCS" 2>/dev/null || true   # TERM so timers flush
-  sleep 10
+  local pid pids
+  pid=$(cat "$PIDFILE" 2>/dev/null) || return 0
+  rm -f "$PIDFILE"
+  grep -qs sglang_server.sh "/proc/$pid/cmdline" || return 0   # gone, or the pid reused
+  pids=$(tree "$pid")
+  kill -TERM $pids 2>/dev/null || true   # TERM so timers flush
+  for _ in $(seq 1 30); do
+    kill -0 $pids 2>/dev/null || return 0
+    sleep 1
+  done
+  # The scheduler dies on TERM, so a server with requests in flight never drains.
+  kill -KILL $pids 2>/dev/null || true
+  sleep 2
 }
 
 # Starts ARM $1 through sglang_server.sh and waits for it. Callers set LOG, and
@@ -102,6 +117,7 @@ launch() {
   ARM=$1 SERVER_LOG=$LOG CAPTURE=${CAPTURE:-} FWD_TRACE=${FWD_TRACE:-} STAGE=${STAGE:-} \
     nohup bash "$SERVER" > "$LOG.start" 2>&1 &
   local pid=$!
+  echo $pid > "$PIDFILE"
   echo -n "  waiting"
   for _ in $(seq 1 300); do
     if [ -f "$LOG" ] && grep -q "fired up and ready" "$LOG"; then echo " ready"; return 0; fi
