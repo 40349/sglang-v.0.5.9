@@ -637,6 +637,7 @@ STAGE_NOTES = {
 # excluded from the total, or the same microseconds would be charged twice.
 BREAKDOWN = {
     "subctx_stitch": "match",
+    "subctx_scan": "match",
     "subctx_lookup": "subctx_stitch",
     "subctx_rotate": "subctx_stitch",
     "subctx_rev_rotate": "cache_finished",
@@ -734,7 +735,11 @@ def cmd_stages(args: argparse.Namespace) -> int:
 
     print("-" * 76)
     print(f"{'TOTAL host overhead added':<18} {'':>45} {total_added:>+9.1f}ms")
-    n_req = max((s["count"] for s in list(a.values()) + list(b.values())), default=0)
+    # Requests: cache_finished runs once per finished request.
+    n_req = max(
+        (arm["cache_finished"]["count"] for arm in (a, b) if "cache_finished" in arm),
+        default=0,
+    )
     if n_req:
         print(f"{'  per request':<18} {'':>45} {1000.0 * total_added / n_req:>+9.1f}us")
 
