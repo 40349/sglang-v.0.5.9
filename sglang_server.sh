@@ -28,7 +28,7 @@
 #
 # Knobs:
 #
-#   MODEL=Qwen/Qwen3-Coder-30B-A3B-Instruct CTXLEN=73728 PORT=30000 MEMFRAC=0.90 BACKEND=triton
+#   MODEL=Qwen/Qwen3-Coder-30B-A3B-Instruct CTXLEN=81920 PORT=30000 MEMFRAC=0.90 BACKEND=triton
 #   CHUNKED_PREFILL        unset keeps the server default; the same for every arm compared
 #   TOOL_PARSER=qwen3_coder REASONING_PARSER= QUANT=  empty drops the flag
 #   Qwen3-30B-A3B:  MODEL=Qwen/Qwen3-30B-A3B CTXLEN=40960 TOOL_PARSER=qwen REASONING_PARSER=qwen3
@@ -48,7 +48,7 @@ WORK_DIR=${WORK_DIR:-$(dirname "$REPO")}
 
 ARM=${ARM:-on}
 MODEL=${MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}
-CTXLEN=${CTXLEN:-73728}
+CTXLEN=${CTXLEN:-81920}
 PORT=${PORT:-30000}
 MEMFRAC=${MEMFRAC:-0.90}
 # Same backend for every arm; idx/cdc need triton (per-position mask).

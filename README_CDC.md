@@ -20,7 +20,7 @@ python -u -m sglang.launch_server \
   --model-path Qwen/Qwen3-Coder-30B-A3B-Instruct \
   --host 0.0.0.0 --port 30000 \
   --attention-backend triton \
-  --context-length 73728 \
+  --context-length 81920 \
   --enable-cache-report \
   --tool-call-parser qwen3_coder
 ```
