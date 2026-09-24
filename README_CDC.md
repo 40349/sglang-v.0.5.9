@@ -17,13 +17,12 @@ SGLANG_SUBCTX_SPLIT=cdc \
 SGLANG_SUBCTX_INDEX=1 \
 SGLANG_SUBCONTEXT_ROTATE=1 \
 python -u -m sglang.launch_server \
-  --model-path Qwen/Qwen3-30B-A3B \
+  --model-path Qwen/Qwen3-Coder-30B-A3B-Instruct \
   --host 0.0.0.0 --port 30000 \
   --attention-backend triton \
-  --context-length 32768 \
+  --context-length 73728 \
   --enable-cache-report \
-  --tool-call-parser qwen \
-  --reasoning-parser qwen3
+  --tool-call-parser qwen3_coder
 ```
 
 `sglang_server.sh` 是包好的版本：在 checkout 裡執行 `ARM=cdc bash sglang_server.sh`（Slurm 上用 `sbatch`）。要重算一部分重用的 token 就把比例寫進 arm，例如 `ARM=cdc@0.15`。其他參數寫在檔案開頭的註解。

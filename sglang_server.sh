@@ -11,8 +11,8 @@
 # sglang server for the sub-context experiments, one arm per start. This is the only
 # place an arm becomes server settings; run_swe.sh starts it once per arm as well.
 #
-#   ARM=cdc@0.15 CTXLEN=40960 sbatch sglang_server.sh   a job
-#   ARM=cdc@0.15 CTXLEN=40960 bash sglang_server.sh     this box
+#   ARM=cdc@0.15 sbatch sglang_server.sh          a job
+#   ARM=cdc@0.15 bash sglang_server.sh            this box
 #   ARM=cdc@0.15 bash sglang_server.sh check      validate, print the arm's file tag
 #
 # Arms:
@@ -28,9 +28,10 @@
 #
 # Knobs:
 #
-#   MODEL=Qwen/Qwen3-30B-A3B CTXLEN=32768 PORT=30000 MEMFRAC=0.90 BACKEND=triton
+#   MODEL=Qwen/Qwen3-Coder-30B-A3B-Instruct CTXLEN=73728 PORT=30000 MEMFRAC=0.90 BACKEND=triton
 #   CHUNKED_PREFILL        unset keeps the server default; the same for every arm compared
-#   TOOL_PARSER=qwen REASONING_PARSER=qwen3 QUANT=    empty drops the flag
+#   TOOL_PARSER=qwen3_coder REASONING_PARSER= QUANT=  empty drops the flag
+#   Qwen3-30B-A3B:  MODEL=Qwen/Qwen3-30B-A3B CTXLEN=40960 TOOL_PARSER=qwen REASONING_PARSER=qwen3
 #   TOPK_LAYER CDC_TARGET CDC_MIN CDC_MAX             unset keeps the server default
 #   AUDIT TRACE ROTATE_GPU DUMP_TREE                  diagnostics; timings then unusable
 #   SERVER_LOG CAPTURE FWD_TRACE STAGE                output paths; empty turns one off
@@ -46,16 +47,18 @@ REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 WORK_DIR=${WORK_DIR:-$(dirname "$REPO")}
 
 ARM=${ARM:-on}
-MODEL=${MODEL:-Qwen/Qwen3-30B-A3B}
-CTXLEN=${CTXLEN:-32768}
+MODEL=${MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}
+CTXLEN=${CTXLEN:-73728}
 PORT=${PORT:-30000}
 MEMFRAC=${MEMFRAC:-0.90}
 # Same backend for every arm; idx/cdc need triton (per-position mask).
 BACKEND=${BACKEND:-triton}
 CHUNKED_PREFILL=${CHUNKED_PREFILL:-}
 # No colon: an explicitly empty value drops the flag.
-TOOL_PARSER=${TOOL_PARSER-qwen}
-REASONING_PARSER=${REASONING_PARSER-qwen3}
+TOOL_PARSER=${TOOL_PARSER-qwen3_coder}
+# Only for a model that closes </think>: on one that never does, the parser takes the
+# whole reply, tool calls included, when the request carries no chat_template_kwargs.
+REASONING_PARSER=${REASONING_PARSER-}
 QUANT=${QUANT:-}
 AUDIT=${AUDIT:-}
 TRACE=${TRACE:-}

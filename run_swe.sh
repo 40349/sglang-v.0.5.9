@@ -15,7 +15,7 @@
 #   ./run_swe.sh toggle   replay that capture once per arm in ARMS and print the tables
 #   sbatch run_swe.sh toggle     the same as a batch job (submit from the checkout)
 #
-#   ARMS="off cdc cdc@0.15" CTXLEN=40960 ./run_swe.sh toggle
+#   ARMS="off cdc cdc@0.15" ./run_swe.sh toggle
 #   ARMS="off rot idx cdc" ./run_swe.sh toggle          the middle rungs; the first arm
 #                                                       is the baseline
 #   AUDIT=1 FULL=1 ./run_swe.sh toggle                  correctness pass, timings unusable
@@ -44,7 +44,7 @@ CHECK_ARM=$REPO/scripts/subcontext_sim/check_remote_arm.py
 
 ARM=${ARM:-on}
 ARMS=${ARMS:-"off cdc"}
-export MODEL=${MODEL:-Qwen/Qwen3-30B-A3B}
+export MODEL=${MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}
 export PORT=${PORT:-30000}
 # Replay saves only `content`, and a reasoning parser would move the pinned generation,
 # all of it inside <think>, out of it.

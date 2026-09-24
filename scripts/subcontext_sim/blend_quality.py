@@ -8,9 +8,12 @@ prefix with the passages, so `off` is the full prefill the paper compares agains
 Prompts, answer parsing, scoring and generation lengths follow CacheBlend's
 example/blend_{wikimqa,musique,samsum}.py. What differs: the chat template (the split
 only runs on /v1/chat/completions), so the paper's `[INST] ... [/INST]` becomes one
-user message; F1 tokenizes with the served model's tokenizer; thinking is off.
+user message each for the prefix, every passage and the question -- cdc cuts before
+every message, so a passage is found whole, as the paper reuses it; F1 tokenizes with
+the served model's tokenizer; thinking is off.
 Each run's reuse rate is printed: near zero on idx/cdc means the passages were not
-found and the run measured nothing.
+found and the run measured nothing. Requests are streamed, so each answer records its
+TTFT as well as its end-to-end latency.
 
     python blend_quality.py run http://127.0.0.1:30000          all three tasks
     python blend_quality.py compare ab_out/quality/<model> off cdc cdc_r15
@@ -62,14 +65,6 @@ TASKS = {
         max_ctx_len=3400,
     ),
 }
-
-
-def post(url: str, payload: dict, timeout: float = 600) -> dict:
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.load(r)
 
 
 def get(url: str) -> dict:
@@ -141,21 +136,41 @@ def score(task: str, text: str, answers: list, tokenizer, scorer) -> float:
 
 
 def chat(
-    base: str, model: str, content: str, max_tokens: int, thinking: bool, ignore_eos: bool = False
-) -> tuple[dict, float]:
-    t0 = time.perf_counter()
-    resp = post(
+    base: str, model: str, contents: list[str], max_tokens: int, thinking: bool, ignore_eos: bool = False
+) -> tuple[str, dict, float, float]:
+    """One streamed request: (text, usage, TTFT, end-to-end latency)."""
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": c} for c in contents],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "ignore_eos": ignore_eos,
+        "chat_template_kwargs": {"enable_thinking": thinking},
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    req = urllib.request.Request(
         base + "/v1/chat/completions",
-        {
-            "model": model,
-            "messages": [{"role": "user", "content": content}],
-            "max_tokens": max_tokens,
-            "temperature": 0.0,
-            "ignore_eos": ignore_eos,
-            "chat_template_kwargs": {"enable_thinking": thinking},
-        },
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
     )
-    return resp, time.perf_counter() - t0
+    text, usage, ttft = [], {}, None
+    t0 = time.perf_counter()
+    with urllib.request.urlopen(req, timeout=600) as r:
+        for line in r:
+            if not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            if data == b"[DONE]":
+                break
+            chunk = json.loads(data)
+            usage = chunk.get("usage") or usage
+            for choice in chunk.get("choices") or ():
+                # The server sends its first chunk once the first token is out.
+                if ttft is None:
+                    ttft = time.perf_counter() - t0
+                text.append((choice.get("delta") or {}).get("content") or "")
+    return "".join(text), usage, ttft, time.perf_counter() - t0
 
 
 def arm_tag(sub: dict) -> str:
@@ -190,16 +205,17 @@ def run_task(task, args, base, model, info, tokenizer, scorer) -> None:
             # Two tokens, EOS ignored: on the split arms a request that finishes during
             # its prefill step is never filed, and its passage would not be found.
             for d in docs:
-                chat(base, model, d, 2, args.thinking, ignore_eos=True)
-        resp, latency = chat(base, model, cfg["prefix"] + "".join(docs) + q, cfg["max_tokens"], args.thinking)
-        text = resp["choices"][0]["message"].get("content") or ""
-        usage = resp.get("usage") or {}
+                chat(base, model, [d], 2, args.thinking, ignore_eos=True)
+        text, usage, ttft, latency = chat(
+            base, model, [cfg["prefix"], *docs, q], cfg["max_tokens"], args.thinking
+        )
         cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
         rows.append(
             dict(
                 idx=i,
                 prompt_tokens=usage.get("prompt_tokens"),
                 cached_tokens=cached,
+                ttft_s=round(ttft, 4),
                 latency_s=round(latency, 4),
                 output=text,
                 score=score(task, text, ex["answers"], tokenizer, scorer),
@@ -216,6 +232,7 @@ def run_task(task, args, base, model, info, tokenizer, scorer) -> None:
         n=len(rows),
         score=sum(r["score"] for r in rows) / len(rows),
         reuse=sum(r["cached_tokens"] for r in rows) / max(1, sum(r["prompt_tokens"] or 0 for r in rows)),
+        ttft_s=sum(r["ttft_s"] for r in rows) / len(rows),
         latency_s=sum(r["latency_s"] for r in rows) / len(rows),
         sub_context=info["sub_context"],
         model_path=info["model_path"],
@@ -252,7 +269,7 @@ def compare_pair(a: dict, b: dict, name_b: str) -> None:
     better = sum(d > 1e-9 for d in diffs)
     print(
         f"  {name_b:10}{sb['score']:>9.4f}{sb['score'] - sa['score']:>+9.4f}{sb['reuse']:>9.1%}"
-        f"{sb['latency_s']:>9.3f}s   same {same}/{len(pairs)}  worse {worse}  better {better}"
+        f"{sb.get('ttft_s', float('nan')):>9.3f}s{sb['latency_s']:>9.3f}s   same {same}/{len(pairs)}  worse {worse}  better {better}"
     )
 
 
@@ -264,8 +281,11 @@ def cmd_compare(args) -> int:
         runs = [json.load(open(p)) for p in paths]
         base = runs[0]["summary"]
         print(f"{task} ({base['metric']}), baseline {args.arms[0]}, {base['n']} samples")
-        print(f"  {'arm':10}{'score':>9}{'delta':>9}{'reuse':>9}{'latency':>10}")
-        print(f"  {args.arms[0]:10}{base['score']:>9.4f}{'':>9}{base['reuse']:>9.1%}{base['latency_s']:>9.3f}s")
+        print(f"  {'arm':10}{'score':>9}{'delta':>9}{'reuse':>9}{'ttft':>10}{'latency':>10}")
+        print(
+            f"  {args.arms[0]:10}{base['score']:>9.4f}{'':>9}{base['reuse']:>9.1%}"
+            f"{base.get('ttft_s', float('nan')):>9.3f}s{base['latency_s']:>9.3f}s"
+        )
         for arm, run in zip(args.arms[1:], runs[1:]):
             compare_pair(runs[0], run, arm)
     return 0

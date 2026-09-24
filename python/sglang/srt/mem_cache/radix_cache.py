@@ -838,7 +838,9 @@ class RadixCache(BasePrefixCache):
 
         A block declined because its namespace holds it at ``canonical != offset`` is
         rotated in place by ``canonical - offset``. Runs at finish only: the rotation is
-        in place, and a decoding request still reads these slots.
+        in place, and a decoding request still reads these slots. A block the namespace
+        already holds whole is neither rotated nor inserted: the tree's copy is kept and
+        this request's is freed.
 
         Returns how many tokens were re-filed.
         """
@@ -850,6 +852,7 @@ class RadixCache(BasePrefixCache):
             return 0  # aborted mid-prefill; nothing settled enough to re-file
 
         reinserted = 0
+        adopted = False
         no_insert = getattr(req, "sub_context_no_insert", None)
         for i, (seg_ids, seg_key, offset) in enumerate(req.iter_sub_contexts()):
             if not seg_ids or req.sub_context_tree_owned[i]:
@@ -863,37 +866,51 @@ class RadixCache(BasePrefixCache):
                 probe.last_device_node, len(probe.device_indices)
             )
             tree_held = _tree_held_mask(probe.device_indices, kv_indices[offset:end])
-            if canonical is None:
-                # The namespace is empty now: file the block where it sits.
-                canonical = offset
-            delta = canonical - offset
-            if delta != 0:
-                if bool(tree_held.any()):
-                    # Some slots are a node's: never rotate those in place. Skipped.
-                    continue
-                if not self.kv_rotator.can_rotate(delta):
-                    continue  # out of the cos_sin_cache's range
-                seg_slots = kv_indices[offset:end]
-                # In place: every slot here is this request's own.
-                self.kv_rotator.rotate_into(
-                    seg_slots, seg_slots, delta, stage="subctx_rotate_finish"
+            if len(probe.device_indices) == len(seg_ids):
+                # Held whole: keep the tree's copy.
+                _free_only_ours(
+                    self.token_to_kv_pool_allocator, kv_indices[offset:end], tree_held
                 )
+                seg_match = probe
+            else:
+                if canonical is None:
+                    # The namespace is empty now: file the block where it sits.
+                    canonical = offset
+                delta = canonical - offset
+                if delta != 0:
+                    if bool(tree_held.any()):
+                        # Some slots are a node's: never rotate those in place. Skipped.
+                        continue
+                    if not self.kv_rotator.can_rotate(delta):
+                        continue  # out of the cos_sin_cache's range
+                    seg_slots = kv_indices[offset:end]
+                    # In place: every slot here is this request's own.
+                    self.kv_rotator.rotate_into(
+                        seg_slots, seg_slots, delta, stage="subctx_rotate_finish"
+                    )
 
-            result = self.insert(
-                InsertParams(
-                    key=radix_key,
-                    value=kv_indices[offset:end].to(dtype=torch.int64, copy=True),
-                    priority=getattr(req, "priority", 0) or 0,
-                    canonical_position=canonical,
+                result = self.insert(
+                    InsertParams(
+                        key=radix_key,
+                        value=kv_indices[offset:end].to(dtype=torch.int64, copy=True),
+                        priority=getattr(req, "priority", 0) or 0,
+                        canonical_position=canonical,
+                    )
                 )
-            )
-            # Free this request's duplicates of what the tree already held.
-            _free_only_ours(
-                self.token_to_kv_pool_allocator,
-                kv_indices[offset : offset + result.prefix_len],
-                tree_held,
-            )
-            seg_match = self.match_prefix(MatchPrefixParams(key=radix_key))
+                # Free this request's duplicates of what the tree already held.
+                _free_only_ours(
+                    self.token_to_kv_pool_allocator,
+                    kv_indices[offset : offset + result.prefix_len],
+                    tree_held,
+                )
+                seg_match = self.match_prefix(MatchPrefixParams(key=radix_key))
+                reinserted += len(seg_ids)
+                if TRACE_ON:
+                    trace(
+                        f"[TRACE-4 SUBCTX-REVERSE-ROTATE] rid={req.rid} "
+                        f"extra_key={seg_key!r} offset={offset} canonical={canonical} "
+                        f"delta={delta} tokens={len(seg_ids)} dup={result.prefix_len}"
+                    )
             self.req_to_token_pool.write(
                 (req.req_pool_idx, slice(offset, end)), seg_match.device_indices
             )
@@ -903,16 +920,10 @@ class RadixCache(BasePrefixCache):
             req.sub_context_tree_owned[i] = True
             req.sub_context_tree_canonical[i] = canonical
             req.sub_context_owned_lens[i] = len(seg_ids)
-            reinserted += len(seg_ids)
-            if TRACE_ON:
-                trace(
-                    f"[TRACE-4 SUBCTX-REVERSE-ROTATE] rid={req.rid} "
-                    f"extra_key={seg_key!r} offset={offset} canonical={canonical} "
-                    f"delta={delta} tokens={len(seg_ids)} dup={result.prefix_len}"
-                )
+            adopted = True
         req.sub_context_reinserted += reinserted
         self.sub_context_reinserted_tokens += reinserted
-        if reinserted:
+        if adopted:
             req.cache_protected_len = self._sub_context_protected_len(
                 req, len(kv_indices)
             )

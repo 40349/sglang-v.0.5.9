@@ -1298,6 +1298,7 @@ class Req(ReqDllmMixin):
         # Whether a run sits on this request's rotated copy rather than tree rows.
         ours_by_start: Dict[int, bool] = {}
         moved = rotated = discarded = 0
+        locked = []
         for match in index.select(candidates):
             seg = self.fill_ids[match.start : match.end]
             probe = tree_cache.match_prefix(
@@ -1315,6 +1316,14 @@ class Req(ReqDllmMixin):
                 probe.last_device_node, take
             )
             delta = match.start - (canonical if canonical is not None else match.start)
+            locked.append((match, probe, delta))
+
+        # Room for the rotated copies, evicted while every run above is locked.
+        evict_from_tree_cache(
+            tree_cache, sum(len(p.device_indices) for _m, p, d in locked if d != 0)
+        )
+        for match, probe, delta in locked:
+            take = len(probe.device_indices)
             if delta == 0:
                 slots = probe.device_indices
             else:

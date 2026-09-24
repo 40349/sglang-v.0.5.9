@@ -6,7 +6,9 @@ Checked:
 - the scan finds every occurrence (against brute force on random inputs),
 - ``select`` covers as many tokens as any non-overlapping subset (against exhaustive
   enumeration),
-- ``cut_points`` cuts the same tokens the same way wherever they sit.
+- ``cut_points`` cuts the same tokens the same way wherever they sit,
+- the cdc split cuts before every message, so a message is cut the same way alone and
+  among others (CacheBlend's passages).
 
 Usage:
     python test_subctx_index.py
@@ -22,6 +24,8 @@ register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu-amd")
 import itertools
 import random
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -327,6 +331,85 @@ class TestCutPoints(unittest.TestCase):
         cuts = cut_points(self.toks(5000), 256, 0)
         self.assertEqual(cuts, sorted(set(cuts)))
         self.assertTrue(all(0 < c < 5000 for c in cuts))
+
+
+class TestCdcSplit(unittest.TestCase):
+    """The chat-level cdc split: a cut before every message, then content cuts."""
+
+    @classmethod
+    def setUpClass(cls):
+        from transformers import AutoTokenizer
+
+        from sglang.srt.entrypoints.openai import serving_chat
+
+        try:
+            cls.tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+        except Exception as e:
+            raise unittest.SkipTest(f"no Qwen3 tokenizer: {e}")
+        cls.serving_chat = serving_chat
+        cls.rng = random.Random(20260923)
+
+    def text(self, n):
+        return " ".join(f"w{self.rng.randrange(3000)}" for _ in range(n))
+
+    def split(self, messages, tokenizer=None):
+        tokenizer = tokenizer or self.tok
+        ids = list(
+            tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True, return_dict=False
+            )
+        )
+        chat = object.__new__(self.serving_chat.OpenAIServingChat)
+        chat.tokenizer_manager = SimpleNamespace(tokenizer=tokenizer)
+        chat._message_start_probed = False
+        chat._message_start_id = None
+        with mock.patch.object(self.serving_chat, "SPLIT_MODE", "cdc"):
+            segs, keys = chat._compute_sub_context_ids(None, messages, None, ids)
+        return ids, segs, keys
+
+    def test_every_message_starts_a_segment(self):
+        msgs = [
+            {"role": "system", "content": self.text(300)},
+            {"role": "user", "content": self.text(900)},
+            {"role": "assistant", "content": self.text(40)},
+            {"role": "user", "content": self.text(700)},
+        ]
+        ids, segs, keys = self.split(msgs)
+        self.assertEqual([t for s in segs for t in s], ids)
+        self.assertEqual(len(keys), len(segs))
+        bounds = set(itertools.accumulate(len(s) for s in segs))
+        marker = self.tok.convert_tokens_to_ids("<|im_start|>")
+        starts = {i for i, t in enumerate(ids) if t == marker and i > 0}
+        self.assertEqual(len(starts), 4)
+        self.assertTrue(starts <= bounds, "a segment spans a message start")
+
+    def test_a_passage_is_cut_the_same_alone_and_among_others(self):
+        """CacheBlend's setting: every chunk of a primed passage is in the full prompt."""
+        passage = {"role": "user", "content": self.text(600)}
+        _, alone, _ = self.split([passage])
+        own = [tuple(s) for s in alone[:-1]]  # the last one is the generation prompt
+        self.assertGreater(len(own), 1)
+        others = [{"role": "user", "content": self.text(n)} for n in (20, 550, 610)]
+        _, full, _ = self.split([others[0], others[1], passage, others[2]])
+        self.assertTrue(set(own) <= {tuple(s) for s in full})
+
+    def test_without_a_message_token_it_cuts_on_content_only(self):
+        vocab = {}
+
+        def render(messages, **kw):
+            text = "".join(f"{m['role']}: {m['content']}\n" for m in messages)
+            return [vocab.setdefault(w, 1000 + len(vocab)) for w in text.split()]
+
+        plain = SimpleNamespace(
+            apply_chat_template=render,
+            all_special_ids=[],
+            get_added_vocab=lambda: {},
+            convert_ids_to_tokens=str,
+        )
+        msgs = [{"role": "user", "content": self.text(1500)}]
+        ids, segs, _ = self.split(msgs, plain)
+        bounds = [0, *cut_points(ids, 256, 64, 1024), len(ids)]
+        self.assertEqual(segs, [ids[a:b] for a, b in zip(bounds, bounds[1:])])
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 import jinja2
+import numpy as np
 import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -128,6 +129,8 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         host_timer.init_host_timer("http")
+        self._message_start_probed = False
+        self._message_start_id: Optional[int] = None
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
@@ -394,6 +397,45 @@ class OpenAIServingChat(OpenAIServingBase):
         result.tool_call_constraint = tool_call_constraint
         return result
 
+    def _message_start_token(self) -> Optional[int]:
+        """The special token the chat template opens each message with, or None.
+
+        Read off the template once: the first token of a second rendered message.
+        """
+        if self._message_start_probed:
+            return self._message_start_id
+        self._message_start_probed = True
+        tokenizer = self.tokenizer_manager.tokenizer
+        kwargs = dict(tokenize=True, add_generation_prompt=False, return_dict=False)
+        try:
+            one = list(
+                tokenizer.apply_chat_template([{"role": "user", "content": "a"}], **kwargs)
+            )
+            two = list(
+                tokenizer.apply_chat_template(
+                    [
+                        {"role": "user", "content": "a"},
+                        {"role": "assistant", "content": "b"},
+                    ],
+                    **kwargs,
+                )
+            )
+        except Exception as e:
+            logger.warning("Sub-context: cannot render messages to find their start: %s", e)
+            return None
+        special = set(tokenizer.all_special_ids) | set(tokenizer.get_added_vocab().values())
+        if len(two) > len(one) and two[: len(one)] == one and two[len(one)] in special:
+            self._message_start_id = two[len(one)]
+            logger.info(
+                "Sub-context: cdc cuts before every %r",
+                tokenizer.convert_ids_to_tokens(self._message_start_id),
+            )
+        else:
+            logger.warning(
+                "Sub-context: no special token opens each message; cdc cuts on content only"
+            )
+        return self._message_start_id
+
     @host_timer.timed("subctx_split")
     def _compute_sub_context_ids(
         self,
@@ -406,7 +448,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         ``SPLIT_MODE == "blocks"``: system prompt, tool definitions, conversation,
         located by re-rendering the leading messages (no split if the template does not
-        render them as a literal prefix). ``"cdc"``: ``cut_points`` on the token ids.
+        render them as a literal prefix). ``"cdc"``: a cut before every message, then
+        ``cut_points`` on each message's token ids.
         Either way ``concat(segments) == prompt_ids``.
         """
 
@@ -417,12 +460,19 @@ class OpenAIServingChat(OpenAIServingBase):
             return None, None
 
         if SPLIT_MODE == "cdc":
-            cuts = cut_points(
-                prompt_ids, CDC_TARGET_TOKENS, MIN_CHUNK_TOKENS, CDC_MAX_TOKENS
-            )
-            if not cuts:
+            arr = np.asarray(prompt_ids, dtype=np.int32)
+            starts = [0]
+            marker = self._message_start_token()
+            if marker is not None:
+                starts += [i for i in np.flatnonzero(arr == marker).tolist() if i > 0]
+            bounds = [0]
+            for a, b in zip(starts, starts[1:] + [len(prompt_ids)]):
+                cuts = cut_points(
+                    arr[a:b], CDC_TARGET_TOKENS, MIN_CHUNK_TOKENS, CDC_MAX_TOKENS
+                )
+                bounds += [a + c for c in cuts] + [b]
+            if len(bounds) < 3:
                 return None, None
-            bounds = [0, *cuts, len(prompt_ids)]
             segments = [prompt_ids[a:b] for a, b in zip(bounds, bounds[1:])]
             # Placeholders; `Req.__init__` replaces them with content hashes.
             return segments, [f"cdc_{i}" for i in range(len(segments))]

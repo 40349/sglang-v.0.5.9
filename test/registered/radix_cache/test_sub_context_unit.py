@@ -793,7 +793,16 @@ class TestReverseRotateInsert(unittest.TestCase):
             req_pool_idx=1,
         )
 
-    def test_declined_block_is_rotated_back_and_filed(self):
+    def _with_new_tail(self):
+        """TOOLS[7,8,30,31] at offset 2: [7,8] is the namespace's, [30,31] is new."""
+        return make_req(
+            "r2",
+            [[1, 2], [7, 8, 30, 31], [40, 41]],
+            [SYS_KEY, self.TOOLS_KEY, MSG_KEY],
+            req_pool_idx=1,
+        )
+
+    def test_a_full_duplicate_is_freed_not_rotated(self):
         rotator = FakeRotator()
         cache, pool, allocator = self._seed(rotator)
         req = self._shifted()
@@ -805,11 +814,13 @@ class TestReverseRotateInsert(unittest.TestCase):
 
         decode_and_finish(cache, pool, req, [9], first_slot=400)
 
-        # `canonical - offset` = 3 - 2, the read path's rotation run backwards, and in
-        # place: source and destination are the same slots.
-        self.assertEqual(rotator.calls, [([900, 901], [900, 901], 1)])
-        self.assertEqual(req.sub_context_reinserted, 2)
-        self.assertEqual(cache.sub_context_reinserted_tokens, 2)
+        # The namespace holds all of [7,8]: rotating the copy back would only produce
+        # a duplicate, so the copy is freed as it is and nothing counts as re-filed.
+        self.assertEqual(rotator.calls, [])
+        self.assertEqual(req.sub_context_reinserted, 0)
+        self.assertEqual(cache.sub_context_reinserted_tokens, 0)
+        self.assertIn(900, allocator.freed)
+        self.assertIn(901, allocator.freed)
 
     def test_the_reply_is_cached_once_the_hole_is_closed(self):
         rotator = FakeRotator()
@@ -845,14 +856,17 @@ class TestReverseRotateInsert(unittest.TestCase):
         """The payoff case: the request's block runs past what the namespace holds."""
         rotator = FakeRotator()
         cache, pool, allocator = self._seed(rotator)
-        req = make_req(
-            "r2",
-            [[1, 2], [7, 8, 30, 31], [40, 41]],
-            [SYS_KEY, self.TOOLS_KEY, MSG_KEY],
-            req_pool_idx=1,
-        )
+        req = self._with_new_tail()
         prefill(cache, pool, req, first_slot=300)
+        rotator.calls.clear()
         decode_and_finish(cache, pool, req, [], first_slot=400)
+
+        # `canonical - offset` = 3 - 2, the read path's rotation run backwards, and in
+        # place: source and destination are the same slots.
+        self.assertEqual(
+            rotator.calls, [([900, 901, 304, 305], [900, 901, 304, 305], 1)]
+        )
+        self.assertEqual(req.sub_context_reinserted, 4)
 
         # [7,8] was already there at 3; [30,31] is new and lands right after it.
         m = cache.match_prefix(
@@ -950,7 +964,7 @@ class TestReverseRotateInsert(unittest.TestCase):
     def test_an_unrotatable_delta_keeps_the_old_behaviour(self):
         rotator = FakeRotator()
         cache, pool, allocator = self._seed(rotator)
-        req = self._shifted()
+        req = self._with_new_tail()  # filing the new tail needs a rotation
         prefill(cache, pool, req, first_slot=300)  # the read path rotates into 900,901
         cache.kv_rotator = FakeRotator(max_delta=0)  # ...but the re-file cannot
         allocator.freed.clear()
@@ -958,7 +972,7 @@ class TestReverseRotateInsert(unittest.TestCase):
 
         self.assertEqual(req.sub_context_reinserted, 0)
         # The block stays this request's to free, and the reply is dropped as before.
-        self.assertEqual(sorted(allocator.freed), [400, 900, 901])
+        self.assertEqual(sorted(allocator.freed), [304, 305, 400, 900, 901])
         self.assertEqual(
             len(
                 cache.match_prefix(
