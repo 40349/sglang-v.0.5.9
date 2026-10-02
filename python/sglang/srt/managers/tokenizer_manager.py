@@ -725,9 +725,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         input_embeds = None
         input_text = obj.text
         token_type_ids = None
-        # Sub-context: per-block token ids / namespaces (None unless request is split).
-        sub_context_ids = None
-        sub_context_extra_keys = None
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
@@ -750,18 +747,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     "the engine with skip_tokenizer_init=False."
                 )
 
-            if isinstance(obj, GenerateReqInput) and obj.sub_contexts:
-                # Tokenize each block separately, then concatenate.
-                contents = [sc["content"] for sc in obj.sub_contexts]
-                sub_context_extra_keys = [sc["extra_key"] for sc in obj.sub_contexts]
-                sub_context_ids, _ = await self._tokenize_texts(
-                    contents, is_cross_encoder_request
-                )
-                input_ids = [tok for seg in sub_context_ids for tok in seg]
-            else:
-                input_ids, token_type_ids = await self._tokenize_texts(
-                    input_text, is_cross_encoder_request
-                )
+            input_ids, token_type_ids = await self._tokenize_texts(
+                input_text, is_cross_encoder_request
+            )
 
         if self.mm_processor and obj.contains_mm_input():
             if obj.image_data is not None and not isinstance(obj.image_data, list):
@@ -808,7 +796,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             mm_inputs = None
 
         # Pre-split ids (OpenAI chat path): accept only if they concatenate to input_ids.
-        if sub_context_ids is None and getattr(obj, "sub_context_ids", None):
+        sub_context_ids = None
+        sub_context_extra_keys = None
+        if getattr(obj, "sub_context_ids", None):
             flat = [tok for seg in obj.sub_context_ids for tok in seg]
             if input_ids is not None and flat == list(input_ids):
                 sub_context_ids = obj.sub_context_ids

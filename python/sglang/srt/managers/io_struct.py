@@ -19,7 +19,6 @@ processes (TokenizerManager, DetokenizerManager, Scheduler).
 from __future__ import annotations
 
 import copy
-import logging
 import uuid
 from abc import ABC
 from dataclasses import dataclass, field
@@ -33,8 +32,6 @@ from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData
-
-logger = logging.getLogger(__name__)
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -254,11 +251,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
-    # Sub-context blocks of the prompt, in order: [{"content": str, "extra_key": str}].
-    # Each is tokenized separately and cached in its own radix namespace.
-    sub_contexts: Optional[List[Dict[str, str]]] = None
-
-    # Pre-split token ids (OpenAI chat path), parallel to ``sub_context_extra_keys``.
+    # Pre-split token ids, parallel to ``sub_context_extra_keys``. Set only by the
+    # OpenAI chat path; `/generate` drops them from the request body.
     # Dropped with a warning unless ``concat(sub_context_ids) == input_ids``.
     sub_context_ids: Optional[List[List[int]]] = None
     sub_context_extra_keys: Optional[List[str]] = None
@@ -311,7 +305,6 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             ValueError: If inputs are not properly specified (e.g., none or all of
                        text, input_ids, input_embeds are provided)
         """
-        self._normalize_sub_contexts()
         self._validate_inputs()
         self._determine_batch_size()
         self._handle_parallel_sampling()
@@ -320,31 +313,6 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             self._normalize_single_inputs()
         else:
             self._normalize_batch_inputs()
-
-    def _normalize_sub_contexts(self):
-        """Set ``text`` to the concatenated ``sub_contexts``.
-
-        With ``input_ids`` also given, ``sub_contexts`` is dropped. With ``text`` also
-        given, it must equal the concatenation.
-        """
-        if not self.sub_contexts:
-            return
-        if self.input_ids is not None:
-            logger.warning(
-                "Sub-context: ignoring `sub_contexts` because `input_ids` was also "
-                "provided; use `sub_context_ids` to split a pre-tokenized prompt."
-            )
-            self.sub_contexts = None
-            return
-
-        joined = "".join(sc["content"] for sc in self.sub_contexts)
-        if self.text is None:
-            self.text = joined
-        elif self.text != joined:
-            raise ValueError(
-                "`text` and `sub_contexts` describe different prompts. Send only "
-                "`sub_contexts`, or make its contents concatenate to exactly `text`."
-            )
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
@@ -716,7 +684,6 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
-            sub_contexts=self.sub_contexts,
             sub_context_ids=self.sub_context_ids,
             sub_context_extra_keys=self.sub_context_extra_keys,
             no_logs=self.no_logs,

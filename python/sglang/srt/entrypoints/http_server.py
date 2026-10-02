@@ -84,7 +84,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     V1RerankReqInput,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
-from sglang.srt.utils.subctx_trace import TRACE_ON, trace
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
@@ -673,10 +672,9 @@ if os.environ.get("SGLANG_DUMPER_SERVER_PORT") == "reuse":
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
-    if TRACE_ON:
-        _keys = [sc["extra_key"] for sc in obj.sub_contexts] if obj.sub_contexts else None
-        trace(f"[TRACE-1 HTTP] received rid={obj.rid}")
-        trace(f"[TRACE-1 HTTP] sub_context extra_keys={_keys}")
+    # The sub-context split is internal to the OpenAI chat path; /generate is never split.
+    obj.sub_context_ids = None
+    obj.sub_context_extra_keys = None
 
     if obj.stream:
 

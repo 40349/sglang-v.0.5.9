@@ -26,7 +26,6 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.schedule_batch import Req, sub_context_chunk_id
 from sglang.srt.mem_cache.subctx_index import SubContextIndex
 from sglang.srt.utils import subctx_config
@@ -994,40 +993,6 @@ class TestReverseRotateInsert(unittest.TestCase):
         self.assertEqual(cache.sub_context_reinserted_tokens, 0)
         # Nothing was rotated on the read path either, so [7,8] was recomputed at 302.
         self.assertEqual(sorted(allocator.freed), [302, 303, 400])
-
-
-class TestSubContextRequestNormalization(unittest.TestCase):
-    """`text` and `sub_contexts` may not describe two different prompts."""
-
-    def _obj(self, **kwargs):
-        return GenerateReqInput(
-            sub_contexts=[
-                {"content": "you are a bot.", "extra_key": SYS_KEY},
-                {"content": "hello", "extra_key": MSG_KEY},
-            ],
-            **kwargs,
-        )
-
-    def test_text_is_derived_from_the_blocks(self):
-        obj = self._obj()
-        obj.normalize_batch_and_arguments()
-        self.assertEqual(obj.text, "you are a bot.hello")
-
-    def test_matching_text_is_kept_with_the_split(self):
-        obj = self._obj(text="you are a bot.hello")
-        obj.normalize_batch_and_arguments()
-        self.assertEqual(obj.text, "you are a bot.hello")
-        self.assertIsNotNone(obj.sub_contexts)
-
-    def test_conflicting_text_is_rejected(self):
-        obj = self._obj(text="a completely different prompt")
-        with self.assertRaises(ValueError):
-            obj.normalize_batch_and_arguments()
-
-    def test_input_ids_wins_and_drops_the_split(self):
-        obj = self._obj(input_ids=[1, 2, 3])
-        obj.normalize_batch_and_arguments()
-        self.assertIsNone(obj.sub_contexts)
 
 
 class TestSubContextTruncation(unittest.TestCase):
