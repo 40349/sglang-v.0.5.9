@@ -170,6 +170,10 @@ class KVRotator:
         self.max_delta = cos_sin_cache.shape[0] - 1
         self.use_native = use_native or not cos_sin_cache.is_cuda
         self.rotated_tokens = 0
+        self.copied_tokens = 0
+        # Stream the kernels run on, after the caller's stream's queued work (the
+        # scheduler's forward stream under overlap scheduling). None: the caller's.
+        self.launch_stream = None
         # Reported on a later call once the event completes; the last few are lost.
         self._gpu_timer = (
             DeviceTimer(reporter=self._report_gpu)
@@ -216,7 +220,7 @@ class KVRotator:
             if self._gpu_timer is not None
             else nullcontext()
         )
-        with host_timer.record(stage), gpu:
+        with host_timer.record(stage), self._on_launch_stream(dst_loc, src_loc), gpu:
             cos, sin = self._cos_sin(delta)
 
             if self.use_native:
@@ -246,6 +250,39 @@ class KVRotator:
                     VROW_P2=triton.next_power_of_2(v_row_elems),
                 )
         self.rotated_tokens += n
+
+    def _on_launch_stream(self, *index_tensors: torch.Tensor):
+        """Context running the kernels on ``launch_stream``, after the current stream's
+        queued work; ``index_tensors`` (made on the current stream) are kept alive for
+        it.
+        """
+        if self.launch_stream is None:
+            return nullcontext()
+        self.launch_stream.wait_stream(torch.cuda.current_stream())
+        for t in index_tensors:
+            t.record_stream(self.launch_stream)
+        return torch.cuda.stream(self.launch_stream)
+
+    def copy_into(
+        self, dst_loc: torch.Tensor, src_loc: torch.Tensor, stage: str = "subctx_copy"
+    ) -> None:
+        """Copy K and V at ``src_loc`` to ``dst_loc`` unchanged, in every layer."""
+        from sglang.srt.mem_cache.memory_pool import move_kv_cache_native
+
+        assert dst_loc.numel() == src_loc.numel(), (
+            f"{dst_loc.numel()=} != {src_loc.numel()=}"
+        )
+        if dst_loc.numel() == 0:
+            return
+        with host_timer.record(stage), self._on_launch_stream(dst_loc, src_loc):
+            if getattr(self.pool, "_kv_copy_config", None) is not None:
+                # The pool's all-layer copy kernel.
+                self.pool.move_kv_cache(dst_loc, src_loc)
+            else:
+                move_kv_cache_native(
+                    self.pool.k_buffer, self.pool.v_buffer, dst_loc, src_loc
+                )
+        self.copied_tokens += dst_loc.numel()
 
 
 def find_rotary_embedding(model) -> Tuple[Optional[object], Optional[str]]:

@@ -1,6 +1,7 @@
 """Selective recompute: recompute the reused tokens whose keys moved most.
 
-Layers ``[0, check_layer]`` run the whole prompt (the probe). At ``check_layer`` each
+Layers ``[0, check_layer]`` run each prompt from its probe start on (the probe): past the
+exact prefix of a sparse layout, past the reused prefix of any other request. At ``check_layer`` each
 reused token's fresh key is compared with its cached key, the top ``TOPK_RATIO`` per
 request are selected, and the remaining layers run only the fresh plus selected tokens.
 
@@ -25,10 +26,12 @@ class BlendPlan:
 
     check_layer: int
 
-    # Rows per request: the probe (whole prompt), and the selection (fresh tokens plus
-    # the recomputed ones).
+    # Rows per request: the probe (from `probe_starts` on), and the selection (fresh
+    # tokens plus the recomputed ones).
     probe_lens: List[int]
     sel_lens: List[int]
+    # Per request: the position of its first probe row.
+    probe_starts: List[int]
 
     # Where the probe layers write KV, per probe row; reused rows go to dummy slot 0.
     probe_cache_loc: torch.Tensor
@@ -99,11 +102,13 @@ class BlendPlan:
                 local = torch.topk(score[lo:hi], k=count).indices
                 chosen_idx = local + lo
                 chosen_pos = (
-                    self.reused_rows[chosen_idx] - self.row_offsets[i]
+                    self.reused_rows[chosen_idx]
+                    - self.row_offsets[i]
+                    + self.probe_starts[i]
                 ).to(fresh.dtype)
             positions, _ = torch.sort(torch.cat([fresh, chosen_pos]))
             sel_positions.append(positions)
-            sel_rows.append(positions + self.row_offsets[i])
+            sel_rows.append(positions - self.probe_starts[i] + self.row_offsets[i])
             topk_rows.append(chosen_idx)
 
         self.sel_positions = torch.cat(sel_positions)
@@ -152,7 +157,7 @@ class BlendPlan:
         device = self.probe_cache_loc.device
         positions = torch.cat(self.fresh_positions) if self.fresh_positions else None
         rows = [
-            self.fresh_positions[i] + self.row_offsets[i]
+            self.fresh_positions[i] - self.probe_starts[i] + self.row_offsets[i]
             for i in range(self.batch_size)
         ]
         self.sel_positions = positions
@@ -178,6 +183,7 @@ def build_plan(
     stride = req_to_token.stride(0)
 
     probe_lens: List[int] = []
+    probe_starts: List[int] = []
     sel_lens: List[int] = []
     topk_counts: List[int] = []
     row_offsets: List[int] = []
@@ -194,13 +200,18 @@ def build_plan(
     row_cursor = 0
     fresh_cursor = 0
     for i, req in enumerate(batch.reqs):
-        n = len(req.fill_ids)
+        start = req.sub_context_probe_start()
+        rows = len(req.fill_ids) - start
         fresh = batch.subctx_fresh_positions[i]
         count = req.sub_context_topk_count()
         req_idx = req_pool_indices[i]
+        assert not fresh or fresh[0] >= start, (
+            f"{req.rid}: computes position {fresh[0]}, before its probe start {start}"
+        )
 
         row_offsets.append(row_cursor)
-        probe_lens.append(n)
+        probe_lens.append(rows)
+        probe_starts.append(start)
         sel_lens.append(len(fresh) + count)
         topk_counts.append(count)
         topk_ptr.append(topk_ptr[-1] + count)
@@ -209,15 +220,18 @@ def build_plan(
         fresh_positions.append(fresh_t)
 
         # Reused rows write to the padded dummy slot 0.
-        loc = torch.zeros(n, dtype=out_cache_loc.dtype, device=device)
-        loc[fresh_t] = out_cache_loc[fresh_cursor : fresh_cursor + len(fresh)]
+        loc = torch.zeros(rows, dtype=out_cache_loc.dtype, device=device)
+        loc[fresh_t - start] = out_cache_loc[fresh_cursor : fresh_cursor + len(fresh)]
         fresh_cursor += len(fresh)
         probe_loc_parts.append(loc)
 
         reused = req.sub_context_reused_positions()
         if reused:
             reused_t = torch.tensor(reused, dtype=torch.int64, device=device)
-            reused_rows_parts.append(reused_t + row_cursor)
+            assert reused[0] >= start, (
+                f"{req.rid}: scores position {reused[0]}, before its probe start {start}"
+            )
+            reused_rows_parts.append(reused_t - start + row_cursor)
             reused_slots_parts.append(
                 torch.cat([s.to(device) for s in req.sub_context_reused_slots()]).long()
             )
@@ -228,13 +242,14 @@ def build_plan(
                 )
             )
         reused_ptr.append(reused_ptr[-1] + len(reused))
-        row_cursor += n
+        row_cursor += rows
 
     empty = torch.empty(0, dtype=torch.int64, device=device)
     return BlendPlan(
         check_layer=check_layer,
         probe_lens=probe_lens,
         sel_lens=sel_lens,
+        probe_starts=probe_starts,
         probe_cache_loc=torch.cat(probe_loc_parts),
         reused_rows=torch.cat(reused_rows_parts) if reused_rows_parts else empty,
         reused_slots=torch.cat(reused_slots_parts) if reused_slots_parts else empty,

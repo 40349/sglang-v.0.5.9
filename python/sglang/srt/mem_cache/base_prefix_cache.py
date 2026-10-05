@@ -231,12 +231,26 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Whether this request takes the per-namespace paths.
 
         The single gate read by ``Req.init_next_round_input``, ``cache_unfinished_req``
-        and ``cache_finished_req``; they must agree.
+        and ``cache_finished_req``; they must agree. False for a chained request.
         """
-        return bool(getattr(req, "has_sub_contexts", False)) and self.supports_sub_contexts()
+        return (
+            bool(getattr(req, "has_sub_contexts", False))
+            and self.supports_sub_contexts()
+            and not self.chains_sub_contexts(req)
+        )
+
+    def chains_sub_contexts(self, req: Any) -> bool:
+        """Whether this request is stored as one chain from position 0, like a plain
+        request, with its chunks registered in the index (the index arms).
+        """
+        return False
 
     def matched_canonical_position(self, last_node: Any, hit_len: int) -> Optional[int]:
         """Where the KV behind a match was computed, or None if not tracked."""
+        return None
+
+    def chain_chunk_slots(self, cid: str) -> Optional[Tuple[torch.Tensor, Any, int]]:
+        """``(slots, node, start)`` of a registered chunk, or None if not tracked."""
         return None
 
     def is_tree_cache(self) -> bool:

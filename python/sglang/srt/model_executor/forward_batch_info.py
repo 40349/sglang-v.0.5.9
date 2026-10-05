@@ -485,8 +485,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         elif batch.subctx_positions is not None:
             ret.subctx_sparse = True
             # Sparse prefill: explicit positions (compute_position is skipped). With
-            # selective recompute they cover the whole prompt until the cut in
-            # `ModelRunner.forward_subctx_blend`.
+            # selective recompute they cover each prompt from its probe start on until
+            # the cut in `ModelRunner.forward_subctx_blend`.
             ret.positions = batch.subctx_positions.to(device, non_blocking=True)
             ret.subctx_blend_plan = batch.subctx_blend_plan
 

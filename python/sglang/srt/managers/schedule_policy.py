@@ -773,8 +773,9 @@ class PrefillAdder:
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
 
-            # Selective recompute's probe runs the whole prompt: it shares a pass only
-            # if it fits what is left, and otherwise runs alone, over the budget.
+            # Selective recompute's probe runs the prompt from its probe start on: it
+            # shares a pass only if it fits what is left, and otherwise runs alone,
+            # over the budget.
             probe_extra = req.sub_context_forward_rows() - req.extend_input_len
             if (
                 probe_extra > 0

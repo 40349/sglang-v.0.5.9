@@ -3,6 +3,10 @@
 這份講的是怎麼把這個 fork 的 sglang server 用 CDC 模式跑起來，以及怎麼確認它真的在運作。
 機制本身（切塊、查找、旋轉、寫入、釋放）見 `subcontext_mechanism.md`。
 
+一句話說明（2026-10-05 起）：每個請求先像原生 radix cache 一樣從頭比對；比不到的部分，用內容索引在 prompt
+任何位置找已快取的區塊，複製（位置不同就旋轉）進自己的格子，只算空洞；算完整條照原生方式存回樹，
+新存的區塊登記進索引。只往後接的對話因此跟原生 radix cache 一樣。
+
 ---
 
 ## 安裝環境
@@ -81,7 +85,7 @@ python -u -m sglang.launch_server \
 | 變數 | 值 | 作用 |
 |---|---|---|
 | `SGLANG_SUBCTX_SPLIT` | `cdc` | 切點由 token 內容決定。必須搭配內容定址的 namespace（`SGLANG_SUBCTX_INDEX=1`），否則 import 時就報錯 |
-| `SGLANG_SUBCTX_INDEX` | `1` | 掃描比對 + sparse prefill |
+| `SGLANG_SUBCTX_INDEX` | `1` | 前綴比對 + 掃描比對 + sparse prefill，整條存成一條鏈 |
 | `SGLANG_SUBCONTEXT_ROTATE` | `1` | 位移的命中用 RoPE 旋轉搬到正確位置。開了 index 卻沒開旋轉會拒絕啟動 |
 | `SGLANG_DISABLE_SUBCONTEXT` | **不要設** | 設了就整個關掉，退回原生 radix cache（上面三個也一併失效） |
 
@@ -91,8 +95,8 @@ python -u -m sglang.launch_server \
 |---|---|---|
 | `SGLANG_SUBCTX_CDC_TARGET` | 256 | 平均 chunk 長度，會無條件捨去到 2 的冪 |
 | `SGLANG_SUBCTX_CDC_MAX` | 1024 | 強制切點的長度上限，應明顯大於 target |
-| `SGLANG_SUBCTX_MIN_CHUNK` | 64 | 最短 chunk。比它短的區塊不寫入快取、每次重算；索引的下限是 32（指紋視窗就是 32 個 token），設更低時索引仍以 32 計 |
-| `SGLANG_SUBCONTEXT_CACHE_OUTPUT` | 1 | 結束時把生成的 token 接在最後一塊後面存進快取（cdc 模式下實際上不會成立，見下方「已知限制」） |
+| `SGLANG_SUBCTX_MIN_CHUNK` | 64 | 最短 chunk，也是 cdc 切點的最小間距。比它短的區塊照樣隨整條鏈存進快取，但不登記索引（位置變了就找不回來）；索引的下限是 32（指紋視窗就是 32 個 token），設更低時索引仍以 32 計 |
+| `SGLANG_SUBCONTEXT_CACHE_OUTPUT` | 1 | 只用在 `on` / `rot`（逐 namespace）；cdc 的回覆隨整條鏈存，不看這個開關 |
 
 Selective recompute（重算一部分重用的 token，修正「在別的前文下算出來」造成的誤差）：
 
@@ -139,6 +143,9 @@ speculative decoding、torch.compile、回傳 hidden states、LoRA。
 - `--page-size` 大於 1（預設就是 1，不要動）
 - `--speculative-algorithm EAGLE`（它把 radix key 改寫成 bigram）
 - `--enable-piecewise-cuda-graph`（預設是關的）
+- `--enable-mixed-chunk`（預設是關的；它把 decode 的 token 接進 prefill batch，sparse prefill 給的位置只涵蓋 prefill 的 token）
+- `--enable-pdmux`（PD multiplexing 的 forward 跑在自己的 stream 上，旋轉的複製排不到它後面）
+- diffusion LLM（`--dllm-algorithm`）、prefill/decode 分離（`--disaggregation-mode`）：那兩條排程路徑不會放掉被拒請求掃描時拿的鎖與副本
 - `--kv-cache-dtype fp8_*`（KV 本身被量化，旋轉要先解量化）
 - sliding-window attention 的模型（它從前綴長度推每個 key 的絕對位置，有洞的 prefill 沒有那個長度）
 - hybrid SWA / mamba 類模型（例如 Qwen3-Next、Qwen3.5 系列）：它們用的是另一種 prefix cache，連切分都不支援
@@ -167,6 +174,7 @@ curl -s http://HOST:30000/server_info \
   "cache_output": true,
   "hash_keys": true,
   "index": true,
+  "chain_storage": true,
   "index_dryrun": false,
   "min_chunk": 64,
   "split_mode": "cdc",
@@ -180,6 +188,7 @@ curl -s http://HOST:30000/server_info \
 ```
 
 `pid` 用來分辨「剛啟動的這個 server」和「還佔著 port 的舊 server」。
+`chain_storage` 沒有這個欄位（或是 false）的 server，跑的是 2026-10-05 以前的舊存法。
 
 repo 裡有現成的檢查腳本，對不上會 refuse 並說明差在哪：
 
@@ -201,18 +210,17 @@ grep "sub-context index:" server.log | tail -1
 ```
 
 ```
-sub-context index: N chunks, M queries, X prompt tokens | reused Y (Z% of prompt),
-W of them rotated into place | K requests too big for one pass
+sub-context index: N chunks, M queries, X prompt tokens | matched P prompt tokens: prefix A (a%),
+scan found B (b%), W of them rotated into place | K requests too big for one pass, R refused for room
 ```
 
-- `Z%` 是重用率。
-- `W` 是其中靠旋轉撿回來的量 — 這些是原生 radix cache 結構上拿不到的。
-- `K` 是退回連續前綴那條路的 request 數。
+- `a%` 是從頭比對到的部分（原生 radix cache 也拿得到）。
+- `b%` 是掃描找到的部分 — 原生 radix cache 結構上拿不到的；`W` 是其中靠旋轉撿回來的量。
+- `K` 是放不進一次 prefill、退回只用前綴的 request 數；`R` 是沒空間被拒、之後只用前綴的 request 數。
 
-**這行只拿來確認「有在運作」，不要當成報告數字。** 排隊中的請求每一輪排程都會重新掃描一次
-（`scheduler.py` 對每個等待中的請求呼叫 `init_next_round_input`），排不進去的下一輪再掃、再累加，
-所以負載高時 `M`、`Y`、`K` 都會偏高。報告用的命中率請用 `SGLANG_FORWARD_TRACE` 的逐 pass 紀錄，
-或 client 端每個請求的 `usage.prompt_tokens_details.cached_tokens`（需要 `--enable-cache-report`）。
+`P`、`A`、`B`、`K` 是每個請求在真的執行時算一次（被拒、排隊重新比對的那幾次不算），4090 smoke 中與 client 端
+每個請求的 `usage.prompt_tokens`、`usage.prompt_tokens_details.cached_tokens` 加總完全一致（需要 `--enable-cache-report`）。
+開頭的 `M`、`X` 仍是每次掃描都算，負載高時會偏高。報告用的數字仍建議用 client 端的 `cached_tokens` 或 `SGLANG_FORWARD_TRACE`。
 
 `K` 偏高表示很多 request 的「待算 token 數」超過一個 prefill pass 的預算（有洞的 prefill 不能切成多段）。
 這時把 `--chunked-prefill-size` 調大（24GB 的卡預設只有 2048）。代價是 activation memory 變多、KV cache 變小，
@@ -222,16 +230,13 @@ W of them rotated into place | K requests too big for one pass
 
 ## 已知限制
 
-- **短於 `SGLANG_SUBCTX_MIN_CHUNK` 的區塊永遠不寫入快取。** cdc 在每則訊息開頭都切，所以很短的訊息
-  （例如短的終端機輸出）會自成一塊，之後每一輪都重算。Terminal-Bench 上這是 cdc 命中率低於原生 radix cache
-  的主要原因（2026-10-02 初步估計每請求約 370 token）。
-- **cdc 模式下生成的 token 不會進快取。** 不是因為生成的 token 短，而是因為它們要接的那一塊：
-  - 存輸出的條件是「整個 prompt 都已寫進樹」，然後把生成的 token 接在 prompt 最後一塊後面存進去。
-  - prompt 最後是 generation prompt（`<|im_start|>assistant\n`，3 個 token）。cdc 在每個 `<|im_start|>` 前都切，
-    所以它自成一塊，短於 `MIN_CHUNK`，永遠不寫入 → 條件永遠不成立 → 生成的 token 直接被釋放。
-  - 就算放寬這個條件，存下來的輸出也不會登記進索引；下一輪的回覆是一則新的 assistant 訊息，cdc 依內容雜湊
-    找區塊，找不到它。所以每一輪模型的回覆都要重算（blocks 模式沒有這個問題：最後一塊是整段 `messages`）。
-- **開了 selective recompute 時，重用的區塊不會以新位置寫回快取**，所以位移過一次的內容之後每個請求都要再旋轉一次。
+- **短於 `SGLANG_SUBCTX_MIN_CHUNK` 的區塊不登記索引。** 它們在鏈上、從頭比對拿得到，但位置一變（例如前面的
+  歷史被省略）就找不回來。
+- **開了 selective recompute 時，重算過的副本會隨整條鏈存回去**，下一輪從頭比對到時當成精確前綴直接用，不再重算。
+- **位置相同也要複製一份**，GPU 記憶體用量跟原生 radix cache 一樣。
+- **開了 selective recompute 時，要求 logprob 的請求只用前綴比對**（重算會改掉 logprob 對齊用的列）。
+- 2026-10-05 以前的版本（每塊一個 namespace）有兩個已解決的問題：短訊息不寫入、模型回覆不進快取，
+  Terminal-Bench 上 cdc 命中率因此低於原生 radix cache。2026-10-05 以前量到的 cdc 數字都是那個版本的。
 
 ---
 

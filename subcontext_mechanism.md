@@ -1,6 +1,6 @@
 # Sub-context KV 重用：機制說明
 
-這份文件講的是這個 fork（`idx` 分支，依 2026-10-02 的程式碼）的 sub-context KV 重用機制：
+這份文件講的是這個 fork（`idx` 分支，依 2026-10-05 的程式碼）的 sub-context KV 重用機制：
 怎麼切塊、怎麼找到可重用的 KV、位置不同時怎麼旋轉、怎麼只算空洞、怎麼重算一部分重用的 token、
 算完怎麼寫回快取與釋放，以及為什麼是這樣寫的。怎麼啟動 server 見 `README_CDC.md`。
 
@@ -10,12 +10,12 @@
 |---|---|
 | `entrypoints/openai/serving_chat.py` | 切塊（blocks / cdc）、錄製請求 |
 | `managers/tokenizer_manager.py`、`managers/io_struct.py` | 驗證切塊與 input_ids 一致、自動截斷後裁齊、往下傳 |
-| `managers/scheduler.py` | 啟動檢查、掛上旋轉器與索引 |
-| `managers/schedule_batch.py` | 讀路徑：stitch 與 scan、旋轉副本的生命週期、sparse prefill 的輸入 |
+| `managers/scheduler.py` | 啟動檢查、掛上旋轉器與索引；沒被收進這一輪的請求放掉掃描結果 |
+| `managers/schedule_batch.py` | 讀路徑：stitch 與 scan、旋轉/複製副本的生命週期、sparse prefill 的輸入 |
 | `managers/schedule_policy.py` | `PrefillAdder`：Stage 2 切 chunk、sparse prefill 不可切、probe 預算 |
-| `mem_cache/radix_cache.py` | 寫路徑：逐 namespace 插入、finish 的搶救與釋放、audit |
-| `mem_cache/rotate_kv.py` | Triton 旋轉 kernel、啟動時的 RoPE 性質自測 |
-| `mem_cache/subctx_index.py` | 內容索引（依 token 內容找已快取的區塊）、CDC 切點 |
+| `mem_cache/radix_cache.py` | 寫路徑：逐 namespace 插入（`on`/`rot`）、鏈式請求的登記與 chunk 位置維護（`idx`/`cdc`）、finish 的搶救與釋放、audit |
+| `mem_cache/rotate_kv.py` | Triton 旋轉 kernel、KV 複製、啟動時的 RoPE 性質自測 |
+| `mem_cache/subctx_index.py` | 內容索引（依 token 內容找已快取的區塊、記錄它們在樹上的位置）、CDC 切點 |
 | `mem_cache/subctx_blend.py` | selective recompute：打分、挑選、寫回 |
 | `mem_cache/common.py` | sparse prefill 的 `req_to_token` 寫入、重算 token 的額外 slot |
 | `layers/attention/triton_backend.py`、`triton_ops/extend_attention.py` | 依 query 絕對位置的 causal 遮罩 |
@@ -40,8 +40,10 @@
 1. **切塊 + namespace**（arm `on`）：把 prompt 切成幾塊，每塊放進自己的 namespace（radix tree 裡以
    `extra_key` 區隔、彼此不共用的子樹），各自查詢。前一塊變了，後一塊仍可能命中。
 2. **旋轉**（arm `rot`）：同一塊內容出現在不同位置時，把快取的 K 轉到新位置再用。
-3. **內容索引 + sparse prefill**（arm `idx`、`cdc`）：不要求從開頭連續命中，在 prompt 的**任何位置**
-   找已快取的區塊，只計算中間的空洞。`cdc` 再把切點改成依內容決定，不依角色。
+3. **內容索引 + sparse prefill**（arm `idx`、`cdc`）：先照原生 radix cache 從頭比對；比不到的部分，
+   再用內容索引在 prompt 的**任何位置**找已快取的區塊，複製到自己的格子（位置不同就旋轉），只計算中間的空洞。
+   算完整條照原生方式存回樹（一條從位置 0 開始的鏈），新存上樹的區塊登記進索引、記下它在樹上的位置。
+   `cdc` 再把切點改成依內容決定，不依角色。
 4. **selective recompute**（arm `idx@r`、`cdc@r`）：重用的區塊是在別的前文下算的，挑出 key 偏差最大的
    比例 r 重算，修正品質。
 
@@ -73,20 +75,20 @@ R(p_new) · f(k_raw) == R(p_new − p) · k_cached[loc]
 | `off` | `SGLANG_DISABLE_SUBCONTEXT=1` | 不切塊，原生 radix cache |
 | `on` | （全部不設） | blocks 切塊 + stitch；位置不對的命中丟掉 |
 | `rot` | `SGLANG_SUBCONTEXT_ROTATE=1`、`SGLANG_SUBCONTEXT_ROTATE_ACROSS=1` | stitch + Stage 1 + Stage 2 旋轉 |
-| `idx[@r]` | `ROTATE=1`、`SGLANG_SUBCTX_INDEX=1`、`SGLANG_SUBCTX_TOPK_RATIO=r` | blocks 切塊 + scan + sparse prefill |
-| `cdc[@r]` | `ROTATE=1`、`INDEX=1`、`SGLANG_SUBCTX_SPLIT=cdc`、`TOPK_RATIO=r` | 依內容切塊 + scan + sparse prefill |
+| `idx[@r]` | `ROTATE=1`、`SGLANG_SUBCTX_INDEX=1`、`SGLANG_SUBCTX_TOPK_RATIO=r` | blocks 切塊；前綴比對 + scan + sparse prefill；整條存成一條鏈 |
+| `cdc[@r]` | `ROTATE=1`、`INDEX=1`、`SGLANG_SUBCTX_SPLIT=cdc`、`TOPK_RATIO=r` | 依內容切塊；其餘同 `idx` |
 
 ### 全部環境變數
 
 | 環境變數 | 預設 | 作用 |
 |---|---|---|
 | `SGLANG_DISABLE_SUBCONTEXT` | 空 | 非 0：chat 不切塊、不做啟動檢查、不掛旋轉器與索引（即使其他開關有設） |
-| `SGLANG_SUBCONTEXT_CACHE_OUTPUT` | **1** | 結束時把「最後一塊 ++ 生成的 token」存進最後一塊的 namespace |
+| `SGLANG_SUBCONTEXT_CACHE_OUTPUT` | **1** | 結束時把「最後一塊 ++ 生成的 token」存進最後一塊的 namespace（只用在逐 namespace 的 `on`/`rot`；`idx`/`cdc` 的回覆隨整條鏈存） |
 | `SGLANG_SUBCONTEXT_ROTATE` | 空 | Stage 1：stitch 時旋轉位移的命中；finish 時就地旋轉 |
 | `SGLANG_SUBCONTEXT_ROTATE_ACROSS` | 空 | Stage 2：prefill chunk 切在 block 邊界，下一輪旋轉接上（也會掛上旋轉器） |
 | `SGLANG_SUBCONTEXT_ROTATE_NATIVE` | 空 | 用純 torch 旋轉取代 Triton kernel（除錯） |
 | `SGLANG_SUBCTX_HASH_KEYS` | 空 | namespace 改用內容雜湊命名，仍走 stitch |
-| `SGLANG_SUBCTX_INDEX` | 空 | scan 路徑 + sparse prefill（隱含內容雜湊命名） |
+| `SGLANG_SUBCTX_INDEX` | 空 | 鏈式儲存：前綴比對 + scan + sparse prefill，存回時登記索引（隱含內容雜湊命名） |
 | `SGLANG_SUBCTX_INDEX_DRYRUN` | 空 | 只統計 scan 能找到什麼，服務仍走 stitch |
 | `SGLANG_SUBCTX_MIN_CHUNK` | 64 | 索引登記與重用的最短長度；也是 cdc 切點的最小間距 |
 | `SGLANG_SUBCTX_SPLIT` | `blocks` | `blocks`（依角色）或 `cdc`（依內容） |
@@ -128,25 +130,27 @@ R(p_new) · f(k_raw) == R(p_new − p) · k_cached[loc]
 **GPU 上的 bytes 不帶身分。** 一個 slot 是誰的，完全由「誰指向它」決定。
 這句話是後面所有規則的來源。
 
-內容索引（`SubContextIndex`）是第五份狀態，但它只存 token id 和 chunk id，不存 KV 也不存位置；
-KV、它在不在、它的位置都還是由 radix tree 決定，兩者可能暫時不一致（見第 7 節）。
+內容索引（`SubContextIndex`）是第五份狀態：存 token id、chunk id，以及每個 chunk 在樹上的位置
+（「持有它最後一個 token 的節點 + 它第一個 token 的位置」，可以有好幾個，最早的優先）。不存 KV；
+KV 在不在還是由 radix tree 決定。樹拆節點、淘汰節點時同步更新位置（見第 7 節）。
 
 ### request 身上的欄位（`Req.__init__`）
 
 | 欄位 | 意思 | 誰寫 |
 |---|---|---|
-| `sub_context_ids` / `sub_context_extra_keys` | 每塊的 token 與 namespace；`concat(ids) == origin_input_ids` | 切塊；scan 會重新切 |
-| `sub_context_ids_as_sent` | 收到時的原始切法 | 建構時；scan 每次從它重切 |
+| `sub_context_ids` / `sub_context_extra_keys` | 每塊的 token 與 namespace；`concat(ids) == origin_input_ids` | 切塊（scan 設回收到時的切法） |
+| `sub_context_ids_as_sent` | 收到時的原始切法；鏈式儲存登記索引時的區塊邊界 | 建構時 |
 | `sub_context_match_nodes/_indices/_positions/_lens` | 排程時查到的 node、slot、canonical、命中長度 | stitch（scan 只留 node） |
-| `sub_context_owned_lens[i]` | 第 i 塊已經被算進 prefix 或已插入的長度 | stitch / scan → 每個 chunk 更新 |
+| `sub_context_owned_lens[i]` | 第 i 塊已經被算進 prefix 或已插入的長度 | stitch → 每個 chunk 更新 |
 | `sub_context_tree_owned[i]` | 第 i 塊**現在是不是樹的** | 只有寫入那趟寫 |
 | `sub_context_tree_canonical[i]` | 樹把第 i 塊登記在哪個位置 | 同上 |
 | `sub_context_last_nodes` | 寫入時上鎖的各 namespace node | 寫入；finish 釋放 |
-| `sub_context_rotated_slots` | 自己 alloc 的旋轉副本，**還沒交給 `req_to_token`** | stitch / scan / append |
+| `sub_context_rotated_slots` | 自己 alloc 的旋轉／複製副本，**還沒交給 `req_to_token`** | stitch / scan / append |
 | `sub_context_next_boundary` | Stage 2 要把 chunk 切在哪 | stitch |
-| `sub_context_layout` / `_layout_ours` | scan 的稀疏配置 `(start, end, slots)`，以及該段是否為旋轉副本 | scan |
-| `sub_context_no_insert[i]` | 第 i 塊兩條寫入路徑都跳過 | scan |
-| `sub_context_source_key[i]` | 第 i 塊的 slot 實際在哪個 namespace（只重用一部分時） | scan |
+| `sub_context_layout` / `_layout_ours` | scan 的稀疏配置 `(start, end, slots)`，以及該段是否為自己的副本；第一段可能是從頭比對到的前綴 | scan |
+| `sub_context_exact_len` | 從頭比對到的前綴長度；這段是精確的，selective recompute 不打分 | scan |
+| `sub_context_index_declined` | 沒空間被拒、又沒有其他請求在跑；之後只用前綴比對 | scheduler |
+| `sub_context_no_insert[i]` / `sub_context_source_key[i]` | 舊 scan 留下的欄位：逐 namespace 的寫入路徑還會讀，但現在沒有路徑會設成非 None | — |
 | `sub_context_discarded/_moved/_rotated/_reinserted` | 給 forward trace 的計數，讀完歸零 | 各路徑 |
 | `cache_protected_len` | 從 0 起連續被樹擁有的長度（上游欄位的有損投影） | 每階段重算 |
 
@@ -223,8 +227,11 @@ mrope 餵純量位置時**會通過**自測（它就是 plain RoPE），真正�
 | `--attention-backend triton` | 只有 triton 的 kernel 收 per-position 遮罩；其他 backend 以索引判斷 causal |
 | 不是 sliding-window attention | 它從前綴長度推每個 key 的絕對位置，有洞的 prefill 沒有那個長度 |
 | 沒有 `--enable-piecewise-cuda-graph` | 它 capture prefill 的形狀，而稀疏 prefill 的遮罩每個請求大小不同 |
+| 沒有 `--enable-mixed-chunk` | 它把 decode 的 token 接進 prefill batch，而 sparse prefill 給的位置只涵蓋 prefill 的 token |
 
 另外：**開了 index 卻沒有旋轉器就拒絕啟動**——位置不同的區塊會全部被丟掉，index 就沒有意義。
+**開了 index 又開 diffusion LLM 或 prefill/decode 分離也拒絕**：那兩條排程路徑不會放掉被拒請求 scan 拿的鎖與副本（第 7-4 節）。
+**開了旋轉又開 `--enable-pdmux` 也拒絕**：PD multiplexing 的 forward 跑在自己的 stream 上，旋轉的複製排不到它後面。
 
 ### 3-4 selective recompute 能不能做（`topk_unsupported_reason`，ratio > 0 時）
 
@@ -247,20 +254,24 @@ mrope 餵純量位置時**會通過**自測（它就是 plain RoPE），真正�
 1. 切塊（serving_chat）      chat request → 幾個 block，各帶一個 namespace            ← 第 5 節
 2. 查找（init_next_round_input）
    ├─ stitch（on / rot）     逐 namespace 查詢，只接受從位置 0 起連續的命中        ← 第 6 節
-   └─ scan（idx / cdc）      用內容索引在任何位置找，放不進一次 prefill 就退回 stitch ← 第 7 節
-3. PrefillAdder             Stage 2 把 chunk 切在 block 邊界；有洞的 prefill 不可切
+   └─ scan（idx / cdc）      先從頭比對，其餘用內容索引在任何位置找、複製進自己的格子 ← 第 7 節
+3. PrefillAdder             Stage 2 把 chunk 切在 block 邊界；有洞的 prefill 不可切；
+                            沒收進這一輪的 scan 請求放掉鎖與副本                    ← 第 7-4 節
 4. prepare_for_extend       prefix → req_to_token，責任交接；sparse 時依位置取輸入  ← 第 8 節
 5. prefill                  算 KV 並產生第一個 token；ratio > 0 時兩段 layer          ← 第 8、9 節
-6. cache_unfinished_req     逐塊插入樹、登記索引                    ← 每個 chunk 跑一次 ← 第 10 節
+6. cache_unfinished_req     on/rot：逐塊插入；idx/cdc：整條插入、登記新存的區塊      ← 第 10、7-5 節
    └─ append                Stage 2
 7. decode                   一個一個吐 token
-8. cache_finished_req       搶救 → 存回覆 → 還鑰匙                                   ← 第 11 節
+8. cache_finished_req       on/rot：搶救 → 存回覆 → 還鑰匙；idx/cdc：整條插入（含回覆）← 第 11、7-5 節
 ```
 
 其中第 6 步**不是每個 request 都會跑**（見第 14 節）。
 
-三個地方共用同一個判斷 `serves_sub_contexts(req)`（= `req.has_sub_contexts and cache.supports_sub_contexts()`）：
-第 2 步的查找、第 6 步、第 8 步。三處必須一致，否則一個 request 會用一條路讀、用另一條路寫。
+兩個判斷，三個地方（第 2、6、8 步）都用同一套，必須一致，否則一個 request 會用一條路讀、用另一條路寫：
+
+- `chains_sub_contexts(req)`：開了 `INDEX`、有索引、request 有切塊、cache 支援 → 走第 7 節的鏈式路徑，
+  寫入走上游的整條插入。
+- `serves_sub_contexts(req)`（= 有切塊、cache 支援、且不是上一種）→ 走逐 namespace 的路徑。
 
 ---
 
@@ -301,8 +312,9 @@ mrope 餵純量位置時**會通過**自測（它就是 plain RoPE），真正�
    同樣的內容不論出現在哪裡都切在同樣的地方。
 3. namespace 先給佔位名 `cdc_0, cdc_1, …`，`Req.__init__` 會換成內容雜湊（cdc 一定搭配內容雜湊）。
 
-兩個後果（見第 15 節）：短於 `MIN_CHUNK` 的訊息自成一塊、永遠不寫入；prompt 最後的
-generation prompt（`<|im_start|>assistant\n`，3 個 token）也自成一塊。
+短於 `MIN_CHUNK` 的訊息、prompt 最後的 generation prompt（`<|im_start|>assistant\n`，3 個 token）
+都自成一塊。鏈式儲存下它們照樣隨整條鏈存進樹、從頭比對拿得到，只是不登記進索引——
+位置變了就找不回來。（舊的逐塊儲存下它們永遠不寫入，見第 15 節。）
 
 ### 5-4 namespace 怎麼命名
 
@@ -313,6 +325,9 @@ generation prompt（`<|im_start|>assistant\n`，3 個 token）也自成一塊。
 
 `chunk_id` 把 token 以 int32 雜湊，再接上 `extra_key`（cache_salt + LoRA id）。
 **角色名不含 `extra_key`**：不同 cache_salt / LoRA 的請求會共用同一個角色 namespace（見第 15 節）。
+
+`idx` / `cdc` 走鏈式儲存，樹裡**不用**這些名稱：整條存在 `req.extra_key`（cache_salt + LoRA id）底下，
+跟 `off` 一樣；`chunk_id` 只當索引裡的 chunk 編號。
 
 ### 5-5 往下傳
 
@@ -410,54 +425,108 @@ last_node = root_node              # scheduler 的單一 node 鎖變成空操作
 
 ---
 
-## 7. scan（內容索引，`idx` / `cdc`）
+## 7. scan 與鏈式儲存（`idx` / `cdc`）
+
+這兩個 arm 的 request 讀寫都**像原生 request 一樣**：在樹裡存成一條從位置 0 開始的鏈，放在
+`req.extra_key`（cache_salt + LoRA id）底下。內容索引只負責「從頭比對斷掉之後，後面還有哪些已快取的區塊、
+它們在樹上哪裡」。（2026-10-05 起；之前是每塊一個內容雜湊 namespace，見 git 歷史。）
 
 ### 7-1 索引
 
-`SubContextIndex`（`subctx_index.py`）只存「哪些 token 序列被寫進過快取」：
+`SubContextIndex`（`subctx_index.py`）記「哪些 token 序列存在樹上的哪裡」：
 
-- **登記**：每個 block 被插入它的 namespace 時（第 10 節），連同 `req.extra_key` 登記；短於 `MIN_CHUNK` 的不登記。
-  chunk id 就是第 5-4 節的 `chunk_id`，所以它同時是那塊在 radix tree 裡的 namespace。
-- **移除**：eviction 淘汰掉某個 namespace 的第一個 node（父節點是 root）時，從索引移除那個 chunk。
+- **登記**：request 存回樹之後，新存上樹的區塊（第 7-5 節）連同 `req.extra_key` 登記；短於 `MIN_CHUNK` 的不登記。
+  每筆記 token、開頭 32 token 的指紋，以及**位置**：持有最後一個 token 的節點 + 第一個 token 的位置。
+- **多個位置**：同一段內容存在好幾條鏈上時，每條都記一筆，**最早的優先**——讀的是最初算出來的那份，
+  一次旋轉就到位；後來的（多半是複製、旋轉過的副本）只在前面的被淘汰後才用（`chain_chunk_slots`，
+  `radix_cache.py` L409）。
 - **範圍**：每個 `extra_key` 一個範圍，掃描只看自己的範圍——不同 cache_salt / LoRA 互相看不到。
 - **掃描**：對 prompt 每個位置算「從這裡開始 32 個 token」的指紋（一次向量化算完），先用 Bloom filter
   （快速排除一定沒登記的位置的位元表）過濾，再查「chunk 開頭指紋 → chunk」表，最後逐 token 比對確認。
-  回傳所有出現（可重疊）。
+  回傳所有出現（可重疊）。新 request 自己怎麼切塊跟比對無關。
 - **挑選**：從可能重疊的命中裡，挑出互不重疊、總長最大的一組。
 
-索引和樹可能暫時不一致（索引說有、樹裡已被部分淘汰），所以每個命中都還要回樹裡確認。
+### 7-2 `_scan_sub_contexts` 的步驟（`schedule_batch.py` L1306）
 
-### 7-2 `_scan_sub_contexts` 的步驟
+1. 放掉上一輪的鎖與副本，清掉上一輪的配置。
+2. **從頭比對**：跟原生 request 一樣 `match_prefix(fill_ids[:max_prefix_len], req.extra_key)`，
+   得到前綴長度 `exact`、`last_node`（之後由 `PrefillAdder` 上鎖，跟原生一樣）、`cache_protected_len = exact`。
+3. **掃描剩下的部分**：`index.scan(fill_ids, extra_key)`；每個命中裁到「`exact` 之後、`max_prefix_len` 之前」
+   （prefill 至少要算最後一個 token），裁完短於 `MIN_CHUNK` 的丟掉。`index.select` 挑出不重疊的組合。
+   被標成 `sub_context_index_declined` 的 request 跳過這一步（第 7-4 節）；開了 selective recompute 時，
+   要求 logprob 的 request 也跳過（重算後的列數會讓 logprob 的對齊跑掉）。
+4. **找位置、上鎖**：`chain_chunk_slots(cid)` 從位置節點往上走父節點，湊出 `[start, end)` 的格子；
+   位置失效（節點已淘汰、範圍對不上）就丟掉那筆位置，全失效就整段重算（記入 `discarded`）。
+   `Δ = 命中位置 − 當初的位置`；`Δ` 超出旋轉範圍的段在這裡就丟掉（記入 `moved`、`discarded`），不上鎖。
+   其餘的段對它的節點 `inc_lock_ref`（連同所有祖先）。
+5. **先算放不放得進一次 prefill**（第 7-3 節）：放不下就放鎖、只用前綴，不淘汰也不複製。
+6. 前綴節點也暫時上鎖，為所有副本先 `evict` 出空間，再放開前綴的鎖。
+7. **一律複製到自己的格子**（`_copy_sub_context_run`）：`Δ ≠ 0` 旋轉，`Δ == 0` 原樣複製
+   （`KVRotator.copy_into`）。即使位置一樣也要複製：鏈必須擁有自己的格子，一個格子不能屬於兩個節點。
+   pool 滿就放鎖、整段重算。
+   overlap 排程下，上一個 forward 可能還在 forward stream 上寫這些格子（chunked prefill 的中間 chunk、剛結束請求的最後幾個 token），
+   所以旋轉與複製的 kernel 直接在 forward stream 上執行（`KVRotator.launch_stream`）：排在進行中的 forward 之後、下一個 forward 之前，
+   default stream 不多任何依賴，`prepare_for_extend` 之後的同步複製也就不會讓 CPU 等前一個 forward。
+   用到的 index tensor 以 `record_stream` 留給 forward stream。不開 overlap 時 forward 本來就在 default stream，照舊在那裡執行。
+8. **輸出**：
+   - 沒找到任何段 → 跟原生 request 完全一樣（`sub_context_layout = None`）。
+   - 找到 → `sub_context_layout = [(0, exact, 前綴格子)] + [(start, end, 副本格子), …]`，
+     `sub_context_exact_len = exact`；`prefix_indices` 是所有段的格子串接。
 
-1. 放掉上一輪的鎖與旋轉副本，回到原始切法（`sub_context_ids_as_sent`）。
-2. `index.scan(fill_ids, extra_key)`；每個命中裁到「最後一個 token 之前、prompt 之內」
-   （被 retract 的 request 的 `fill_ids` 後面還有它自己的輸出），裁完太短的丟掉。
-3. `index.select` 挑出不重疊的組合；每段到它的 namespace 查樹：
-   - 樹裡已不完整（被部分淘汰）→ 整段重算，記入 `discarded`。
-   - 否則**上鎖**，算 `Δ = 命中位置 − canonical`。
-4. 為所有需要旋轉的段先 `evict` 出足夠空間——此時所有段都已上鎖，淘汰不會打到它們。
-5. `Δ == 0` 直接用樹的格子；`Δ ≠ 0` 複製到新格子並旋轉。旋轉失敗（超出範圍、pool 滿）就放掉鎖、整段重算。
-6. **重新切塊**（`_resplit_for_sub_context_matches`）：在每段重用的起訖點切，原始切點不在某段內部的也保留，
-   每塊的 namespace 重算為內容雜湊。於是「重用的段」各自成為一塊。
-7. 逐塊設定：
-   - 新算的塊：短於 `MIN_CHUNK` 的標 `no_insert`（不值得一個 namespace）。
-   - 重用的塊：若被裁過（只用到 chunk 的前一部分），標 `no_insert`，並記下 slot 實際所在的 namespace
-     （`sub_context_source_key`），給 finish 的釋放路徑用。
-   - 開了 selective recompute：**所有重用的塊**都標 `no_insert`——其中一部分 token 會被重算，跟快取裡的不再相同。
-8. 輸出：`sub_context_layout = [(start, end, slots), …]`；`prefix_indices` 是所有重用段的 slot 串接；
-   `cache_protected_len` 是從 0 起連續的重用長度；`last_node` 設成 root。Stage 2 不用在這條路徑。
+### 7-3 放不進一次 prefill → 只用前綴
 
-### 7-3 放不進一次 prefill → 退回 stitch
+有洞的 prefill **不能切成多個 chunk**。檢查「要算的 token 數 ≤ `--chunked-prefill-size`」做兩次：
+複製之前用找到的段長先算一次（`_fits_one_pass`），放不下就不複製；複製之後再算一次
+（`_sub_context_layout_fits_one_pass`），因為 pool 滿而沒複製成的段會讓要算的變多。任一次放不下都記一次 `fell_back`，
+放掉段的鎖與副本，退回只用前綴（之後照原生 chunked prefill）。放得下但這一輪預算不夠的，`PrefillAdder` 回 `OTHER` 讓它等。
 
-有洞的 prefill **不能切成多個 chunk**（每個 chunk 都假設前面是連續的前綴）。
-`_sub_context_layout_fits_one_pass` 檢查「要算的 token 數 ≤ `--chunked-prefill-size`」；
-放不下就記一次 `fell_back`，放掉 scan 拿的鎖與副本，改走 stitch。
-放得下但這一輪預算不夠的，`PrefillAdder` 回 `OTHER` 讓它等下一輪，不會把它切開。
+### 7-4 沒被收進這一輪的請求
 
-### 7-4 dry run（`SGLANG_SUBCTX_INDEX_DRYRUN`）
+`init_next_round_input` 在排程迴圈裡對每個排到的等待請求都會跑一次，scan 在這時就拿了鎖、配了副本。
+請求若沒被收進這一輪（`add_one_req` 回非 `CONTINUE`、且它不在 `can_run_list` 裡——adder 收進一個請求後
+預算剛好用完也會回 `NO_TOKEN`/`OTHER`，那種不算），`scheduler.py` L2257 呼叫
+`release_sub_context_scan`（`schedule_batch.py` L1091）：放掉段的鎖、還掉副本。下一輪重新 scan。
 
-照常走 stitch，另外跑一次 scan 只統計：找到多少、仍在快取多少、其中位置不同的多少、
-超出 stitch 前綴多少。不改 request 狀態，但查樹會更新節點的存取時間（影響 LRU）。
+**沒空間的卡死**：段的鎖會把來源節點到 root 的整條路徑都釘住，加上副本，可能讓 adder 的剩餘額度不夠，
+回 `NO_TOKEN`；下一輪重 scan 結果一樣。所以當「`NO_TOKEN`、沒有請求在跑、沒有 chunked 請求、這一輪也沒收進任何請求」
+時，這個請求標成 `sub_context_index_declined`，之後只用前綴比對（記入 `no_room`）；這一輪**不**設
+`batch_is_full`，否則沒有請求在跑時 scheduler 不會再排 prefill，前綴重試永遠不會發生。
+
+離開等待隊列的其他三條路（`abort_request`、`_abort_on_waiting_timeout`、優先序擠掉）也都呼叫
+`release_sub_context_scan`。
+
+### 7-5 存回樹與登記（`_register_chain`，`radix_cache.py` L539）
+
+`serves_sub_contexts` 對鏈式請求回 False，所以 `cache_unfinished_req` / `cache_finished_req` 走**上游的整條插入**：
+`insert(fill_ids, req_to_token 那一列)`；樹已經有的部分（`prefix_len`）照上游規則把自己的重複格子還掉。
+插入之後：
+
+- **登記新存上樹的區塊**：區塊邊界用 request 收到時的切法（`sub_context_ids_as_sent`）；結束長度
+  `> prefix_len`（含有這次新存的 token）且 ≥ `MIN_CHUNK` 的才登記，位置是這條鏈上持有它最後一個 token 的節點。
+  從別處複製進來的段也在其中——同一段內容因此多一筆位置（排在原本的後面）。
+- **結束時**（`cache_finished_req`，`final=True`）：最後一塊延伸到生成的最後一個 token，再依切塊模式重切
+  （`cdc` 用 `cut_points`，`blocks` 當一塊）——所以 generation prompt 和模型的回覆一起登記。
+- `cache_unfinished_req` 插入後放掉 scan 拿的段的鎖（副本已經寫好，交給鏈了）。
+
+開了 selective recompute 時，副本裡有一部分 token 是重算過的；它們照樣隨鏈存進樹，之後的 request
+從頭比對到時當成精確前綴直接用，不再重算（這是設計上的選擇：鏈不能有洞，停在第一個借來的段會丟掉它後面的所有內容）。
+
+### 7-6 位置的維護
+
+| 事件 | 做什麼 | 在哪 |
+|---|---|---|
+| 節點被拆開（`_split_node`） | 最後一個 token 落在新的上半節點的位置，改指上半節點（格子號碼本來就不變） | `_rehome_chunks`，L502 |
+| 節點被淘汰 | 丟掉以它為位置的那幾筆；一個 chunk 的位置全丟光就從索引移除 | `_forget_chunks_at`，L528 |
+| `reset()`（flush cache） | 清空位置表與索引 | L382 |
+| 讀取時發現位置失效 | 丟掉那一筆，換下一筆 | `chain_chunk_slots` |
+
+`_chunks_at`（節點 id → 以它為位置的 chunk）是反查表，讓拆節點和淘汰不必掃整個索引。
+開 `SGLANG_SUBCTX_AUDIT` 時，每次讀取還會逐 token 比對位置上的內容（`SUBCTX-CHAIN-MISMATCH`）。
+
+### 7-7 dry run（`SGLANG_SUBCTX_INDEX_DRYRUN`）
+
+不開 `INDEX`、只開 `DRYRUN` 時照常走逐 namespace 的 stitch，另外跑一次 scan 只統計：找到多少、仍在快取多少、
+其中位置不同的多少、超出 stitch 前綴多少。不改 request 狀態，但查樹會更新節點的存取時間（影響 LRU）。
 
 ---
 
@@ -502,10 +571,13 @@ req.sub_context_rotated_slots = None     # 責任移轉
 
 重用的區塊是在別的前文下算的，它的 KV 和「在現在這個前文下算」不同。做法（`subctx_blend.py`）：
 
-1. **數量在排程前就決定**：每個 request 重算 `int(重用 token 數 × ratio)` 個（`sub_context_topk_count`）。
+1. **數量在排程前就決定**：每個 request 重算 `int(打分的重用 token 數 × ratio)` 個（`sub_context_topk_count`）。
+   打分的只有 scan 找到的段；從頭比對到的前綴（`sub_context_exact_len`）是精確的，不打分（`_scored_runs`）。
    `alloc_for_extend` 多配這麼多 slot；`PrefillAdder` 把它們計入 KV 容量。
-2. **probe**（第 `[0, TOPK_LAYER]` 層）：整段 prompt 都跑。新 token 的 KV 寫到它的新 slot，
-   重用位置的 KV 寫到 dummy slot 0——所以重用位置的 slot 裡**還是快取的 key**。
+2. **probe**（第 `[0, TOPK_LAYER]` 層）：每個 request 從它的 probe 起點（`sub_context_probe_start`）跑到 prompt 結尾——
+   有 layout 的從精確前綴之後開始，同一批裡其他 request 從它要算的第一個 token 開始。起點之前的 KV 照樣從快取讀，
+   只是不當 query。新 token 的 KV 寫到它的新 slot，重用位置的 KV 寫到 dummy slot 0——所以重用位置的 slot 裡
+   **還是快取的 key**。
 3. **打分**（第 `TOPK_LAYER` 層，attention 之前）：每個重用位置的分數 = `Σ (k_新算 − k_快取)²`
    （對 head 與維度加總）；每個 request 取分數最高的那些，與新 token 的位置合併、排序。
    挑選在 GPU 上完成，不需要同步回 host。
@@ -515,16 +587,19 @@ req.sub_context_rotated_slots = None     # 責任移轉
 5. **第二段**（`TOPK_LAYER+1` 之後的層）：hidden states、位置、slot 都裁成「新 token + 被挑中的 token」，
    重建 attention metadata 再跑（`ModelRunner.forward_subctx_blend`）。這條路不用 CUDA graph。
 
-**`PrefillAdder` 的 probe 規則**：probe 要跑整段 prompt，比「要算的 token」多；
+**`PrefillAdder` 的 probe 規則**：probe 要跑從起點之後的整段（`sub_context_forward_rows`），比「要算的 token」多；
 如果這個 request 不是本批第一個、而多出的列放不進剩餘預算，就等下一輪；
 如果是第一個，就單獨跑，允許超出預算。
 
-**重用的塊不寫回快取**：被重算的 token 跟快取不同，所以 scan 把重用的塊都標成 `no_insert`（第 7-2 節）。
-後果是位移過一次的內容，之後每個請求都要再旋轉一次（第 15 節）。
+**重算過的副本隨鏈寫回**：`idx` / `cdc` 的副本是 request 自己的格子，跟整條鏈一起存進樹（第 7-5 節）；
+下一輪從頭比對到這段時當成精確前綴，不再打分。索引裡同一段內容的最早位置仍是原始算出來的那份，
+別的 request 從索引找到這段時讀的是原始那份。
 
 ---
 
 ## 10. cache_unfinished_req（每個 chunk）
+
+**本節只適用逐 namespace 的路徑（`on` / `rot`、只開 `HASH_KEYS`）。** `idx` / `cdc` 走上游的整條插入，見第 7-5 節。
 
 把剛算好的 KV 交給樹保管。KV 現在只有這個 request 的 `req_to_token` 指著，
 request 一結束就沒人記得它了。
@@ -532,7 +607,7 @@ request 一結束就沒人記得它了。
 ### 逐塊步驟
 
 **⓪ 要不要寫**：這次還沒算到這塊就跳過（`covered_end = min(offset + 塊長, end_k)`）；
-`sub_context_no_insert[i]` 為真也跳過（第 7 節）——跳過的塊留到 finish 處理。
+`sub_context_no_insert[i]` 為真也跳過（舊 scan 用的，現在沒有路徑會設定）——跳過的塊留到 finish 處理。
 
 **① 樹上有嗎、位置對嗎**
 
@@ -660,6 +735,8 @@ last_node = root_node                                # 讓 scheduler 的鎖變 n
 
 ## 11. cache_finished_req
 
+**11-1 到 11-3 只適用逐 namespace 的路徑。** `idx` / `cdc` 走上游的整條插入（回覆一起存），見第 7-5 節。
+
 先兩道冪等的保險（`release_sub_context_match_locks`、`release_sub_context_rotated_slots`，
 給沒跑過第 10 節的 request 用；對一般 request 是空操作），然後：
 
@@ -732,7 +809,7 @@ if not kept and prompt_len < len(kv_indices):
 | 塊是樹的 | 一格都不還，只 `dec_lock_ref` |
 | 塊被拒絕，全是自己的 | 整塊還 |
 | 塊被拒絕，**混著樹的格子** | **逐格比對，只還自己的** |
-| 只重用一部分的塊（scan 裁過） | 到 `sub_context_source_key` 那個 namespace 比對，只還自己的 |
+| 只重用一部分的塊（舊 scan 裁過；現在不會發生） | 到 `sub_context_source_key` 那個 namespace 比對，只還自己的 |
 | 從沒跑過第 10 節 | 每塊都當「被拒絕」處理，逐格比對 |
 | 回覆沒被收下 | 連同 tail 一起還 |
 
@@ -773,7 +850,7 @@ GPU 上沒有任何線索可查——唯一能發現問題的地方是**記帳**
 | 何時 | 目的地 | 為什麼 |
 |---|---|---|
 | stitch（排程） | **複製到新格子**並旋轉 | 來源是樹的，別人鎖著 |
-| scan（排程） | **複製到新格子**並旋轉 | 同上 |
+| scan（排程） | **一律複製到新格子**，位置不同時旋轉 | 鏈必須擁有自己的格子 |
 | append（每個 chunk 結尾） | **複製到新格子**並旋轉 | 同上 |
 | selective recompute 的寫回 | **新格子**（前面各層從快取複製） | 被重算的 token 不能改寫樹的格子 |
 | finish：搶救被拒絕的塊 | **就地**旋轉 | 格子是自己的，而且已經不會再讀 |
@@ -812,10 +889,10 @@ GPU 上沒有任何線索可查——唯一能發現問題的地方是**記帳**
 | 工具 | 開關 | 內容 |
 |---|---|---|
 | forward trace | `SGLANG_FORWARD_TRACE=<檔>` | 每個 forward pass 一列 JSON：`mode`、`bs`、`new_tokens`、`cached_tokens`（只算增量）、`matched_tokens`、`discarded_tokens`、`moved_tokens`、`rotated_tokens`、`reinserted_tokens`、`sub_reqs`、`gpu_ms`。以 CUDA event 計時，不同步 |
-| host 階段計時 | `SGLANG_STAGE_TRACE=<前綴>` | 每個 process 寫 `<前綴>.<proc>.json`：`tpl_render`、`subctx_split`（http）；`match`、`subctx_stitch`、`subctx_lookup`、`subctx_scan`、`subctx_rotate`、`subctx_rotate_finish`、`subctx_rev_rotate`、`cache_unfinished`、`cache_finished`（scheduler）。client 建立 `<前綴>.mark` 後另開一份 `measured` 累計，排除 warm-up |
+| host 階段計時 | `SGLANG_STAGE_TRACE=<前綴>` | 每個 process 寫 `<前綴>.<proc>.json`：`tpl_render`、`subctx_split`（http）；`match`、`subctx_stitch`、`subctx_lookup`、`subctx_scan`、`subctx_rotate`、`subctx_copy`、`subctx_rotate_finish`、`subctx_rev_rotate`、`cache_unfinished`、`cache_finished`（scheduler）。client 建立 `<前綴>.mark` 後另開一份 `measured` 累計，排除 warm-up |
 | 請求錄製 | `SGLANG_CAPTURE_REQUESTS=<檔>` | 每個 chat 請求原文一行，給 `subcontext_bench.py replay` |
-| `/server_info` | — | `sub_context` 物件：所有開關的實際值與 `pid`，給遠端 client 確認 arm（`scripts/subcontext_sim/check_remote_arm.py`） |
-| 索引統計 | 開 index 時 | prefill log 那行後面附 `sub-context index: …`。**排隊中的請求每輪排程都重新掃描，數字會重複累加**，只拿來確認有在運作；報告用 forward trace 或 client 的 `cached_tokens` |
+| `/server_info` | — | `sub_context` 物件：所有開關的實際值與 `pid`，給遠端 client 確認 arm（`scripts/subcontext_sim/check_remote_arm.py`）；`chain_storage` 為 true 表示是鏈式儲存的版本 |
+| 索引統計 | 開 index 時 | prefill log 那行後面附 `sub-context index: …`：比對過的 prompt token 數、其中從頭比對到的、scan 找到的、旋轉的，以及放不進一次 prefill、沒空間被拒的請求數。每個請求只在第一次真的執行（`prepare_for_extend`）時算一次，被拒後重新比對、被 retract 後重跑的都不算；4090 smoke 中與 client 端 `prompt_tokens`、`cached_tokens` 加總完全一致。`chunks`、`queries`、`prompt tokens`（開頭三個）仍是每次掃描都算 |
 
 ### 防線與偵錯
 
@@ -827,6 +904,7 @@ GPU 上沒有任何線索可查——唯一能發現問題的地方是**記帳**
 | `_audit_sub_context_chunk` / `_finish` | 寫入或 finish 之後，自己的 slot 是否「恰好」被釋放或被樹持有其一 | **要** |
 | slot 級 double-free 偵測（`allocator.py`） | 同一格被還兩次的當下，附上呼叫者的檔名與行號 | **要** |
 | `SUBCTX-OUTPUT-UNDERMATCH` | 「今天不可能發生」的顯式警報 | 不用 |
+| `SUBCTX-CHAIN-MISMATCH` | 索引記的位置上不是那段 token（鏈式儲存，讀取時逐 token 比對） | **要** |
 | `SGLANG_SUBCTX_TRACE` | 每個階段的 TRACE 行（命中、旋轉、寫入） | 不用 |
 | `SGLANG_DUMP_TREE` | 每次 extend 後印整棵樹（含每個 node 的 `extra_key`） | 不用 |
 
@@ -937,19 +1015,21 @@ replay client 用 `ignore_eos`，所以「prefill 當下就吐停止 token」在
 
 ### 會影響命中率或成本的
 
-- **短於 `MIN_CHUNK` 的區塊永遠不寫入。** 新算的塊短於 `MIN_CHUNK` 會被標 `no_insert`，索引也不登記；
-  cdc 在每則訊息開頭都切，所以短訊息自成一塊、之後每一輪都重算。
-  Terminal-Bench 上這是 cdc 命中率低於 `off` 的主要原因（2026-10-02 初步估計每請求約 370 token）。
-  索引的指紋視窗是 32 token，`MIN_CHUNK` 最低只能到 32；更短的訊息要和相鄰訊息併成一塊才能重用。
-- **cdc 模式下生成的 token 不會進快取。** 原因不是生成的 token 短，而是它們要接的那一塊：
-  11-2 要求「整個 prompt 都在樹裡」，再把生成的 token 接在最後一塊後面；cdc 的最後一塊是 generation prompt
-  （`<|im_start|>assistant\n`，3 個 token），短於 `MIN_CHUNK`、永遠不寫入，所以條件永遠不成立，
-  生成的 token 在 11-3 被釋放。就算放寬這個條件，11-2 也不會把輸出登記進索引；下一輪的回覆是一則新的
-  assistant 訊息，scan 依內容雜湊找區塊，找不到它。所以每一輪模型的回覆都要重算。
-  blocks 模式沒有這個問題：最後一塊是整段 `messages`，回覆接在它後面，下一輪 stitch 從同一個 namespace 命中。
-- **開了 selective recompute，重用的塊不以新位置寫回**，位移過一次的內容之後每個請求都要再旋轉一次。
-- **同一批裡沒有 layout 的請求，在 probe 階段也會跑整段 prompt。** `prepare_for_extend` 在 batch 裡有
-  任何 layout 時把所有請求的輸入都換成整段 `fill_ids`，但 `PrefillAdder` 只對有 layout 的請求計入 probe 的額外列。
+- **（舊存法的問題，鏈式儲存已解決）cdc 的短訊息與模型回覆進不了快取。** 2026-10-05 以前 `idx` / `cdc` 每塊一個
+  namespace：短於 `MIN_CHUNK` 的塊不寫入、每輪重算；generation prompt（3 個 token）也不寫入，連帶 11-2 的條件永遠不成立，
+  回覆不進快取。Terminal-Bench 上 cdc 命中率因此低於 `off`（2026-10-02 估計每請求多算約 600 token）。
+  改成鏈式儲存後兩者都隨整條鏈存進樹；4090 smoke（Qwen2.5-7B，初步）中只往後接的流量 cdc 每筆命中與回覆都和 `off` 相同。
+- **短於 `MIN_CHUNK` 的區塊不登記索引**：在鏈上、從頭比對拿得到，但位置變了 scan 找不回來。
+- **位置相同也要複製**：別條鏈上、位置剛好相同的段，舊存法是直接共用格子，現在要複製一份（鏈必須擁有自己的格子）。
+  GPU 記憶體用量跟 `off` 一樣，不再有「同一段內容只存一份」的節省。複製在沒開 speculative decoding 時是逐層的 Python 迴圈。
+- **等待中的請求每輪重新 scan、重新複製**：沒被收進的請求會放掉副本（第 7-4 節），下一輪再做一次。
+- **`sub_context_index_declined`**：一個請求因為沒空間被標記後只用前綴比對，直到被 retract 才清掉。
+  「沒有其他請求在跑」只看 running batch 與 chunked request；overlap 下還在跑、沒併進 running batch 的
+  prefill-only batch 看不到，可能多判一次「沒空間」（只少了重用，不會卡住）。
+- **（已解決，2026-10-05）probe 跑整段 prompt。** 以前同一批裡只要有一個 layout，所有請求都把整段 prompt 送進 probe，
+  而 `PrefillAdder` 只對有 layout 的請求計入額外列。現在 probe 從各自的起點開始（第 9 節），同批的前綴命中只跑它要算的列，
+  adder 的計算也跟實際一致。改了 probe 的形狀會讓矩陣乘法的捨入不同（同樣的列、不同的總列數，bf16 結果不一定位元相同），
+  所以和改之前的 cdc@r 回覆不會逐字相同。
 
 ### 隔離與正確性
 
@@ -957,7 +1037,7 @@ replay client 用 `ignore_eos`，所以「prefill 當下就吐停止 token」在
   `system_prompt_key` 等 namespace，租戶與 adapter 的隔離被打破。內容雜湊模式（`idx` / `cdc`）沒有這個問題。
 - **sparse prefill 路徑沒有傳 attention sink**：有 sink 的模型不在啟動檢查的拒絕清單裡。
 
-### `_cache_sub_context_output` 的 gate 過嚴（已決定不處理）
+### `_cache_sub_context_output` 的 gate 過嚴（已決定不處理；只影響 `on` / `rot`）
 
 現在要求 `cache_protected_len == prompt_len`（整條 prompt 不准有洞）。
 但要存的東西是「最後一塊 ++ 生成的 token」，插進**最後一塊的 namespace**，
@@ -1000,7 +1080,8 @@ append 省下的是重算，付出的是一趟 scheduler round-trip。用 Stage 
 
 - SWE-agent（last-5 observation 省略）：cdc 比 `off` 多命中的部分全在第一則 user 訊息之後的對話段；
   system + tools 與第一則 user 訊息 `off` 已經全部命中。
-- Terminal-Bench（對話只往後追加）：`off` 已命中約 97%，cdc 因為上面的短訊息問題反而較低。
+- Terminal-Bench（對話只往後追加）：`off` 已命中約 97%；舊存法的 cdc 因為上面的短訊息與回覆問題反而較低，
+  鏈式儲存後應與 `off` 相同（smoke 已確認，Terminal-Bench 本身未重跑）。
 - 不同 task 之間能共用的只有開頭約 1k token 的共用指令；同一題的平行 rollout 之間 cdc 也沒有多撿。
   cdc 要發揮，需要「大量相同內容出現在不同的前文之後」的 workload。
 

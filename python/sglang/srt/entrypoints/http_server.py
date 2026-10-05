@@ -619,6 +619,8 @@ async def server_info():
             "cache_output": subctx_config.CACHE_SUBCONTEXT_OUTPUT,
             "hash_keys": subctx_config.hash_subcontext_keys(),
             "index": subctx_config.INDEX_SUBCONTEXTS,
+            # Index arms store each request as one chain, with chunk locations.
+            "chain_storage": subctx_config.INDEX_SUBCONTEXTS,
             "index_dryrun": subctx_config.INDEX_DRYRUN,
             "min_chunk": subctx_config.MIN_CHUNK_TOKENS,
             "split_mode": subctx_config.SPLIT_MODE,

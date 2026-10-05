@@ -221,8 +221,9 @@ class _Scope:
 class SubContextIndex:
     """Registered chunks, and where they occur in a query.
 
-    Holds token ids only. The KV, its residency and its position stay in the radix
-    tree, looked up with the chunk id as ``extra_key``; the two may drift.
+    Holds token ids, plus the opaque locations the caller registered for each chunk
+    (``register(..., where=...)``), oldest first. The KV and its residency stay in
+    the radix tree.
     """
 
     def __init__(self, min_chunk_tokens: int = MIN_CHUNK_TOKENS) -> None:
@@ -231,6 +232,8 @@ class SubContextIndex:
         self._scopes: Dict[Optional[str], _Scope] = {}
         # chunk id -> scope, for `unregister`.
         self._scope_of: Dict[str, Optional[str]] = {}
+        # chunk id -> its locations, oldest first.
+        self._where: Dict[str, List[object]] = {}
         self.registered = 0
         self.scanned_queries = 0
         self.scanned_tokens = 0
@@ -241,11 +244,18 @@ class SubContextIndex:
         self.beyond_stitch_tokens = 0
         self.displaced_tokens = 0
         self.stitched_tokens = 0
-        # Live tallies.
+        # Live tallies, counted once per request that runs (`count_match`).
+        # `prompt_tokens`: matched; `prefix_tokens`: reached by the plain prefix match;
+        # `reused_tokens`: found by the scan past it.
+        self.prompt_tokens = 0
+        self.prefix_tokens = 0
         self.reused_tokens = 0
         self.rotated_tokens = 0
-        # Requests whose layout did not fit one prefill pass and took the stitch.
+        # Requests whose layout did not fit one prefill pass and took the prefix only.
         self.fell_back = 0
+        # Requests refused for KV room with nothing else running; matched on the
+        # prefix only from then on.
+        self.no_room = 0
 
     def report(self) -> str:
         """One-line summary of the tallies."""
@@ -253,12 +263,16 @@ class SubContextIndex:
             f"sub-context index: {len(self)} chunks, {self.scanned_queries} queries, "
             f"{self.scanned_tokens} prompt tokens"
         )
-        if self.reused_tokens or self.fell_back:
-            share = 100.0 * self.reused_tokens / max(self.scanned_tokens, 1)
+        if self.prompt_tokens:
+            denom = self.prompt_tokens
             return (
-                f"{head} | reused {self.reused_tokens} ({share:.0f}% of prompt), "
+                f"{head} | matched {self.prompt_tokens} prompt tokens: prefix "
+                f"{self.prefix_tokens} ({100.0 * self.prefix_tokens / denom:.0f}%), "
+                f"scan found {self.reused_tokens} "
+                f"({100.0 * self.reused_tokens / denom:.0f}%), "
                 f"{self.rotated_tokens} of them rotated into place"
-                f" | {self.fell_back} requests too big for one pass"
+                f" | {self.fell_back} requests too big for one pass, "
+                f"{self.no_room} refused for room"
             )
         # Dry run.
         return (
@@ -268,15 +282,29 @@ class SubContextIndex:
             f"reachable only by placing blocks freely: {self.beyond_stitch_tokens}"
         )
 
+    def count_match(
+        self, prompt: int, prefix: int, found: int, rotated: int, fell_back: int
+    ) -> None:
+        """Add one admitted request's match to the live tallies."""
+        self.prompt_tokens += prompt
+        self.prefix_tokens += prefix
+        self.reused_tokens += found
+        self.rotated_tokens += rotated
+        self.fell_back += fell_back
+
     def __len__(self) -> int:
         return sum(len(s.chunks) for s in self._scopes.values())
 
     def register(
-        self, token_ids: Sequence[int], extra_key: Optional[str] = None
+        self,
+        token_ids: Sequence[int],
+        extra_key: Optional[str] = None,
+        where: object = None,
     ) -> Optional[str]:
         """Make ``token_ids`` findable. Returns its chunk id, or None if too short.
 
-        Idempotent: registering the same run twice does not duplicate it.
+        Idempotent: registering the same run twice does not duplicate it. A ``where``
+        given is appended to the chunk's locations unless already there.
         """
         ids = np.asarray(token_ids, dtype=np.int32)
         if ids.shape[0] < self.min_chunk_tokens:
@@ -286,6 +314,10 @@ class SubContextIndex:
         scope = self._scopes.get(extra_key)
         if scope is None:
             scope = self._scopes[extra_key] = _Scope()
+        if where is not None:
+            places = self._where.setdefault(cid, [])
+            if where not in places:
+                places.append(where)
         if cid in scope.chunks:
             return cid
 
@@ -302,8 +334,54 @@ class SubContextIndex:
         self.registered += 1
         return cid
 
+    def location(self, cid: str) -> object:
+        """The oldest location registered for ``cid``, or None."""
+        places = self._where.get(cid)
+        return places[0] if places else None
+
+    def locations(self, cid: str) -> List[object]:
+        """Every location registered for ``cid``, oldest first."""
+        return list(self._where.get(cid, ()))
+
+    def relocate(self, cid: str, old: object, new: object) -> None:
+        """Replace one of a chunk's locations in place. Unknown ones are ignored."""
+        places = self._where.get(cid)
+        if places is not None and old in places:
+            places[places.index(old)] = new
+
+    def drop_location(self, cid: str, where: object) -> None:
+        """Remove one of a chunk's locations; forget the chunk with its last one."""
+        places = self._where.get(cid)
+        if places is None or where not in places:
+            return
+        places.remove(where)
+        if not places:
+            self.unregister(cid)
+
+    def chunk_len(self, cid: str) -> int:
+        """Token count of a registered chunk; 0 if unknown."""
+        extra_key = self._scope_of.get(cid, _MISSING)
+        if extra_key is _MISSING:
+            return 0
+        ids = self._scopes[extra_key].chunks.get(cid)
+        return 0 if ids is None else int(ids.shape[0])
+
+    def chunk_tokens(self, cid: str) -> Optional[np.ndarray]:
+        """Token ids of a registered chunk, or None."""
+        extra_key = self._scope_of.get(cid, _MISSING)
+        if extra_key is _MISSING:
+            return None
+        return self._scopes[extra_key].chunks.get(cid)
+
+    def clear(self) -> None:
+        """Forget every chunk. The tallies are kept."""
+        self._scopes.clear()
+        self._scope_of.clear()
+        self._where.clear()
+
     def unregister(self, cid: str) -> None:
         """Forget a chunk (called when the tree evicts it). Unknown ids are ignored."""
+        self._where.pop(cid, None)
         extra_key = self._scope_of.pop(cid, _MISSING)
         if extra_key is _MISSING:
             return

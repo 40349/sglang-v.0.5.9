@@ -152,6 +152,12 @@ def sparse_prefill_unsupported_reason(model_runner) -> Optional[str]:
             "sliding-window attention derives each key's absolute position from the "
             "prefix length, which a prefill with holes in it does not have"
         )
+    if model_runner.server_args.enable_mixed_chunk:
+        return (
+            "mixed chunked prefill appends decode tokens to a prefill batch, and a "
+            "scattered prefill passes positions for its prefill tokens only "
+            "(drop --enable-mixed-chunk)"
+        )
     if model_runner.server_args.enable_piecewise_cuda_graph:
         return (
             "piecewise CUDA graphs capture a prefill's shapes, and the mask a "
@@ -223,7 +229,8 @@ def rotation_unsupported_reason(model_runner, tree_cache) -> Optional[str]:
 def topk_unsupported_reason(model_runner) -> Optional[str]:
     """Return why reused tokens cannot be selectively recomputed, or None if they can.
 
-    The probe runs the whole prompt through layers ``[0, TOPK_LAYER]``, then the token
+    The probe runs each prompt from its probe start through layers ``[0, TOPK_LAYER]``,
+    then the token
     dimension is cut down to the selected rows. Each case below either cannot run a
     layer range, splits the tokens across ranks, or reads a token count the cut changes.
     """
@@ -276,7 +283,7 @@ def topk_unsupported_reason(model_runner) -> Optional[str]:
     if args.enable_two_batch_overlap:
         return (
             "two-batch overlap splits a batch and re-enters the layer stack per half, "
-            "which the probe's single pass over the whole prompt does not survive"
+            "which the probe's single pass over the prompts does not survive"
         )
     if args.speculative_algorithm is not None:
         return (

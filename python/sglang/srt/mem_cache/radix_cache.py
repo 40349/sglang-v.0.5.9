@@ -60,6 +60,8 @@ from sglang.srt.mem_cache.evict_policy import (
     PriorityStrategy,
 )
 from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
+from sglang.srt.mem_cache.subctx_index import chunk_id as sub_context_chunk_id
+from sglang.srt.mem_cache.subctx_index import cut_points
 from sglang.srt.utils import host_timer, subctx_config
 from sglang.srt.utils.subctx_config import CACHE_SUBCONTEXT_OUTPUT
 from sglang.srt.utils.subctx_trace import TRACE_ON, trace
@@ -302,6 +304,8 @@ class RadixCache(BasePrefixCache):
         self.kv_rotator = None
         # SubContextIndex, set by the scheduler when the index is on.
         self.sub_context_index = None
+        # Chained requests: node id -> ids of the chunks whose last token it holds.
+        self._chunks_at: dict = {}
         # Tokens re-filed at finish. Drained by the forward trace.
         self.sub_context_reinserted_tokens = 0
         # Doubly-owned slot count at the last `_audit_tree_duplicates` walk.
@@ -375,6 +379,9 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
+        self._chunks_at.clear()
+        if self.sub_context_index is not None:
+            self.sub_context_index.clear()
         self._record_all_cleared_event()
 
     def supports_sub_contexts(self) -> bool:
@@ -387,6 +394,194 @@ class RadixCache(BasePrefixCache):
             and self.page_size == 1
             and not self.is_eagle
         )
+
+    def chains_sub_contexts(self, req: Req) -> bool:
+        """Index arms: the request is matched and stored as one chain under its own
+        ``extra_key``, and its chunks are registered in the index.
+        """
+        return (
+            subctx_config.INDEX_SUBCONTEXTS
+            and self.sub_context_index is not None
+            and bool(getattr(req, "has_sub_contexts", False))
+            and self.supports_sub_contexts()
+        )
+
+    def chain_chunk_slots(
+        self, cid: str
+    ) -> Optional[Tuple[torch.Tensor, TreeNode, int]]:
+        """``(slots, node, start)`` of a registered chunk at its oldest location still
+        in the tree: its KV slots in order, the node holding its last token, and the
+        position its first token was computed at.
+
+        Locations no longer holding the chunk are dropped on the way; None, and the
+        chunk forgotten, when none is left. Refreshes the access time of the nodes the
+        returned span crosses.
+        """
+        index = self.sub_context_index
+        length = index.chunk_len(cid)
+        for where in index.locations(cid):
+            node, start = where
+            end = start + length
+            if length == 0 or not self._node_in_tree(node) or not (
+                node.canonical_position <= end - 1 < node.canonical_position + len(node.key)
+            ):
+                self._drop_location(cid, where)
+                continue
+            slots, tokens = self._chain_span(node, start, end)
+            if slots is None or (
+                AUDIT_ON and tokens != index.chunk_tokens(cid).tolist()
+            ):
+                if slots is not None:
+                    logger.error(
+                        "SUBCTX-CHAIN-MISMATCH cid=%s start=%d len=%d -- the location "
+                        "holds other tokens",
+                        cid,
+                        start,
+                        length,
+                    )
+                self._drop_location(cid, where)
+                continue
+            return slots, node, start
+        return None
+
+    def _chain_span(
+        self, node: TreeNode, start: int, end: int
+    ) -> Tuple[Optional[torch.Tensor], Optional[List[int]]]:
+        """Slots of positions ``[start, end)`` on the chain ending in ``node``, which
+        holds position ``end - 1``; and their tokens when auditing. Slots None if the
+        chain is shorter than ``start``.
+        """
+        now = time.monotonic()
+        parts = []
+        tokens: Optional[List[int]] = [] if AUDIT_ON else None
+        cur, hi = node, end
+        while hi > start:
+            if cur is self.root_node or cur is None:
+                return None, None
+            lo = cur.canonical_position
+            parts.append(cur.value[max(start, lo) - lo : hi - lo])
+            if tokens is not None:
+                tokens = list(cur.key.token_ids[max(start, lo) - lo : hi - lo]) + tokens
+            cur.last_access_time = now
+            hi = lo
+            cur = cur.parent
+        parts.reverse()
+        return (torch.cat(parts) if len(parts) > 1 else parts[0]), tokens
+
+    def _node_in_tree(self, node: TreeNode) -> bool:
+        parent = node.parent
+        if parent is None or node.key is None or len(node.key) == 0:
+            return False
+        return parent.children.get(self.get_child_key_fn(node.key)) is node
+
+    def _place_chunk(
+        self, ids: List[int], extra_key: Optional[str], node: TreeNode, start: int
+    ) -> None:
+        """Register ``ids`` with a location: its last token in ``node``, its first
+        computed at ``start``. Earlier locations of the chunk are kept ahead of it.
+        """
+        if self.sub_context_index.register(ids, extra_key, where=(node, start)) is None:
+            return
+        self._chunks_at.setdefault(node.id, set()).add(
+            sub_context_chunk_id(ids, extra_key)
+        )
+
+    def _drop_location(self, cid: str, where: Tuple[TreeNode, int]) -> None:
+        """Remove one location of ``cid``, and the node's entry once it holds none."""
+        index = self.sub_context_index
+        index.drop_location(cid, where)
+        node = where[0]
+        if any(place[0] is node for place in index.locations(cid)):
+            return
+        held = self._chunks_at.get(node.id)
+        if held is not None:
+            held.discard(cid)
+            if not held:
+                del self._chunks_at[node.id]
+
+    def _rehome_chunks(self, new_node: TreeNode, child: TreeNode) -> None:
+        """After ``_split_node``: locations ending before ``child`` now end in
+        ``new_node``.
+        """
+        held = self._chunks_at.get(child.id)
+        if not held:
+            return
+        index = self.sub_context_index
+        boundary = child.canonical_position
+        for cid in list(held):
+            length = index.chunk_len(cid)
+            still_here = False
+            for where in index.locations(cid):
+                if where[0] is not child:
+                    continue
+                start = where[1]
+                if start + length - 1 < boundary:
+                    index.relocate(cid, where, (new_node, start))
+                    self._chunks_at.setdefault(new_node.id, set()).add(cid)
+                else:
+                    still_here = True
+            if not still_here:
+                held.discard(cid)
+        if not held:
+            del self._chunks_at[child.id]
+
+    def _forget_chunks_at(self, node: TreeNode) -> None:
+        """After evicting ``node``: drop the chunk locations whose last token it held."""
+        held = self._chunks_at.pop(node.id, None)
+        if not held:
+            return
+        index = self.sub_context_index
+        for cid in held:
+            for where in index.locations(cid):
+                if where[0] is node:
+                    index.drop_location(cid, where)
+
+    def _register_chain(
+        self,
+        req: Req,
+        token_ids: List[int],
+        stored_from: int,
+        last_node: TreeNode,
+        final: bool,
+    ) -> None:
+        """Register the request's blocks that end in ``(stored_from, len(token_ids)]``.
+
+        ``last_node`` ends the request's chain at ``len(token_ids)``. Block edges are
+        the split the request arrived with; with ``final``, the last block runs to the
+        end of the generated tokens and is cut again by the split mode.
+        """
+        if self.sub_context_index is None or not req.sub_context_ids_as_sent:
+            return
+        covered = len(token_ids)
+        edges = [0]
+        for block in req.sub_context_ids_as_sent:
+            edges.append(edges[-1] + len(block))
+        if final and covered > edges[-1]:
+            head = edges[-2]
+            tail = token_ids[head:covered]
+            cuts = []
+            if subctx_config.SPLIT_MODE == "cdc":
+                cuts = cut_points(
+                    tail,
+                    subctx_config.CDC_TARGET_TOKENS,
+                    subctx_config.MIN_CHUNK_TOKENS,
+                    subctx_config.CDC_MAX_TOKENS,
+                )
+            edges = edges[:-1] + [head + c for c in cuts] + [covered]
+
+        min_len = self.sub_context_index.min_chunk_tokens
+        blocks = [
+            (a, b)
+            for a, b in zip(edges, edges[1:])
+            if stored_from < b <= covered and b - a >= min_len
+        ]
+        node = last_node
+        for a, b in reversed(blocks):
+            while node is not self.root_node and node.canonical_position > b - 1:
+                node = node.parent
+            if node is self.root_node:
+                return
+            self._place_chunk(token_ids[a:b], req.extra_key, node, a)
 
     def matched_canonical_position(
         self, last_node: Optional[TreeNode], hit_len: int
@@ -576,6 +771,11 @@ class RadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
             )
+            if self.chains_sub_contexts(req) and len(keys) > new_prefix_len:
+                chain_end = self.match_prefix(
+                    MatchPrefixParams(key=radix_key)
+                ).last_device_node
+                self._register_chain(req, keys, new_prefix_len, chain_end, final=True)
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : len(keys)]
@@ -1109,6 +1309,11 @@ class RadixCache(BasePrefixCache):
 
         req.last_node = new_last_node
 
+        if self.chains_sub_contexts(req):
+            self._register_chain(req, keys, new_prefix_len, new_last_node, final=False)
+            # The locks on the nodes the scan copied from.
+            req.release_sub_context_match_locks(self)
+
     def _sub_context_protected_len(self, req: Req, covered: int) -> int:
         """Length of the tree-owned prompt prefix, up to the first block not owned."""
         protected = 0
@@ -1324,9 +1529,11 @@ class RadixCache(BasePrefixCache):
             was_namespace_root = x.parent is self.root_node
             self._delete_leaf(x)
 
-            if was_namespace_root and self.sub_context_index is not None:
-                # The namespace's first node is gone: forget the chunk.
-                if x.key.extra_key is not None:
+            if self.sub_context_index is not None:
+                if subctx_config.INDEX_SUBCONTEXTS:
+                    self._forget_chunks_at(x)
+                elif was_namespace_root and x.key.extra_key is not None:
+                    # The namespace's first node is gone: forget the chunk.
                     self.sub_context_index.unregister(x.key.extra_key)
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
@@ -1510,6 +1717,8 @@ class RadixCache(BasePrefixCache):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+        if self._chunks_at:
+            self._rehome_chunks(new_node, child)
 
         return new_node
 

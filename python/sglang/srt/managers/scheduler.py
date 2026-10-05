@@ -789,6 +789,15 @@ class Scheduler(
 
         if not (INDEX_SUBCONTEXTS or INDEX_DRYRUN):
             return
+        if INDEX_SUBCONTEXTS and (
+            self.server_args.dllm_algorithm is not None
+            or self.server_args.disaggregation_mode != "null"
+        ):
+            raise ValueError(
+                "The sub-context index is enabled with a diffusion LLM or with "
+                "prefill/decode disaggregation; neither scheduling path releases what "
+                "a refused request scanned. Unset SGLANG_SUBCTX_INDEX."
+            )
         if INDEX_SUBCONTEXTS:
             reason = sparse_prefill_unsupported_reason(self.tp_worker.model_runner)
             if reason is not None:
@@ -818,7 +827,11 @@ class Scheduler(
         logger.info(
             "Sub-context index ENABLED (min chunk %d tokens%s)%s",
             self.tree_cache.sub_context_index.min_chunk_tokens,
-            ", dry run -- scanning and reporting only" if INDEX_DRYRUN else "",
+            (
+                ", dry run -- scanning and reporting only"
+                if INDEX_DRYRUN
+                else ", requests stored as prefix chains"
+            ),
             (
                 f"; selective recompute of {TOPK_RATIO:.0%} of reused tokens, "
                 f"scored at layer {TOPK_LAYER}"
@@ -842,6 +855,12 @@ class Scheduler(
 
         if not (ROTATE_SUBCONTEXT or ROTATE_ACROSS_RECOMPUTE):
             return
+        if self.server_args.enable_pdmux:
+            raise ValueError(
+                "Sub-context KV rotation is enabled with PD multiplexing, whose "
+                "forwards run on their own streams; the copies would not be ordered "
+                "after them. Unset SGLANG_SUBCONTEXT_ROTATE or --enable-pdmux."
+            )
         model_runner = self.tp_worker.model_runner
         reason = rotation_unsupported_reason(model_runner, self.tree_cache)
         if reason is not None:
@@ -856,6 +875,9 @@ class Scheduler(
             rotary.rotary_dim,
             use_native=ROTATE_NATIVE,
         )
+        if self.device == "cuda" and self.enable_overlap:
+            # Under overlap the forward runs on its own stream; copies follow it there.
+            self.tree_cache.kv_rotator.launch_stream = self.forward_stream
         logger.info(
             "Sub-context KV rotation ENABLED (max delta %d, across-recompute=%s%s)",
             self.tree_cache.kv_rotator.max_delta,
@@ -1878,6 +1900,7 @@ class Scheduler(
                 elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
+                candidate_req.release_sub_context_scan(self.tree_cache)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
@@ -1917,6 +1940,7 @@ class Scheduler(
                     ),
                     req,
                 )
+                req.release_sub_context_scan(self.tree_cache)
                 deleted_reqs.add(req)
 
         if deleted_reqs:
@@ -2226,7 +2250,21 @@ class Scheduler(
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
+                # Sub-context: a request left queued drops its scanned runs. The adder
+                # also stops the loop after admitting one, when the budget is spent.
+                declined = False
+                if all(r is not req for r in adder.can_run_list):
+                    declined = req.release_sub_context_scan(
+                        self.tree_cache,
+                        no_room=(
+                            res == AddReqResult.NO_TOKEN
+                            and self.running_batch.is_empty()
+                            and self.chunked_req is None
+                            and not adder.can_run_list
+                        ),
+                    )
+                # A request just declined retries next round on its prefix alone.
+                if res == AddReqResult.NO_TOKEN and not declined:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
                         self.running_batch.batch_is_full = len(
@@ -2880,6 +2918,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            req.release_sub_context_scan(self.tree_cache)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)

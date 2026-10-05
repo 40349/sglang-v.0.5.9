@@ -125,7 +125,11 @@ def build(reqs, first_slot: int = 400, check_layer: int = CHECK_LAYER):
     # positions, the computed tokens scattered into the gaps.
     cursor = 0
     for i, req in enumerate(reqs):
-        for start, end, slots in req.sub_context_layout:
+        if req.sub_context_layout is None:
+            # An ordinary request in the batch: its prefix, then what it computes.
+            prefix = req.prefix_indices
+            pool.req_to_token[req.req_pool_idx, : len(prefix)] = prefix
+        for start, end, slots in req.sub_context_layout or []:
             pool.req_to_token[req.req_pool_idx, start:end] = slots
         positions = torch.tensor(fresh_positions[i], dtype=torch.int64)
         pool.req_to_token[req.req_pool_idx, positions] = out_cache_loc[
@@ -151,7 +155,7 @@ def keys_with_deviation(plan, loud_positions, kv_pool, request=0):
     fresh = torch.zeros(total_rows, NUM_HEADS, HEAD_DIM)
     fresh[plan.reused_rows] = cached[plan.reused_slots]
     for rank, position in enumerate(loud_positions):
-        row = plan.row_offsets[request] + position
+        row = plan.row_offsets[request] + position - plan.probe_starts[request]
         # Descending, so the order the positions are given in is the order they should
         # come back in -- a test that passes on a tie tells us nothing.
         fresh[row] += float(len(loud_positions) - rank)
@@ -229,6 +233,46 @@ class TestSelection(unittest.TestCase):
             plan.sel_positions.tolist(), req.sub_context_fresh_positions()
         )
         self.assertEqual(plan.sel_topk_rows.numel(), 0)
+
+    def test_the_probe_starts_past_the_exact_prefix(self):
+        """A chained request's prefix is neither probed nor scored; with a plain
+        request in the same batch, that one probes only what it computes."""
+        subctx_config.TOPK_RATIO = 0.25
+        # [0, 12) exact prefix, [20, 36) a scanned run: 16 scored tokens, quota 4.
+        chained = make_req(40, [(0, 12, 100), (20, 36, 500)], req_pool_idx=0, ours=[False, True])
+        chained.sub_context_exact_len = 12
+        plain = make_req(30, [], req_pool_idx=1)
+        plain.sub_context_layout = None
+        plain.prefix_indices = torch.arange(700, 725, dtype=torch.int64)
+        self.assertEqual(chained.sub_context_forward_rows(), 28)
+
+        plan, _pool, _fresh_loc, _topk = build([chained, plain])
+        self.assertEqual(plan.probe_starts, [12, 25])
+        self.assertEqual(plan.probe_lens, [28, 5])
+        self.assertEqual(plan.topk_counts, [4, 0])
+        self.assertEqual(plan.probe_cache_loc.numel(), 33)
+
+        kv_pool = FakeKVPool()
+        loud = [33, 21, 28, 25]
+        k = keys_with_deviation(plan, loud, kv_pool)
+        plan.select(k, kv_pool.get_key_buffer(plan.check_layer))
+
+        positions = plan.sel_positions.tolist()
+        mine = positions[: plan.sel_lens[0]]
+        self.assertEqual(
+            sorted(set(mine) - set(chained.sub_context_fresh_positions())), sorted(loud)
+        )
+        self.assertEqual(positions[plan.sel_lens[0] :], plain.sub_context_fresh_positions())
+        self.assertTrue(all(p >= 12 for p in mine))
+        # Rows index the probe: position - start + offset.
+        self.assertEqual(
+            plan.sel_rows.tolist()[: plan.sel_lens[0]],
+            [p - 12 for p in positions[: plan.sel_lens[0]]],
+        )
+        self.assertEqual(
+            plan.sel_rows.tolist()[plan.sel_lens[0] :],
+            [plan.row_offsets[1] + p - 25 for p in positions[plan.sel_lens[0] :]],
+        )
 
     def test_each_request_gets_its_own_quota(self):
         subctx_config.TOPK_RATIO = 0.25

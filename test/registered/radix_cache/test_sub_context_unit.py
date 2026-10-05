@@ -94,6 +94,7 @@ class FakeRotator:
         self.max_delta = max_delta
         self.calls = []
         self.stages = []
+        self.copies = []
 
     def can_rotate(self, delta: int) -> bool:
         return delta != 0 and abs(delta) <= self.max_delta
@@ -103,6 +104,9 @@ class FakeRotator:
         # Recorded so a test can tell a read-path rotation from a finish-path one.
         self.calls.append((src_loc.tolist(), dst_loc.tolist(), delta))
         self.stages.append(stage)
+
+    def copy_into(self, dst_loc, src_loc, stage="subctx_copy"):
+        self.copies.append((src_loc.tolist(), dst_loc.tolist()))
 
 
 def make_cache(
@@ -1178,11 +1182,45 @@ def wide_pool(pool, width: int = 512):
     return pool
 
 
-class TestScanDrivenReuse(unittest.TestCase):
-    """Scan path: reused runs anywhere in the prompt, the gaps computed."""
+def prefill_chained(cache, pool, req: Req, first_slot: int) -> None:
+    """Match, write req_to_token as the sparse prefill does, then cache the prompt.
+
+    Takes the scheduler's lock on ``last_node`` as the prefill adder does.
+    """
+    req.init_next_round_input(cache)
+    cache.inc_lock_ref(req.last_node)
+    n = len(req.fill_ids)
+    row = req.req_pool_idx
+    if req.sub_context_layout is None:
+        reused = len(req.prefix_indices)
+        pool.req_to_token[row, :reused] = req.prefix_indices
+        pool.req_to_token[row, reused:n] = torch.arange(
+            first_slot, first_slot + n - reused, dtype=torch.int64
+        )
+    else:
+        for start, end, slots in req.sub_context_layout:
+            pool.req_to_token[row, start:end] = slots
+        fresh = req.sub_context_fresh_positions()
+        pool.req_to_token[row, fresh] = torch.arange(
+            first_slot, first_slot + len(fresh), dtype=torch.int64
+        )
+    req.sub_context_rotated_slots = None  # as prepare_for_extend does
+    cache.cache_unfinished_req(req)
+
+
+def chain_slots(cache, ids, extra_key=None):
+    return cache.match_prefix(
+        MatchPrefixParams(key=RadixKey(list(ids), extra_key))
+    ).device_indices.tolist()
+
+
+class TestChainedIndex(unittest.TestCase):
+    """Index arms: a request is matched and stored as one chain like a plain request;
+    the index records where each registered chunk sits in the tree."""
 
     HEAD_A = list(range(1, 41))
     HEAD_B = list(range(900, 910))
+    HEAD_C = list(range(800, 840))
     TAIL = list(range(500, 540))
     MORE = list(range(700, 740))
 
@@ -1190,6 +1228,7 @@ class TestScanDrivenReuse(unittest.TestCase):
         self._saved = (
             subctx_config.HASH_SUBCONTEXT_KEYS,
             subctx_config.INDEX_SUBCONTEXTS,
+            subctx_config.TOPK_RATIO,
         )
         subctx_config.HASH_SUBCONTEXT_KEYS = True
         subctx_config.INDEX_SUBCONTEXTS = True
@@ -1198,212 +1237,322 @@ class TestScanDrivenReuse(unittest.TestCase):
         (
             subctx_config.HASH_SUBCONTEXT_KEYS,
             subctx_config.INDEX_SUBCONTEXTS,
+            subctx_config.TOPK_RATIO,
         ) = self._saved
 
-    def _seeded(self, first_blocks):
+    def _cache(self):
         cache, pool, allocator = make_cache(rotator=FakeRotator())
         wide_pool(pool)
         cache.sub_context_index = SubContextIndex(min_chunk_tokens=32)
-        first = make_req("r1", first_blocks, [SYS_KEY, MSG_KEY])
-        prefill(cache, pool, first, first_slot=100)
-        decode_and_finish(cache, pool, first, [], first_slot=400)
         return cache, pool, allocator
 
-    def test_a_block_behind_a_miss_is_reused_where_it_lands(self):
-        """The whole point. The head changes, so the stitch reaches nothing; the block
-        behind it is cached, 30 positions from where it was computed, and reusable."""
-        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
+    def _seeded(self, first_blocks, output=()):
+        cache, pool, allocator = self._cache()
+        first = make_req("r1", first_blocks, [SYS_KEY, MSG_KEY])
+        prefill_chained(cache, pool, first, first_slot=100)
+        decode_and_finish(cache, pool, first, list(output), first_slot=400)
+        return cache, pool, allocator
 
-        second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
-        second.init_next_round_input(cache)
-        self.addCleanup(second.release_sub_context_match_locks, cache)
+    def _cid(self, ids, extra_key=None):
+        return sub_context_chunk_id(ids, extra_key)
 
-        # Reused at 10, computed at 40: rotated by -30, and every token of it taken
-        # except the last, which prefill must run to produce logits.
+    def test_a_request_is_stored_as_one_chain_with_its_blocks_located(self):
+        cache, _, _ = self._seeded([self.HEAD_A, self.TAIL])
+
         self.assertEqual(
-            [(start, end) for start, end, _ in second.sub_context_layout], [(10, 49)]
+            chain_slots(cache, self.HEAD_A + self.TAIL), list(range(100, 180))
         )
-        self.assertEqual(len(second.prefix_indices), 39)
-        self.assertEqual(cache.kv_rotator.calls[-1][2], -30)
+        # No per-block namespace.
+        self.assertEqual(chain_slots(cache, self.TAIL, self._cid(self.TAIL)), [])
+        self.assertEqual(len(cache.sub_context_index), 2)
+        slots, _node, start = cache.chain_chunk_slots(self._cid(self.TAIL))
+        self.assertEqual(start, 40)
+        self.assertEqual(slots.tolist(), list(range(140, 180)))
+        self.assertEqual(cache.protected_size(), 0)
 
-    def test_a_run_reused_only_in_part_is_never_filed(self):
-        """A trimmed run's tokens are a prefix of the chunk holding them, so they
-        address a different namespace. Filing it there would give one set of slots two
-        owners, so the block is marked and both insert paths skip it."""
-        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
+    def test_a_block_behind_a_miss_is_copied_rotated_and_computed_around(self):
+        cache, _, _ = self._seeded([self.HEAD_A, self.TAIL])
         second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
         second.init_next_round_input(cache)
+        self.addCleanup(second.release_sub_context_rotated_slots, cache)
         self.addCleanup(second.release_sub_context_match_locks, cache)
 
-        # [short head, the 39 reused tokens, the one token left to compute]
-        self.assertEqual([len(b) for b in second.sub_context_ids], [10, 39, 1])
-        self.assertEqual(second.sub_context_no_insert, [True, True, True])
+        # Computed at 40, reused at 10; the last token is left for prefill.
+        self.assertEqual(
+            [(s, e) for s, e, _ in second.sub_context_layout], [(10, 49)]
+        )
+        src, dst, delta = cache.kv_rotator.calls[-1]
+        self.assertEqual(src, list(range(140, 179)))
+        self.assertEqual(delta, -30)
+        self.assertEqual(second.sub_context_layout[0][2].tolist(), dst)
+        self.assertEqual(second.sub_context_exact_len, 0)
+        self.assertEqual(second.sub_context_rotated, 39)
+        self.assertEqual(
+            second.sub_context_fresh_positions(), list(range(0, 10)) + [49]
+        )
 
-    def test_a_grown_tail_reuses_its_earlier_self(self):
-        """This turn's conversation contains last turn's: the earlier tail is found and
-        reused, and only the new tokens are computed, as a block of their own.
-        """
-        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
+    def test_the_plain_prefix_is_exact_and_not_scored(self):
+        cache, _, _ = self._seeded([self.HEAD_A, self.TAIL])
+        subctx_config.TOPK_RATIO = 0.5
+        second = make_req(
+            "r2", [self.HEAD_A, self.MORE + self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1
+        )
+        second.init_next_round_input(cache)
+        self.addCleanup(second.release_sub_context_rotated_slots, cache)
+        self.addCleanup(second.release_sub_context_match_locks, cache)
 
+        self.assertEqual(
+            [(s, e) for s, e, _ in second.sub_context_layout], [(0, 40), (80, 119)]
+        )
+        self.assertEqual(second.sub_context_layout[0][2].tolist(), list(range(100, 140)))
+        self.assertEqual(second.sub_context_exact_len, 40)
+        self.assertEqual(second.cache_protected_len, 40)
+        self.assertEqual(second.sub_context_reused_positions(), list(range(80, 119)))
+        self.assertEqual(second.sub_context_reused_ours(), [True] * 39)
+        self.assertEqual(second.sub_context_topk_count(), 19)
+
+    def test_a_grown_conversation_is_a_plain_prefix_hit(self):
+        cache, _, allocator = self._seeded([self.HEAD_A, self.TAIL])
         grown = make_req(
             "r2", [self.HEAD_A, self.TAIL + self.MORE], [SYS_KEY, MSG_KEY], req_pool_idx=1
         )
         grown.init_next_round_input(cache)
-        self.addCleanup(grown.release_sub_context_match_locks, cache)
 
-        # The head is at its own position and the tail's earlier self right behind it;
-        # only the 40 new tokens are left to compute.
-        self.assertEqual(
-            [(start, end) for start, end, _ in grown.sub_context_layout],
-            [(0, 40), (40, 80)],
-        )
-        self.assertEqual(len(grown.prefix_indices), 80)
-        self.assertEqual([len(b) for b in grown.sub_context_ids], [40, 40, 40])
+        self.assertIsNone(grown.sub_context_layout)
+        self.assertEqual(grown.prefix_indices.tolist(), list(range(100, 180)))
+        self.assertEqual(grown.cache_protected_len, 80)
+        self.assertEqual(cache.kv_rotator.calls, [])
+        self.assertEqual(allocator.allocated, [])
 
-    def test_no_slot_ends_up_with_two_owners(self):
-        """After a scan-driven prefill and finish, no slot is held by two namespaces."""
-        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
-
-        grown = make_req(
-            "r2", [self.HEAD_A, self.TAIL + self.MORE], [SYS_KEY, MSG_KEY], req_pool_idx=1
-        )
-        prefill(cache, pool, grown, first_slot=1000)
-        decode_and_finish(cache, pool, grown, [], first_slot=2000)
-
-        shared = {
-            slot: owners
-            for slot, owners in tree_slot_owners(cache).items()
-            if len(owners) > 1
-        }
-        self.assertEqual(shared, {}, f"slots claimed by two namespaces: {shared}")
-
-    def test_a_trimmed_run_at_its_own_position_is_not_freed(self):
-        """A run reused in place and trimmed by one token: its slots stay with the tree
-        (freed only after asking the namespace that holds them).
-        """
+    def test_a_run_at_its_own_position_on_another_chain_is_copied(self):
         cache, pool, allocator = self._seeded([self.HEAD_A, self.TAIL])
-        cached = cache.match_prefix(
-            MatchPrefixParams(
-                key=RadixKey(self.TAIL, sub_context_chunk_id(self.TAIL, None))
-            )
-        ).device_indices.tolist()
-        self.assertEqual(len(cached), len(self.TAIL))
+        second = make_req("r2", [self.HEAD_C, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        prefill_chained(cache, pool, second, first_slot=5000)
+        decode_and_finish(cache, pool, second, [], first_slot=6000)
 
-        # The same prompt again: the tail is at its own position, so delta is zero and
-        # the slots handed to this request are the node's.
-        again = make_req("r2", [self.HEAD_A, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
-        again.init_next_round_input(cache)
-        self.assertEqual(again.sub_context_no_insert[1], True)
-        self.assertEqual(again.sub_context_source_key[1], sub_context_chunk_id(self.TAIL, None))
         self.assertEqual(cache.kv_rotator.calls, [], "nothing to rotate at delta zero")
+        self.assertEqual(len(cache.kv_rotator.copies), 1)
+        src, dst = cache.kv_rotator.copies[0]
+        self.assertEqual(src, list(range(140, 179)))
+        owners = tree_slot_owners(cache)
+        self.assertEqual(len(owners), 80 + 80, "a slot is held by two nodes")
+        self.assertEqual(set(allocator.freed) & set(owners), set())
+        self.assertEqual(chain_slots(cache, self.HEAD_C + self.TAIL)[40:79], dst)
+        self.assertEqual(cache.protected_size(), 0)
 
-        prefill(cache, pool, again, first_slot=1000)
-        decode_and_finish(cache, pool, again, [], first_slot=2000)
+    def test_a_chunk_is_read_at_its_oldest_location_then_the_next(self):
+        """Copies keep the first location ahead; once it is evicted the next one serves."""
+        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
+        second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        prefill_chained(cache, pool, second, first_slot=5000)
+        decode_and_finish(cache, pool, second, [], first_slot=6000)
 
-        returned = set(allocator.freed)
+        cid = self._cid(self.TAIL)
         self.assertEqual(
-            returned & set(cached),
-            set(),
-            "gave back slots the tree is still serving",
+            [start for _node, start in cache.sub_context_index.locations(cid)], [40, 10]
         )
+        slots, _node, start = cache.chain_chunk_slots(cid)
+        self.assertEqual((start, slots.tolist()), (40, list(range(140, 180))))
 
-    def test_the_stitch_leaves_no_layout_behind(self):
-        """Both paths write the same fields, and the batch reads `sub_context_layout` to
-        decide the shape of the whole pass. A layout left over from a scan that was then
-        abandoned would place freed slots into req_to_token."""
-        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
-        second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        # Reading the chunk refreshed the first chain; touch the second after it, so
+        # the first is the least recently used leaf.
+        second_slots = chain_slots(cache, self.HEAD_B + self.TAIL)
+        cache.evict(EvictParams(num_tokens=1))
+        self.assertEqual(chain_slots(cache, self.HEAD_A + self.TAIL), [])
+        slots, _node, start = cache.chain_chunk_slots(cid)
+        self.assertEqual(start, 10)
+        self.assertEqual(slots.tolist(), second_slots[10:50])
+        self.assertEqual(len(cache.sub_context_index.locations(cid)), 1)
+
+    def test_a_refused_request_drops_its_runs(self):
+        """Not admitted: its locks and copies go back. With no room and nothing else
+        running, later matches take the prefix only."""
+        cache, _, allocator = self._seeded([self.HEAD_A, self.TAIL])
+        second = make_req(
+            "r2", [self.HEAD_A, self.MORE + self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1
+        )
         second.init_next_round_input(cache)
-        self.assertIsNotNone(second.sub_context_layout)
-        second.release_sub_context_match_locks(cache)
+        copies = second.sub_context_layout[1][2].tolist()
+        self.assertGreater(cache.protected_size(), 0)
 
-        second._stitch_sub_contexts(cache)
-        self.addCleanup(second.release_sub_context_match_locks, cache)
+        self.assertIsNotNone(second.sub_context_tally)
+        self.assertFalse(second.release_sub_context_scan(cache))
+        self.assertEqual(cache.protected_size(), 0)
+        self.assertEqual(sorted(allocator.freed), copies)
+        self.assertFalse(second.sub_context_index_declined)
+        self.assertIsNone(second.sub_context_tally, "a refused match is not counted")
+
+        second.init_next_round_input(cache)
+        self.assertIsNotNone(second.sub_context_layout, "a plain refusal retries the scan")
+        self.assertTrue(second.release_sub_context_scan(cache, no_room=True))
+        self.assertTrue(second.sub_context_index_declined)
+        self.assertFalse(second.release_sub_context_scan(cache, no_room=True))
+        self.assertEqual(cache.sub_context_index.no_room, 1)
+
+        second.init_next_round_input(cache)
         self.assertIsNone(second.sub_context_layout)
-        self.assertIsNone(second.sub_context_no_insert)
+        self.assertEqual(second.prefix_indices.tolist(), list(range(100, 140)))
+        self.assertEqual(cache.protected_size(), 0)
 
-    def test_the_positions_left_to_compute_are_the_gaps(self):
-        """What prefill is handed: the complement of the layout, ascending, ending at
-        the last position -- whose logits become the next token."""
-        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
+    def test_eviction_forgets_the_chunks_it_removes(self):
+        cache, _, _ = self._seeded([self.HEAD_A, self.TAIL])
+        cache.evict(EvictParams(num_tokens=10**6))
+        self.assertEqual(len(cache.sub_context_index), 0)
+        self.assertEqual(cache._chunks_at, {})
+
         second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
         second.init_next_round_input(cache)
+        self.assertIsNone(second.sub_context_layout)
+
+    def test_a_split_moves_a_chunk_to_the_node_now_holding_its_end(self):
+        cache, _, _ = self._seeded([self.HEAD_A, self.TAIL])
+        # Splits the 80-token node at 50: [0, 50) and [50, 80).
+        chain_slots(cache, self.HEAD_A + self.TAIL[:10] + [1, 2, 3])
+
+        node, start = cache.sub_context_index.location(self._cid(self.HEAD_A))
+        self.assertEqual((node.canonical_position, len(node.key), start), (0, 50, 0))
+        slots, _, _ = cache.chain_chunk_slots(self._cid(self.HEAD_A))
+        self.assertEqual(slots.tolist(), list(range(100, 140)))
+        slots, tail_node, start = cache.chain_chunk_slots(self._cid(self.TAIL))
+        self.assertEqual((tail_node.canonical_position, start), (50, 40))
+        self.assertEqual(slots.tolist(), list(range(140, 180)))
+
+        # Evicting the lower half keeps the chunk that ends above it.
+        cache.evict(EvictParams(num_tokens=30))
+        self.assertIsNone(cache.sub_context_index.location(self._cid(self.TAIL)))
+        self.assertIsNotNone(cache.chain_chunk_slots(self._cid(self.HEAD_A)))
+
+    def test_the_reply_is_registered_with_the_last_block(self):
+        cache, _, _ = self._seeded([self.HEAD_A, self.TAIL], output=self.MORE)
+        reply = self._cid(self.TAIL + self.MORE)
+        slots, _node, start = cache.chain_chunk_slots(reply)
+        self.assertEqual(start, 40)
+        self.assertEqual(slots.tolist(), list(range(140, 180)) + list(range(400, 440)))
+
+        second = make_req(
+            "r2", [self.HEAD_B, self.TAIL + self.MORE + [7, 7]], [SYS_KEY, MSG_KEY],
+            req_pool_idx=1,
+        )
+        second.init_next_round_input(cache)
+        self.addCleanup(second.release_sub_context_rotated_slots, cache)
         self.addCleanup(second.release_sub_context_match_locks, cache)
+        self.assertEqual([(s, e) for s, e, _ in second.sub_context_layout], [(10, 90)])
+        self.assertEqual(cache.kv_rotator.calls[-1][2], -30)
 
-        fresh = second.sub_context_fresh_positions()
-        self.assertEqual(fresh, list(range(0, 10)) + [49])
-        self.assertEqual(len(fresh), second.extend_input_len)
-        self.assertEqual(fresh[-1], len(second.origin_input_ids) - 1)
+    def test_a_layout_too_big_for_one_pass_keeps_the_prefix_only(self):
+        """Known before copying: nothing is locked or copied."""
+        cache, _, allocator = self._seeded([self.HEAD_A, self.TAIL])
+        second = make_req(
+            "r2", [self.HEAD_A, self.MORE + self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1
+        )
+        second._fits_one_pass = lambda to_compute: False
+        second.init_next_round_input(cache)
 
-    def test_the_finish_audit_counts_a_trimmed_run_as_tree_owned(self):
-        """A trimmed run reused in place is held by its source namespace, so the
-        finish audit reports nothing lost."""
+        self.assertIsNone(second.sub_context_layout)
+        self.assertEqual(second.sub_context_exact_len, 0)
+        self.assertEqual(second.prefix_indices.tolist(), list(range(100, 140)))
+        self.assertEqual(cache.kv_rotator.calls, [])
+        self.assertEqual(allocator.allocated, [])
+        self.assertIsNone(second.sub_context_match_nodes)
+        self.assertEqual(cache.protected_size(), 0)
+        self.assertEqual(second.sub_context_tally[4], 1)
+        self.assertEqual(second.sub_context_moved, 39)
+
+    def test_a_layout_left_too_big_by_failed_copies_keeps_the_prefix_only(self):
+        """The check after copying: the copies made go back."""
+        cache, _, allocator = self._seeded([self.HEAD_A, self.TAIL])
+        second = make_req(
+            "r2", [self.HEAD_A, self.MORE + self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1
+        )
+        second._sub_context_layout_fits_one_pass = lambda: False
+        second.init_next_round_input(cache)
+
+        self.assertIsNone(second.sub_context_layout)
+        self.assertEqual(second.prefix_indices.tolist(), list(range(100, 140)))
+        self.assertEqual(sorted(allocator.freed), sorted(cache.kv_rotator.calls[-1][1]))
+        self.assertIsNone(second.sub_context_match_nodes)
+        self.assertEqual(cache.protected_size(), 0)
+        self.assertEqual(second.sub_context_tally[4], 1)
+        self.assertEqual((second.sub_context_moved, second.sub_context_rotated), (39, 0))
+
+    def test_a_run_out_of_rotation_range_is_never_locked(self):
+        cache, pool, allocator = make_cache(rotator=FakeRotator(max_delta=5))
+        wide_pool(pool)
+        cache.sub_context_index = SubContextIndex(min_chunk_tokens=32)
+        first = make_req("r1", [self.HEAD_A, self.TAIL], [SYS_KEY, MSG_KEY])
+        prefill_chained(cache, pool, first, first_slot=100)
+        decode_and_finish(cache, pool, first, [], first_slot=400)
+
+        second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        second.init_next_round_input(cache)
+        self.assertIsNone(second.sub_context_layout)
+        self.assertEqual(cache.protected_size(), 0)
+        self.assertEqual(allocator.allocated, [])
+        self.assertEqual((second.sub_context_moved, second.sub_context_discarded), (39, 39))
+
+    def test_a_request_is_counted_once(self):
+        """Matched again after it ran (a retraction): the tallies do not grow."""
+        cache, _, _ = self._seeded([self.HEAD_A, self.TAIL])
+        index = cache.sub_context_index
+        second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        second.init_next_round_input(cache)
+        self.addCleanup(second.release_sub_context_rotated_slots, cache)
+        self.addCleanup(second.release_sub_context_match_locks, cache)
+        before = index.prompt_tokens
+        second.count_sub_context_match(index)
+        self.assertEqual(index.prompt_tokens - before, 50)
+        self.assertEqual(index.reused_tokens, 39)
+
+        second.release_sub_context_match_locks(cache)
+        second.release_sub_context_rotated_slots(cache)
+        second.init_next_round_input(cache)
+        second.count_sub_context_match(index)
+        self.assertEqual(index.prompt_tokens - before, 50)
+        self.assertIsNone(second.sub_context_tally)
+
+    def test_a_cache_salt_scopes_the_scan(self):
+        cache, pool, _ = self._cache()
+        ids = self.HEAD_A + self.TAIL
+        first = Req(
+            rid="r1", origin_input_text="", origin_input_ids=ids,
+            sampling_params=SamplingParams(max_new_tokens=8),
+            sub_context_ids=[self.HEAD_A, self.TAIL],
+            sub_context_extra_keys=[SYS_KEY, MSG_KEY], extra_key="salt-a",
+        )
+        first.req_pool_idx = 0
+        prefill_chained(cache, pool, first, first_slot=100)
+        decode_and_finish(cache, pool, first, [], first_slot=400)
+        self.assertEqual(chain_slots(cache, ids, "salt-a"), list(range(100, 180)))
+
+        second = Req(
+            rid="r2", origin_input_text="",
+            origin_input_ids=self.HEAD_B + self.TAIL,
+            sampling_params=SamplingParams(max_new_tokens=8),
+            sub_context_ids=[self.HEAD_B, self.TAIL],
+            sub_context_extra_keys=[SYS_KEY, MSG_KEY], extra_key="salt-b",
+        )
+        second.req_pool_idx = 1
+        second.init_next_round_input(cache)
+        self.assertIsNone(second.sub_context_layout)
+        self.assertEqual(len(second.prefix_indices), 0)
+
+    def test_every_lock_is_released_and_no_slot_is_lost(self):
+        """The finish audit sees every slot the request held freed or in the tree."""
         from sglang.srt.mem_cache import radix_cache
 
-        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
-        again = make_req("r2", [self.HEAD_A, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
-        prefill(cache, pool, again, first_slot=1000)
-        self.assertIsNotNone(again.sub_context_source_key[1])
-
-        self.addCleanup(setattr, radix_cache, "AUDIT_ON", radix_cache.AUDIT_ON)
-        radix_cache.AUDIT_ON = True
-        with self.assertNoLogs(radix_cache.logger, level="ERROR"):
-            decode_and_finish(cache, pool, again, [], first_slot=2000)
-
-    def test_a_rotated_run_is_counted_as_rotated_not_moved(self):
-        """`moved` counts displaced hits that were not rotated in, as on the stitch."""
-        cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
-        second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
-        second.init_next_round_input(cache)
-        self.addCleanup(second.release_sub_context_match_locks, cache)
-
-        self.assertEqual(second.sub_context_rotated, 39)
-        self.assertEqual(second.sub_context_moved, 0)
-        self.assertEqual(second.sub_context_discarded, 0)
-
-    def test_a_retracted_request_reuses_nothing_past_its_prompt(self):
-        """A retracted request's fill_ids hold its output after the prompt. A run
-        reaching into that output is trimmed to the prompt, here below the minimum."""
         cache, pool, allocator = self._seeded([self.HEAD_A, self.TAIL])
         second = make_req(
-            "r2", [self.HEAD_B, self.TAIL[:30]], [SYS_KEY, MSG_KEY], req_pool_idx=1
+            "r2", [self.HEAD_A, self.MORE + self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1
         )
-        second.output_ids = list(self.TAIL[30:])  # retracted after generating these
-        second.init_next_round_input(cache)
-        self.addCleanup(second.release_sub_context_match_locks, cache)
+        prefill_chained(cache, pool, second, first_slot=5000)
+        self.assertIsNone(second.sub_context_match_nodes)
+        decode_and_finish(cache, pool, second, [7, 8], first_slot=6000)
+        self.assertEqual(cache.protected_size(), 0)
 
-        self.assertEqual(cache.kv_rotator.calls, [], "rotated a run past the prompt")
-        self.assertEqual(allocator.allocated, [])
-        prompt = len(second.origin_input_ids)
-        for start, end, _ in second.sub_context_layout or []:
-            self.assertLessEqual(end, prompt)
-
-    def test_a_trimmed_run_is_marked_when_its_trimmed_span_is_a_chunk_too(self):
-        """Chunk B (registered first) trimmed by one token covers the same span as
-        chunk A == B[:-1]. The selected B must still be marked as trimmed, or finish
-        rotates B's tree slots in place and frees them."""
-        cache, pool, allocator = self._seeded([self.HEAD_A, self.TAIL])
-        # A == TAIL[:-1], registered at another position.
-        other = make_req(
-            "r2", [self.HEAD_B, self.TAIL[:-1]], [SYS_KEY, MSG_KEY], req_pool_idx=1
-        )
-        prefill(cache, pool, other, first_slot=1000)
-        decode_and_finish(cache, pool, other, [], first_slot=2000)
-        tail_key = sub_context_chunk_id(self.TAIL, None)
-        tail_slots = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(self.TAIL, tail_key))
-        ).device_indices.tolist()
-        self.assertEqual(len(tail_slots), len(self.TAIL))
-
-        again = make_req("r3", [self.HEAD_A, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=2)
-        again.init_next_round_input(cache)
-        self.assertEqual(again.sub_context_source_key[1], tail_key)
-        self.assertTrue(again.sub_context_no_insert[1])
-
-        prefill(cache, pool, again, first_slot=3000)
-        decode_and_finish(cache, pool, again, [], first_slot=4000)
-        self.assertEqual(set(allocator.freed) & set(tail_slots), set())
-        self.assertEqual(cache.kv_rotator.calls, [])
+        held = set(pool.req_to_token[1, :122].tolist())
+        owners = tree_slot_owners(cache)
+        self.assertEqual(held - set(owners) - set(allocator.freed), set(), "lost slots")
+        self.assertEqual(held & set(owners) & set(allocator.freed), set(), "freed but held")
 
 
 class TestRetractedRequest(unittest.TestCase):

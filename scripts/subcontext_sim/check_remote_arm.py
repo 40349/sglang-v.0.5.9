@@ -119,6 +119,15 @@ def main() -> int:
         )
         return 1
 
+    if args.index and not sub.get("chain_storage"):
+        print(
+            "REFUSING: the server runs the index arm with per-block namespaces (no "
+            "`chain_storage`), the storage before 2026-10-05. Its numbers do not "
+            "compare with chained runs; update that checkout and restart the server.",
+            file=sys.stderr,
+        )
+        return 1
+
     if args.split_mode is not None and sub.get("split_mode") != args.split_mode:
         print(
             f"REFUSING: asked for split_mode={args.split_mode} but the server reports "

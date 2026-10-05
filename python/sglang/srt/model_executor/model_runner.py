@@ -2318,7 +2318,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> LogitsProcessorOutput:
         """Selective-recompute prefill in two layer ranges.
 
-        Layers ``[0, check_layer]`` run every prompt position; the scored layer selects
+        Layers ``[0, check_layer]`` run each prompt from its probe start on (the
+        positions in ``forward_batch.positions``); the scored layer selects
         the tokens to recompute. Layers after it run only the fresh plus selected
         tokens. The attention metadata is rebuilt in between, since the row count and
         req_to_token have both changed.

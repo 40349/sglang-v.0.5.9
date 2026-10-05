@@ -675,6 +675,17 @@ class Req(ReqDllmMixin):
         self.sub_context_layout: Optional[List[Tuple[int, int, torch.Tensor]]] = None
         # Parallel to the layout: whether the run sits on this request's rotated copy.
         self.sub_context_layout_ours: Optional[List[bool]] = None
+        # Chained requests: the prefix the plain match reached. The layout's run over
+        # it is exact and is not scored by selective recompute.
+        self.sub_context_exact_len: int = 0
+        # Chained requests: refused for KV room while holding scanned runs with
+        # nothing else running. Matched on the prefix only from then on.
+        self.sub_context_index_declined: bool = False
+        # Chained requests: the last match's (prompt, prefix, found, rotated, fell
+        # back) tokens and flag, added to the index tallies the first time the request
+        # runs (`sub_context_counted`).
+        self.sub_context_tally: Optional[Tuple[int, int, int, int, int]] = None
+        self.sub_context_counted: bool = False
         # Displaced hits not yet counted as moved, pending `_rotate_append_sub_contexts`.
         self.sub_context_deferred_moved: int = 0
         # Stage 2: offset of the next block that only needs a rotation. The prefill
@@ -1012,23 +1023,13 @@ class Req(ReqDllmMixin):
         max_prefix_len = max(max_prefix_len, 0)
         token_ids = self.fill_ids[:max_prefix_len]
 
-        if tree_cache is not None and tree_cache.serves_sub_contexts(self):
+        if tree_cache is not None and tree_cache.chains_sub_contexts(self):
+            self._scan_sub_contexts(tree_cache, token_ids)
+        elif tree_cache is not None and tree_cache.serves_sub_contexts(self):
             # Matched per namespace only; never against the default namespace.
-            if (
-                subctx_config.INDEX_SUBCONTEXTS
-                and getattr(tree_cache, "sub_context_index", None) is not None
-            ):
-                self._scan_sub_contexts(tree_cache)
-                if not self._sub_context_layout_fits_one_pass():
-                    tree_cache.sub_context_index.fell_back += 1
-                    # A sparse layout cannot be chunked: release it and take the stitch.
-                    self.release_sub_context_match_locks(tree_cache)
-                    self.release_sub_context_rotated_slots(tree_cache)
-                    self._stitch_sub_contexts(tree_cache)
-            else:
-                self._stitch_sub_contexts(tree_cache)
-                if subctx_config.INDEX_DRYRUN:
-                    self._measure_sub_context_scan(tree_cache)
+            self._stitch_sub_contexts(tree_cache)
+            if subctx_config.INDEX_DRYRUN:
+                self._measure_sub_context_scan(tree_cache)
         elif tree_cache is not None:
             if self.has_sub_contexts and not tree_cache.supports_sub_contexts():
                 _warn_sub_contexts_unsupported_once(tree_cache)
@@ -1087,6 +1088,41 @@ class Req(ReqDllmMixin):
         self.sub_context_match_indices = None
         self.sub_context_match_positions = None
 
+    def release_sub_context_scan(
+        self, tree_cache: BasePrefixCache, no_room: bool = False
+    ) -> bool:
+        """Drop what the match took for a request leaving the waiting queue or left in
+        it: the locks on the nodes its runs came from, the copies not yet in
+        req_to_token, and its uncounted tallies.
+
+        ``no_room``: it was refused for KV room with nothing else running. If it held
+        runs, later matches take the prefix only. Returns whether this call made it so.
+        Idempotent.
+        """
+        declined = (
+            no_room
+            and self.sub_context_layout is not None
+            and not self.sub_context_index_declined
+        )
+        if declined:
+            self.sub_context_index_declined = True
+            index = getattr(tree_cache, "sub_context_index", None)
+            if index is not None:
+                index.no_room += 1
+        self.sub_context_tally = None
+        self.release_sub_context_match_locks(tree_cache)
+        self.release_sub_context_rotated_slots(tree_cache)
+        return declined
+
+    def count_sub_context_match(self, index) -> None:
+        """Add the last match to ``index``'s tallies, the first time the request runs."""
+        if self.sub_context_tally is None:
+            return
+        if index is not None and not self.sub_context_counted:
+            index.count_match(*self.sub_context_tally)
+            self.sub_context_counted = True
+        self.sub_context_tally = None
+
     def release_sub_context_rotated_slots(self, tree_cache: BasePrefixCache) -> None:
         """Free rotated copies not yet handed to req_to_token.
 
@@ -1101,6 +1137,7 @@ class Req(ReqDllmMixin):
         # The layout points at the slots just freed.
         self.sub_context_layout = None
         self.sub_context_layout_ours = None
+        self.sub_context_exact_len = 0
 
     def _next_rotatable_boundary(
         self,
@@ -1152,37 +1189,28 @@ class Req(ReqDllmMixin):
         self.sub_context_rotated_slots.append(dst)
         return dst
 
-    def _resplit_for_sub_context_matches(self, resolved) -> None:
-        """Re-cut the prompt so every reused run is a block of its own.
+    def _copy_sub_context_run(
+        self, tree_cache: BasePrefixCache, src_indices: torch.Tensor, delta: int
+    ) -> Optional[torch.Tensor]:
+        """Copy a run's KV to fresh slots of this request's own, K rotated by
+        ``delta`` (copied unchanged at zero).
 
-        Cuts at every run's start and end, and at the boundaries the request arrived
-        with except those inside a run. A reused block's address is then the chunk
-        holding its slots, and new work is stored as its own chunk.
+        Returns the new slots, or None when the delta is out of range or the pool is
+        full (the caller then recomputes the run). ``src_indices`` is not written.
         """
-        blocks = self.sub_context_ids_as_sent
-        prompt = [tok for block in blocks for tok in block]
-
-        sent_boundaries, at = [], 0
-        for block in blocks:
-            at += len(block)
-            sent_boundaries.append(at)
-
-        cuts = {0, len(prompt)}
-        for start, end, _slots, _cut, _cid in resolved:
-            cuts.add(start)
-            cuts.add(end)
-        for boundary in sent_boundaries:
-            if not any(
-                start < boundary < end for start, end, _s, _c, _k in resolved
-            ):
-                cuts.add(boundary)
-
-        edges = sorted(c for c in cuts if 0 <= c <= len(prompt))
-        self.sub_context_ids = [p for a, b in zip(edges, edges[1:]) if (p := prompt[a:b])]
-        self.sub_context_extra_keys = [
-            sub_context_chunk_id(block, self.extra_key)
-            for block in self.sub_context_ids
-        ]
+        if delta != 0:
+            return self._rotate_sub_context_block(tree_cache, src_indices, delta)
+        rotator = getattr(tree_cache, "kv_rotator", None)
+        if rotator is None:
+            return None
+        dst = tree_cache.token_to_kv_pool_allocator.alloc(len(src_indices))
+        if dst is None:
+            return None
+        rotator.copy_into(dst, src_indices)
+        if self.sub_context_rotated_slots is None:
+            self.sub_context_rotated_slots = []
+        self.sub_context_rotated_slots.append(dst)
+        return dst
 
     def sub_context_fresh_positions(self) -> List[int]:
         """The positions this pass computes, ascending: the tail after the reused
@@ -1199,50 +1227,77 @@ class Req(ReqDllmMixin):
         fresh.extend(range(cursor, n))
         return fresh
 
+    def _scored_runs(self) -> List[Tuple[int, int, torch.Tensor, bool]]:
+        """The layout's runs selective recompute scores, as ``(start, end, slots,
+        ours)``: every run but the one over the plain prefix match.
+        """
+        if self.sub_context_layout is None:
+            return []
+        ours = self.sub_context_layout_ours or [False] * len(self.sub_context_layout)
+        return [
+            (start, end, slots, flag)
+            for (start, end, slots), flag in zip(self.sub_context_layout, ours)
+            if start >= self.sub_context_exact_len
+        ]
+
     def sub_context_reused_positions(self) -> List[int]:
-        """The positions this pass reads from the cache, ascending.
+        """The scored positions this pass reads from the cache, ascending.
 
         Same order as the slots ``sub_context_reused_slots`` returns. Empty on the
         stitch path.
         """
-        if self.sub_context_layout is None:
-            return []
         reused: List[int] = []
-        for start, end, _slots in self.sub_context_layout:
+        for start, end, _slots, _ours in self._scored_runs():
             reused.extend(range(start, end))
         return reused
 
     def sub_context_reused_slots(self) -> List[torch.Tensor]:
         """The cache rows behind ``sub_context_reused_positions``, in the same order."""
-        if self.sub_context_layout is None:
-            return []
-        return [slots for _start, _end, slots in self.sub_context_layout]
+        return [slots for _start, _end, slots, _ours in self._scored_runs()]
 
     def sub_context_reused_ours(self) -> List[bool]:
-        """Per reused position: whether its row is this request's rotated copy."""
-        if self.sub_context_layout is None:
-            return []
-        ours = self.sub_context_layout_ours or [False] * len(self.sub_context_layout)
+        """Per scored position: whether its row is this request's rotated copy."""
         return [
-            flag
-            for (start, end, _slots), flag in zip(self.sub_context_layout, ours)
+            ours
+            for start, end, _slots, ours in self._scored_runs()
             for _ in range(end - start)
         ]
 
     def sub_context_topk_count(self) -> int:
-        """How many reused tokens this pass recomputes: ``TOPK_RATIO`` of them."""
+        """How many reused tokens this pass recomputes: ``TOPK_RATIO`` of the scored
+        ones.
+        """
         if self.sub_context_layout is None or not subctx_config.topk_active():
             return 0
-        n_reused = sum(end - start for start, end, _slots in self.sub_context_layout)
+        n_reused = sum(end - start for start, end, _s, _o in self._scored_runs())
         return min(n_reused, int(n_reused * subctx_config.TOPK_RATIO))
 
     def sub_context_forward_rows(self) -> int:
-        """Rows the prefill forward runs: the whole prompt when selective recompute
-        probes it, otherwise the tokens to compute.
+        """Rows the prefill forward runs: from ``sub_context_probe_start`` on when
+        selective recompute probes the prompt, otherwise the tokens to compute.
         """
         if self.sub_context_layout is not None and subctx_config.topk_active():
-            return len(self.fill_ids)
+            return len(self.fill_ids) - self.sub_context_probe_start()
         return self.extend_input_len
+
+    def sub_context_probe_start(self) -> int:
+        """First position selective recompute's probe runs: past the exact prefix of a
+        sparse layout, past the reused prefix otherwise.
+        """
+        if self.sub_context_layout is not None:
+            return self.sub_context_exact_len
+        return len(self.prefix_indices)
+
+    def _fits_one_pass(self, to_compute: int) -> bool:
+        """Whether ``to_compute`` tokens fit one prefill pass
+        (``--chunked-prefill-size``)."""
+        try:
+            budget = get_global_server_args().chunked_prefill_size
+        except ValueError:
+            return True  # no server args (unit tests)
+        if budget is None or budget <= 0:
+            return True
+        return to_compute <= budget
 
     def _sub_context_layout_fits_one_pass(self) -> bool:
         """Whether the sparse layout fits one prefill pass (it cannot be chunked).
@@ -1253,180 +1308,163 @@ class Req(ReqDllmMixin):
         """
         if self.sub_context_layout is None:
             return True
-        try:
-            budget = get_global_server_args().chunked_prefill_size
-        except ValueError:
-            return True  # no server args (unit tests)
-        if budget is None or budget <= 0:
-            return True
-        return len(self.fill_ids) - len(self.prefix_indices) <= budget
+        return self._fits_one_pass(len(self.fill_ids) - len(self.prefix_indices))
 
     @host_timer.timed("subctx_scan")
-    def _scan_sub_contexts(self, tree_cache: BasePrefixCache) -> None:
-        """Find this prompt's cached blocks at any position, with no contiguity rule.
+    def _scan_sub_contexts(
+        self, tree_cache: BasePrefixCache, token_ids: List[int]
+    ) -> None:
+        """Match the prefix as a plain request does, then find this prompt's cached
+        chunks past it.
 
-        Each found run is reused where it lands: in place when it is at the position it
-        was computed at, otherwise as a rotated copy. The gaps are computed. The prompt
-        is then re-cut around the runs (``_resplit_for_sub_context_matches``).
+        Each found run is copied into slots of this request's own, rotated when it sits
+        at another position than it was computed at; the request is later stored as one
+        chain, like a plain one. The gaps are computed. With no run found, or a layout
+        too big for one prefill pass, the request is a plain prefix hit.
         """
         self.release_sub_context_match_locks(tree_cache)
         self.release_sub_context_rotated_slots(tree_cache)
+        self.sub_context_layout = None
+        self.sub_context_layout_ours = None
+        self.sub_context_exact_len = 0
         self.sub_context_ids = self.sub_context_ids_as_sent
-        self.sub_context_extra_keys = [
-            sub_context_chunk_id(block, self.extra_key)
-            for block in self.sub_context_ids_as_sent
-        ]
-
-        index = tree_cache.sub_context_index
-        # Runs end before the last token (prefill must compute at least one) and within
-        # the prompt (a retracted request's fill_ids also hold its output). A run that
-        # overruns is trimmed rather than dropped.
-        prompt_len = sum(len(block) for block in self.sub_context_ids_as_sent)
-        last_computable = min(max(len(self.fill_ids) - 1, 0), prompt_len)
-        # (start, trimmed end, chunk id) -> untrimmed end
-        full_end = {}
-        candidates = []
-        for match in index.scan(self.fill_ids, self.extra_key):
-            end = min(match.end, last_computable)
-            if end - match.start < index.min_chunk_tokens:
-                continue
-            full_end[(match.start, end, match.chunk_id)] = match.end
-            candidates.append(SubContextMatch(match.start, end, match.chunk_id))
-
-        resolved = []
-        nodes = []
-        # Whether a run sits on this request's rotated copy rather than tree rows.
-        ours_by_start: Dict[int, bool] = {}
-        moved = rotated = discarded = 0
-        locked = []
-        for match in index.select(candidates):
-            seg = self.fill_ids[match.start : match.end]
-            probe = tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(token_ids=seg, extra_key=match.chunk_id)
-                )
-            )
-            take = len(probe.device_indices)
-            if take != match.length:
-                # Partly evicted since it was indexed: recompute the whole run.
-                discarded += take
-                continue
-            tree_cache.inc_lock_ref(probe.last_device_node)
-            canonical = tree_cache.matched_canonical_position(
-                probe.last_device_node, take
-            )
-            delta = match.start - (canonical if canonical is not None else match.start)
-            locked.append((match, probe, delta))
-
-        # Room for the rotated copies, evicted while every run above is locked.
-        evict_from_tree_cache(
-            tree_cache, sum(len(p.device_indices) for _m, p, d in locked if d != 0)
-        )
-        for match, probe, delta in locked:
-            take = len(probe.device_indices)
-            if delta == 0:
-                slots = probe.device_indices
-            else:
-                slots = self._rotate_sub_context_block(
-                    tree_cache, probe.device_indices, delta
-                )
-                if slots is None:
-                    # Out of rotation range, or the pool is full: recompute the run.
-                    tree_cache.dec_lock_ref(probe.last_device_node)
-                    moved += take
-                    discarded += take
-                    continue
-                rotated += take
-            ours_by_start[match.start] = delta != 0
-            resolved.append(
-                (
-                    match.start,
-                    match.end,
-                    slots,
-                    full_end[(match.start, match.end, match.chunk_id)] != match.end,
-                    match.chunk_id,
-                )
-            )
-            nodes.append(probe.last_device_node)
-
-        self._resplit_for_sub_context_matches(resolved)
-
-        by_start = {
-            start: (end, slots, cut, cid) for start, end, slots, cut, cid in resolved
-        }
-        n_blocks = len(self.sub_context_ids)
-        match_lens = [0] * n_blocks
-        owned = [0] * n_blocks
-        no_insert = [False] * n_blocks
-        source_key: List[Optional[str]] = [None] * n_blocks
-        layout: List[Tuple[int, int, torch.Tensor]] = []
-        layout_ours: List[bool] = []
-        stitched: List[torch.Tensor] = []
-        for i, (seg_ids, _key, offset) in enumerate(self.iter_sub_contexts()):
-            hit = by_start.get(offset)
-            if hit is None or hit[0] != offset + len(seg_ids):
-                # Fresh. Too short to be worth a namespace: not inserted.
-                no_insert[i] = len(seg_ids) < index.min_chunk_tokens
-                continue
-            end, slots, cut, cid = hit
-            match_lens[i] = owned[i] = len(seg_ids)
-            no_insert[i] = cut
-            if cut:
-                # Trimmed: the slots live under `cid`, not under this block's address.
-                source_key[i] = cid
-            layout.append((offset, end, slots))
-            layout_ours.append(ours_by_start.get(offset, False))
-            stitched.append(slots)
-            if subctx_config.topk_active():
-                # Any reused block may get recomputed tokens: never file it. Fresh
-                # blocks are still inserted.
-                no_insert[i] = True
-
-        self.sub_context_layout = layout or None
-        self.sub_context_layout_ours = layout_ours or None
-        self.sub_context_no_insert = no_insert
-        self.sub_context_source_key = source_key
-        self.sub_context_match_lens = match_lens
-        self.sub_context_owned_lens = owned
+        self.sub_context_no_insert = None
+        self.sub_context_source_key = None
+        self.sub_context_match_lens = None
+        self.sub_context_owned_lens = None
         self.sub_context_tree_owned = None
         self.sub_context_tree_canonical = None
-        # `nodes` holds the locks taken above; the other two are unused on this path.
-        self.sub_context_match_indices = [None] * n_blocks
-        self.sub_context_match_nodes = nodes or None
-        self.sub_context_match_positions = [None] * n_blocks
-        # No Stage 2 on this path.
         self.sub_context_next_boundary = None
         self.sub_context_deferred_moved = 0
+
+        match = tree_cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(token_ids=token_ids, extra_key=self.extra_key)
+            )
+        )
+        prefix = match.device_indices
+        exact = len(prefix)
+        self.prefix_indices = prefix
+        self.last_node = match.last_device_node
+        self.last_host_node = match.last_host_node
+        self.host_hit_length = 0
+        self.mamba_branching_seqlen = None
+        self.cache_protected_len = exact
+
+        index = tree_cache.sub_context_index
+        rotator = getattr(tree_cache, "kv_rotator", None)
+        # Runs start past the prefix and end within `token_ids` (prefill computes at
+        # least the last token). A run that overruns either edge is trimmed.
+        limit = len(token_ids)
+        # Trimmed run -> tokens trimmed off the chunk's head.
+        head = {}
+        candidates = []
+        # Requests returning logprobs take the prefix only under selective recompute.
+        found_runs = (
+            []
+            if self.sub_context_index_declined
+            or (self.return_logprob and subctx_config.topk_active())
+            else index.scan(self.fill_ids, self.extra_key)
+        )
+        for found in found_runs:
+            start, end = max(found.start, exact), min(found.end, limit)
+            if end - start < index.min_chunk_tokens:
+                continue
+            run = SubContextMatch(start, end, found.chunk_id)
+            head[run] = start - found.start
+            candidates.append(run)
+
+        moved = rotated = discarded = 0
+        fell_back = 0
+        located = []
+        for run in index.select(candidates):
+            where = tree_cache.chain_chunk_slots(run.chunk_id)
+            if where is None:
+                discarded += run.length
+                continue
+            slots, node, computed_at = where
+            skip = head[run]
+            delta = run.start - computed_at - skip
+            if delta and (rotator is None or not rotator.can_rotate(delta)):
+                moved += run.length
+                discarded += run.length
+                continue
+            tree_cache.inc_lock_ref(node)
+            located.append((run, slots[skip : skip + run.length], node, delta))
+
+        if located and not self._fits_one_pass(
+            len(self.fill_ids) - exact - sum(r.length for r, _s, _n, _d in located)
+        ):
+            # A sparse layout cannot be chunked: keep the prefix only.
+            fell_back = 1
+            for run, _src, node, delta in located:
+                tree_cache.dec_lock_ref(node)
+                if delta:
+                    moved += run.length
+                discarded += run.length
+            located = []
+
+        if located:
+            # Room for the copies, evicted while the prefix and every run are locked.
+            tree_cache.inc_lock_ref(self.last_node)
+            evict_from_tree_cache(tree_cache, sum(r.length for r, _s, _n, _d in located))
+            tree_cache.dec_lock_ref(self.last_node)
+        runs = []
+        nodes = []
+        for run, src, node, delta in located:
+            dst = self._copy_sub_context_run(tree_cache, src, delta)
+            if dst is None:
+                # Out of rotation range, or the pool is full: recompute the run.
+                tree_cache.dec_lock_ref(node)
+                if delta:
+                    moved += run.length
+                discarded += run.length
+                continue
+            if delta:
+                rotated += run.length
+            runs.append((run.start, run.end, dst))
+            nodes.append(node)
+        self.sub_context_match_nodes = nodes or None
+        self.sub_context_match_indices = None
+        self.sub_context_match_positions = None
+
+        if runs:
+            layout = ([(0, exact, prefix)] if exact else []) + runs
+            self.sub_context_layout = layout
+            self.sub_context_layout_ours = ([False] if exact else []) + [True] * len(
+                runs
+            )
+            self.sub_context_exact_len = exact
+            self.prefix_indices = torch.cat([slots for _s, _e, slots in layout])
+            if not self._sub_context_layout_fits_one_pass():
+                # Copies that failed left more to compute than one pass holds: keep the
+                # prefix only.
+                fell_back = 1
+                self.release_sub_context_match_locks(tree_cache)
+                self.release_sub_context_rotated_slots(tree_cache)
+                self.prefix_indices = prefix
+                discarded += sum(e - s for s, e, _ in runs)
+                moved += rotated
+                runs = []
+                rotated = 0
+
         self.sub_context_moved = moved
         self.sub_context_rotated = rotated
         self.sub_context_discarded = discarded
-        index.reused_tokens += sum(len(slots) for _s, _e, slots in layout)
-        index.rotated_tokens += rotated
-
-        if stitched:
-            self.prefix_indices = torch.cat(stitched)
-        else:
-            self.prefix_indices = torch.empty(
-                (0,), dtype=torch.int64, device=tree_cache.device
-            )
-        self.last_node = tree_cache.root_node
-        self.last_host_node = tree_cache.root_node
-        self.host_hit_length = 0
-        self.mamba_branching_seqlen = None
-        # Reused prefix contiguous from position 0.
-        covered = 0
-        for start, end, _slots in layout:
-            if start != covered:
-                break
-            covered = end
-        self.cache_protected_len = covered
+        self.sub_context_tally = (
+            len(self.fill_ids),
+            exact,
+            sum(e - s for s, e, _ in runs),
+            rotated,
+            fell_back,
+        )
 
         if TRACE_ON:
             trace(
                 f"[TRACE-4 SUBCTX-SCAN] rid={self.rid} prompt={len(self.fill_ids)} "
-                f"reused={len(self.prefix_indices)} moved={moved} rotated={rotated} "
-                f"discarded={discarded} blocks={[len(b) for b in self.sub_context_ids]} "
-                f"layout={[(s, e) for s, e, _ in layout]}"
+                f"prefix={exact} reused={len(self.prefix_indices)} moved={moved} "
+                f"rotated={rotated} discarded={discarded} "
+                f"layout={[(s, e) for s, e, _ in (self.sub_context_layout or [])]}"
             )
 
     @host_timer.timed("subctx_scan")
@@ -1818,6 +1856,8 @@ class Req(ReqDllmMixin):
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        # Sub-context: a retracted request may scan the index again.
+        self.sub_context_index_declined = False
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -2160,15 +2200,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
+        index = getattr(self.tree_cache, "sub_context_index", None)
+        for r in reqs:
+            r.count_sub_context_match(index)
         if any(r.sub_context_layout is not None for r in reqs):
             # Sparse reuse: gather the computed tokens by position.
             self.subctx_fresh_positions = [r.sub_context_fresh_positions() for r in reqs]
             if subctx_config.topk_active():
-                # The scored layers run the whole prompt.
+                # The scored layers run each prompt from its probe start on.
+                starts = [r.sub_context_probe_start() for r in reqs]
                 self.subctx_probe_positions = [
-                    list(range(len(r.fill_ids))) for r in reqs
+                    list(range(start, len(r.fill_ids)))
+                    for r, start in zip(reqs, starts)
                 ]
-                input_ids = [list(r.fill_ids) for r in reqs]
+                input_ids = [list(r.fill_ids[start:]) for r, start in zip(reqs, starts)]
             else:
                 self.subctx_probe_positions = None
                 input_ids = [
@@ -2901,7 +2946,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         """The position of every token in ``input_ids`` for a sparse prefill, else None.
 
         Covers every request in the batch. With selective recompute these are the
-        probe's positions (the whole prompt).
+        probe's positions (each prompt from its probe start on).
         """
         if self.subctx_fresh_positions is None or not self.forward_mode.is_extend():
             return None
