@@ -210,7 +210,7 @@ grep "sub-context index:" server.log | tail -1
 ```
 
 ```
-sub-context index: N chunks, M queries, X prompt tokens | matched P prompt tokens: prefix A (a%),
+sub-context index: N chunks, M queries, X tokens scanned | matched P prompt tokens: prefix A (a%),
 scan found B (b%), W of them rotated into place | K requests too big for one pass, R refused for room
 ```
 

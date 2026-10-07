@@ -451,8 +451,10 @@ last_node = root_node              # scheduler 的單一 node 鎖變成空操作
 1. 放掉上一輪的鎖與副本，清掉上一輪的配置。
 2. **從頭比對**：跟原生 request 一樣 `match_prefix(fill_ids[:max_prefix_len], req.extra_key)`，
    得到前綴長度 `exact`、`last_node`（之後由 `PrefillAdder` 上鎖，跟原生一樣）、`cache_protected_len = exact`。
-3. **掃描剩下的部分**：`index.scan(fill_ids, extra_key)`；每個命中裁到「`exact` 之後、`max_prefix_len` 之前」
-   （prefill 至少要算最後一個 token），裁完短於 `MIN_CHUNK` 的丟掉。`index.select` 挑出不重疊的組合。
+3. **掃描剩下的部分**：`index.scan(fill_ids, extra_key, min_end=exact + MIN_CHUNK)`，只回傳結尾在 `min_end` 之後的命中，
+   只對 `fill_ids[min_end - 最長 chunk:]` 取指紋（每個 scope 記登記過的最長 chunk）；結果和掃整條再裁相同。
+   每個命中裁到「`exact` 之後、`max_prefix_len` 之前」（prefill 至少要算最後一個 token），裁完短於 `MIN_CHUNK` 的丟掉。
+   `index.select` 挑出不重疊的組合。
    被標成 `sub_context_index_declined` 的 request 跳過這一步（第 7-4 節）；開了 selective recompute 時，
    要求 logprob 的 request 也跳過（重算後的列數會讓 logprob 的對齊跑掉）。
 4. **找位置、上鎖**：`chain_chunk_slots(cid)` 從位置節點往上走父節點，湊出 `[start, end)` 的格子；
@@ -892,7 +894,7 @@ GPU 上沒有任何線索可查——唯一能發現問題的地方是**記帳**
 | host 階段計時 | `SGLANG_STAGE_TRACE=<前綴>` | 每個 process 寫 `<前綴>.<proc>.json`：`tpl_render`、`subctx_split`（http）；`match`、`subctx_stitch`、`subctx_lookup`、`subctx_scan`、`subctx_rotate`、`subctx_copy`、`subctx_rotate_finish`、`subctx_rev_rotate`、`cache_unfinished`、`cache_finished`（scheduler）。client 建立 `<前綴>.mark` 後另開一份 `measured` 累計，排除 warm-up |
 | 請求錄製 | `SGLANG_CAPTURE_REQUESTS=<檔>` | 每個 chat 請求原文一行，給 `subcontext_bench.py replay` |
 | `/server_info` | — | `sub_context` 物件：所有開關的實際值與 `pid`，給遠端 client 確認 arm（`scripts/subcontext_sim/check_remote_arm.py`）；`chain_storage` 為 true 表示是鏈式儲存的版本 |
-| 索引統計 | 開 index 時 | prefill log 那行後面附 `sub-context index: …`：比對過的 prompt token 數、其中從頭比對到的、scan 找到的、旋轉的，以及放不進一次 prefill、沒空間被拒的請求數。每個請求只在第一次真的執行（`prepare_for_extend`）時算一次，被拒後重新比對、被 retract 後重跑的都不算；4090 smoke 中與 client 端 `prompt_tokens`、`cached_tokens` 加總完全一致。`chunks`、`queries`、`prompt tokens`（開頭三個）仍是每次掃描都算 |
+| 索引統計 | 開 index 時 | prefill log 那行後面附 `sub-context index: …`：比對過的 prompt token 數、其中從頭比對到的、scan 找到的、旋轉的，以及放不進一次 prefill、沒空間被拒的請求數。每個請求只在第一次真的執行（`prepare_for_extend`）時算一次，被拒後重新比對、被 retract 後重跑的都不算；4090 smoke 中與 client 端 `prompt_tokens`、`cached_tokens` 加總完全一致。`chunks`、`queries`、`tokens scanned`（開頭三個）仍是每次掃描都算；`tokens scanned` 只算實際取指紋的部分（從「前綴長度 + 最短 chunk − 最長 chunk」起），dry run 掃整條 |
 
 ### 防線與偵錯
 
@@ -1026,6 +1028,10 @@ replay client 用 `ignore_eos`，所以「prefill 當下就吐停止 token」在
 - **`sub_context_index_declined`**：一個請求因為沒空間被標記後只用前綴比對，直到被 retract 才清掉。
   「沒有其他請求在跑」只看 running batch 與 chunked request；overlap 下還在跑、沒併進 running batch 的
   prefill-only batch 看不到，可能多判一次「沒空間」（只少了重用，不會卡住）。
+- **probe 不受一次 prefill 的預算限制，可能 OOM**：放不放得進一次 prefill 只算要算的 token；開 selective recompute 時
+  probe 要跑精確前綴之後的所有列，`PrefillAdder` 讓放不下的 probe 單獨跑。4090（chunked 2048）上 27.9k 列的 probe 在
+  qwen2 MLP 要 970 MiB 時 OOM、server 崩潰；約 6k 列的 RAG probe 沒事，H200 尚未踩到。2026-10-07 試過「probe 列數超過
+  `--chunked-prefill-size` 就退回前綴」：不再 OOM，但 4090 上 SWE 重播的掃描重用少 90%、RAG 全部退回，已撤回。根本解法是 probe 分批跑。
 - **（已解決，2026-10-05）probe 跑整段 prompt。** 以前同一批裡只要有一個 layout，所有請求都把整段 prompt 送進 probe，
   而 `PrefillAdder` 只對有 layout 的請求計入額外列。現在 probe 從各自的起點開始（第 9 節），同批的前綴命中只跑它要算的列，
   adder 的計算也跟實際一致。改了 probe 的形狀會讓矩陣乘法的捨入不同（同樣的列、不同的總列數，bf16 結果不一定位元相同），

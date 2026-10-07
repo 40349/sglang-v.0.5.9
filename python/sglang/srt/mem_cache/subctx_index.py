@@ -179,11 +179,13 @@ def cut_points(
 class _Scope:
     """The chunks registered under one ``extra_key``; a scan sees only its own scope."""
 
-    __slots__ = ("chunks", "by_anchor", "_bits", "_mask")
+    __slots__ = ("chunks", "by_anchor", "max_len", "_bits", "_mask")
 
     def __init__(self) -> None:
         self.chunks: Dict[str, np.ndarray] = {}
         self.by_anchor: Dict[int, List[str]] = {}
+        # Longest chunk ever registered here; not lowered on unregister.
+        self.max_len = 0
         # Bloom filter over `by_anchor`'s keys; None means rebuild on next use.
         self._bits: Optional[np.ndarray] = None
         self._mask = np.uint64(0)
@@ -261,7 +263,7 @@ class SubContextIndex:
         """One-line summary of the tallies."""
         head = (
             f"sub-context index: {len(self)} chunks, {self.scanned_queries} queries, "
-            f"{self.scanned_tokens} prompt tokens"
+            f"{self.scanned_tokens} tokens scanned"
         )
         if self.prompt_tokens:
             denom = self.prompt_tokens
@@ -322,6 +324,7 @@ class SubContextIndex:
             return cid
 
         scope.chunks[cid] = ids
+        scope.max_len = max(scope.max_len, int(ids.shape[0]))
         self._scope_of[cid] = extra_key
         anchor = int(anchor_fingerprints(ids[:ANCHOR_TOKENS])[0])
         bucket = scope.by_anchor.get(anchor)
@@ -400,17 +403,25 @@ class SubContextIndex:
             bucket.remove(cid)
 
     def scan(
-        self, token_ids: Sequence[int], extra_key: Optional[str] = None
+        self,
+        token_ids: Sequence[int],
+        extra_key: Optional[str] = None,
+        min_end: int = 0,
     ) -> List[Match]:
-        """Every occurrence of a registered chunk in ``token_ids``, overlaps included."""
+        """Every occurrence of a registered chunk in ``token_ids`` that ends at or past
+        ``min_end``, overlaps included.
+
+        Only ``token_ids[min_end - (longest chunk in the scope):]`` is fingerprinted.
+        """
         scope = self._scopes.get(extra_key)
         if scope is None or not scope.chunks:
             return []
 
-        ids = np.asarray(token_ids, dtype=np.int32)
-        n = ids.shape[0]
+        n = len(token_ids)
+        offset = min(n, max(0, min_end - scope.max_len))
+        ids = np.asarray(token_ids[offset:], dtype=np.int32)
         self.scanned_queries += 1
-        self.scanned_tokens += n
+        self.scanned_tokens += n - offset
 
         prints = anchor_fingerprints(ids)
         if prints.shape[0] == 0:
@@ -419,12 +430,16 @@ class SubContextIndex:
         # Bloom filter, then the anchor table, then a full token comparison.
         bits, mask = scope.prefilter()
         matches: List[Match] = []
-        for start in _bloom_hits(bits, mask, prints).tolist():
-            for cid in scope.by_anchor.get(int(prints[start]), ()):
+        for at in _bloom_hits(bits, mask, prints).tolist():
+            for cid in scope.by_anchor.get(int(prints[at]), ()):
                 chunk = scope.chunks[cid]
-                end = start + chunk.shape[0]
-                if end <= n and np.array_equal(ids[start:end], chunk):
-                    matches.append(Match(start, end, cid))
+                end = at + chunk.shape[0]
+                if (
+                    offset + end >= min_end
+                    and end <= ids.shape[0]
+                    and np.array_equal(ids[at:end], chunk)
+                ):
+                    matches.append(Match(offset + at, offset + end, cid))
         return matches
 
     @staticmethod

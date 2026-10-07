@@ -3,7 +3,8 @@
 Checked:
 
 - a chunk's identity is its token ids and ``extra_key``, not its position,
-- the scan finds every occurrence (against brute force on random inputs),
+- the scan finds every occurrence (against brute force on random inputs), and a scan
+  from `min_end` finds the same ones ending there,
 - ``select`` covers as many tokens as any non-overlapping subset (against exhaustive
   enumeration),
 - ``cut_points`` cuts the same tokens the same way wherever they sit,
@@ -161,6 +162,46 @@ class TestScan(unittest.TestCase):
 
             with self.subTest(trial=trial):
                 self.assertEqual(sorted(index.scan(query)), _brute_force(query, chunks))
+
+    def test_a_scan_from_min_end_finds_the_full_scans_occurrences_ending_there(self):
+        """Chunks of mixed lengths, some unregistered, and ``min_end`` at either edge
+        and past the query."""
+        rng = random.Random(20261007)
+        for trial in range(300):
+            alphabet = list(range(6))
+            index = SubContextIndex(min_chunk_tokens=ANCHOR_TOKENS)
+            chunks = {}
+            for _ in range(rng.randrange(1, 7)):
+                length = rng.randrange(ANCHOR_TOKENS, ANCHOR_TOKENS + 60)
+                chunk = [rng.choice(alphabet) for _ in range(length)]
+                cid = index.register(chunk)
+                if cid is not None:
+                    chunks[cid] = chunk
+
+            query = [rng.choice(alphabet) for _ in range(rng.randrange(0, 400))]
+            for chunk in list(chunks.values()):
+                if rng.random() < 0.7 and query:
+                    at = rng.randrange(0, len(query))
+                    query = query[:at] + chunk + query[at:]
+            if chunks and rng.random() < 0.3:
+                index.unregister(max(chunks, key=lambda c: len(chunks[c])))
+
+            full = sorted(index.scan(query))
+            edges = {0, rng.randrange(0, len(query) + 1), len(query), len(query) + 5}
+            for min_end in sorted(edges | {m.end for m in full}):
+                with self.subTest(trial=trial, min_end=min_end):
+                    self.assertEqual(
+                        sorted(index.scan(query, min_end=min_end)),
+                        [m for m in full if m.end >= min_end],
+                    )
+
+    def test_a_scan_from_min_end_fingerprints_only_the_tail(self):
+        index = SubContextIndex(min_chunk_tokens=ANCHOR_TOKENS)
+        ids = list(range(5000, 5040))
+        index.register(ids)
+        query = list(range(1000)) + ids
+        self.assertEqual(index.scan(query, min_end=1000)[0].start, 1000)
+        self.assertEqual(index.scanned_tokens, len(query) - (1000 - 40))
 
     def test_a_run_too_short_to_be_worth_reusing_is_refused(self):
         index = SubContextIndex(min_chunk_tokens=64)

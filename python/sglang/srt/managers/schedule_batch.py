@@ -1364,7 +1364,9 @@ class Req(ReqDllmMixin):
             []
             if self.sub_context_index_declined
             or (self.return_logprob and subctx_config.topk_active())
-            else index.scan(self.fill_ids, self.extra_key)
+            else index.scan(
+                self.fill_ids, self.extra_key, min_end=exact + index.min_chunk_tokens
+            )
         )
         for found in found_runs:
             start, end = max(found.start, exact), min(found.end, limit)
