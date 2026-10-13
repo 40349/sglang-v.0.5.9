@@ -752,10 +752,10 @@ ARM_STEMS = (
 )
 
 
-def _load_arm(dirname: str, suffix: str, stem: str) -> Optional[dict]:
-    client = os.path.join(dirname, f"client_{stem}{suffix}.json")
-    trace = os.path.join(dirname, f"trace_{stem}{suffix}.jsonl")
-    stage = os.path.join(dirname, f"stage_{stem}{suffix}")
+def _load_arm(dirname: str, stem: str) -> Optional[dict]:
+    client = os.path.join(dirname, f"client_{stem}.json")
+    trace = os.path.join(dirname, f"trace_{stem}.jsonl")
+    stage = os.path.join(dirname, f"stage_{stem}")
     if not os.path.exists(client) and not os.path.exists(trace):
         return None
 
@@ -943,15 +943,15 @@ def cmd_summary(args: argparse.Namespace) -> int:
         _split_ratio_stem(s)[1] or 0,
     )):
         base_stem, ratio = _split_ratio_stem(stem)
-        arm = _load_arm(args.dir, args.suffix, stem)
+        arm = _load_arm(args.dir, stem)
         if arm is not None:
             arm["label"] = known[base_stem] + (
                 f" +{ratio}% recompute" if ratio else ""
             )
             arms.append(arm)
     if not arms:
-        print(f"no arms found under {args.dir} with suffix {args.suffix!r} "
-              f"(looking for client_base{args.suffix}.json and friends, "
+        print(f"no arms found under {args.dir} "
+              f"(looking for client_base.json and friends, "
               f"limited to {args.arms})", file=sys.stderr)
         return 1
     base = arms[0]
@@ -1058,8 +1058,8 @@ def cmd_summary(args: argparse.Namespace) -> int:
         notes.append("concurrency 1: throughput here is 1/latency by construction, "
                      "not serving capacity -- re-run with --concurrency for that")
     notes.append("replay pins the generated length with ignore_eos, so this says "
-                 "nothing about answer quality: pass@1 comes from `run_mas.sh eval` "
-                 "on a record run, counted as regressions against the baseline")
+                 "nothing about answer quality: pass@1 comes from the agent's own "
+                 "evaluation of a record run, counted as regressions against the baseline")
     print()
     for n in notes:
         print(f"NOTE: {n}")
@@ -1124,8 +1124,6 @@ def main() -> int:
                        help="one table over every arm of a completed toggle run")
     m.add_argument("dir", nargs="?", default=".",
                    help="directory holding client_/trace_/stage_ files (default .)")
-    m.add_argument("--suffix", default="",
-                   help="the _<tag>_ab suffix run_mas.sh gave the run's files")
     m.add_argument("--arms", default="base,sub,rot,idx,cdc",
                    help="which arms to put in the table, comma separated "
                         "(base, sub, rot, idx, cdc). An arm whose files are missing is left "

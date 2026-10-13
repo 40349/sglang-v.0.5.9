@@ -1,14 +1,12 @@
 """Verify a sglang server is the sub-context arm the caller asked for.
 
 Reads the ``sub_context`` block of ``/server_info`` (absent on a server not running
-this fork), and optionally checks that MASLab's ``model_api_config.json`` points at the
-same URL. Exits non-zero with the reason on any mismatch.
+this fork). Exits non-zero with the reason on any mismatch.
 
 Usage:
     check_remote_arm.py URL --arm off|on|rot|idx|cdc[@ratio[,ratio...]] [--audit B]
     check_remote_arm.py URL --split true|false --rotate true|false \
-        [--index B] [--split-mode blocks|cdc] [--topk-ratio R] [--audit B] \
-        [--maslab-config PATH --model NAME]
+        [--index B] [--split-mode blocks|cdc] [--topk-ratio R] [--audit B]
 """
 
 from __future__ import annotations
@@ -74,8 +72,6 @@ def main() -> int:
         help="require the slot-ownership audit on or off (also catches a stale "
         "server still holding the port)",
     )
-    ap.add_argument("--maslab-config")
-    ap.add_argument("--model")
     args = ap.parse_args()
     if args.arm is not None:
         name, _, ratio = args.arm.partition("@")
@@ -171,26 +167,6 @@ def main() -> int:
     print(f"  arm OK: {sub}")
     print(f"  model:  {info.get('model_path')}")
     print(f"  KV pool: max_total_num_tokens={info.get('max_total_num_tokens')}")
-
-    if args.maslab_config and args.model:
-        want = base + "/v1"
-        cfg = json.load(open(args.maslab_config))
-        entry = cfg.get(args.model)
-        if entry is None:
-            print(
-                f"REFUSING: {args.model} is not in {args.maslab_config}",
-                file=sys.stderr,
-            )
-            return 1
-        urls = [c["model_url"] for c in entry["model_list"]]
-        if want not in urls:
-            print(
-                f"REFUSING: MASLab would send {args.model} to {urls}, not {want}.\n"
-                f"  Fix model_url in {args.maslab_config}",
-                file=sys.stderr,
-            )
-            return 1
-        print(f"  MASLab -> {want}")
     return 0
 
 
