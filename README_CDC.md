@@ -58,9 +58,10 @@ python -u -m sglang.launch_server \
 ```
 
 `sglang_server.sh` 是包好的版本：在 checkout 裡執行 `ARM=cdc bash sglang_server.sh`（Slurm 上用 `sbatch`）。
-要重算一部分重用的 token 就把比例寫進 arm，例如 `ARM=cdc@0.15`。arm 和環境變數的對應寫在
-`sglang_server.sh` 第 144–153 行；其他參數寫在檔案開頭的註解。環境裡若已經直接設了 arm 會設定的開關
-（例如 `SGLANG_SUBCTX_INDEX`、`SGLANG_SUBCTX_TOPK_RATIO`，完整清單在第 72–76 行），這支腳本會拒絕啟動，
+要重算一部分重用的 token 就把比例寫進 arm，例如 `ARM=cdc@0.15`；逐層篩選寫成一串比例，例如
+`ARM=cdc@0.3,0.2,0.15`（從 `TOPK_LAYER` 起連續幾層各挑一次，每次只從上一層留下的裡面挑）。arm 和環境變數的對應寫在
+`sglang_server.sh` 第 150–159 行；其他參數寫在檔案開頭的註解。環境裡若已經直接設了 arm 會設定的開關
+（例如 `SGLANG_SUBCTX_INDEX`、`SGLANG_SUBCTX_TOPK_RATIO`，完整清單在第 74–78 行），這支腳本會拒絕啟動，
 開關只能透過 arm 和它的參數設定。
 
 ---
@@ -102,10 +103,13 @@ Selective recompute（重算一部分重用的 token，修正「在別的前文�
 
 | 變數 | 預設 | 說明 |
 |---|---|---|
-| `SGLANG_SUBCTX_TOPK_RATIO` | 0 | 每個請求重算重用 token 中 key 偏差最大的比例，範圍 [0, 1]。> 0 必須開 `SGLANG_SUBCTX_INDEX` |
-| `SGLANG_SUBCTX_TOPK_LAYER` | 1 | 在第幾層比較新舊 key。0 只允許在 ratio = 1.0（第 0 層的 key 只取決於 token 與位置，分數全為 0） |
+| `SGLANG_SUBCTX_TOPK_RATIO` | 0 | 每個請求重算重用 token 中 key 偏差最大的比例，範圍 [0, 1]。逗號分隔（不遞增）時每個比例對應一個連續的打分層。> 0 必須開 `SGLANG_SUBCTX_INDEX` |
+| `SGLANG_SUBCTX_TOPK_LAYER` | 1 | 第一個打分層。0 只允許第一個比例 = 1.0（第 0 層的 key 只取決於 token 與位置，分數全為 0） |
 
-ratio > 0 時，啟動還會檢查（不符就拒絕）：模型要有 `forward_split_prefill`、`TOPK_LAYER` 之後至少還有一層、
+probe 各層（`[0, TOPK_LAYER]`）每一列都把新算的 KV 寫回自己的 slot，attention 讀整段新算的 KV，所以 ratio 1.0
+在任何打分層都等於整段重算。
+
+ratio > 0 時，啟動還會檢查（不符就拒絕）：模型要有 `forward_split_prefill`、最後一個打分層之後至少還有一層、
 `--tp-size 1`、不能用 pipeline parallel、DP attention、`--moe-dense-tp-size 1`、two-batch overlap、
 speculative decoding、torch.compile、回傳 hidden states、LoRA。
 
@@ -164,7 +168,7 @@ curl -s http://HOST:30000/server_info \
   | python -c "import json,sys; print(json.dumps(json.load(sys.stdin)['sub_context'], indent=2))"
 ```
 
-`ARM=cdc` 應該看到（`cdc@0.15` 只差 `topk_ratio`）：
+`ARM=cdc` 應該看到（`cdc@0.15` 只差 `topk_ratios`）：
 
 ```json
 {
@@ -180,7 +184,7 @@ curl -s http://HOST:30000/server_info \
   "split_mode": "cdc",
   "cdc_target": 256,
   "cdc_max": 1024,
-  "topk_ratio": 0.0,
+  "topk_ratios": [0.0],
   "topk_layer": 1,
   "audit": false,
   "pid": 12345

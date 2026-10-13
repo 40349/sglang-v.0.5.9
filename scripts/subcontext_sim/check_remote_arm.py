@@ -5,7 +5,7 @@ this fork), and optionally checks that MASLab's ``model_api_config.json`` points
 same URL. Exits non-zero with the reason on any mismatch.
 
 Usage:
-    check_remote_arm.py URL --arm off|on|rot|idx|cdc[@ratio] [--audit B]
+    check_remote_arm.py URL --arm off|on|rot|idx|cdc[@ratio[,ratio...]] [--audit B]
     check_remote_arm.py URL --split true|false --rotate true|false \
         [--index B] [--split-mode blocks|cdc] [--topk-ratio R] [--audit B] \
         [--maslab-config PATH --model NAME]
@@ -21,6 +21,10 @@ import urllib.request
 
 def _bool(v: str) -> bool:
     return v.lower() in ("1", "true", "yes", "on")
+
+
+def _ratios(v: str) -> list:
+    return [float(r) for r in v.split(",")]
 
 
 # What each arm of sglang_server.sh leaves the server reporting.
@@ -58,9 +62,10 @@ def main() -> int:
     )
     ap.add_argument(
         "--topk-ratio",
-        type=float,
+        type=_ratios,
         default=None,
-        help="require this selective-recompute ratio",
+        help="require these selective-recompute ratios, one per scored layer "
+        "(e.g. 0.15 or 0.3,0.2,0.15)",
     )
     ap.add_argument(
         "--audit",
@@ -78,7 +83,7 @@ def main() -> int:
             ap.error(f"unknown arm {args.arm!r}")
         for key, value in ARMS[name].items():
             setattr(args, key, value)
-        args.topk_ratio = float(ratio or 0)
+        args.topk_ratio = _ratios(ratio or "0")
     elif args.split is None or args.rotate is None:
         ap.error("give --arm, or both --split and --rotate")
 
@@ -137,11 +142,15 @@ def main() -> int:
         return 1
 
     if args.topk_ratio is not None:
-        got = sub.get("topk_ratio")
-        if got is None or abs(float(got) - args.topk_ratio) > 1e-9:
+        got = sub.get("topk_ratios")
+        if got is None and "topk_ratio" in sub:  # a server from before 2026-10-12
+            got = [sub["topk_ratio"]]
+        if got is None or len(got) != len(args.topk_ratio) or any(
+            abs(float(g) - w) > 1e-9 for g, w in zip(got, args.topk_ratio)
+        ):
             print(
-                f"REFUSING: asked for topk_ratio={args.topk_ratio} but the server "
-                f"reports topk_ratio={got!r}. Ratios are swept within one arm name, "
+                f"REFUSING: asked for topk_ratios={args.topk_ratio} but the server "
+                f"reports topk_ratios={got!r}. Ratios are swept within one arm name, "
                 "so a mismatch here produces a table whose rows are all the same run.",
                 file=sys.stderr,
             )

@@ -1228,7 +1228,7 @@ class TestChainedIndex(unittest.TestCase):
         self._saved = (
             subctx_config.HASH_SUBCONTEXT_KEYS,
             subctx_config.INDEX_SUBCONTEXTS,
-            subctx_config.TOPK_RATIO,
+            subctx_config.TOPK_RATIOS,
         )
         subctx_config.HASH_SUBCONTEXT_KEYS = True
         subctx_config.INDEX_SUBCONTEXTS = True
@@ -1237,7 +1237,7 @@ class TestChainedIndex(unittest.TestCase):
         (
             subctx_config.HASH_SUBCONTEXT_KEYS,
             subctx_config.INDEX_SUBCONTEXTS,
-            subctx_config.TOPK_RATIO,
+            subctx_config.TOPK_RATIOS,
         ) = self._saved
 
     def _cache(self):
@@ -1293,7 +1293,7 @@ class TestChainedIndex(unittest.TestCase):
 
     def test_the_plain_prefix_is_exact_and_not_scored(self):
         cache, _, _ = self._seeded([self.HEAD_A, self.TAIL])
-        subctx_config.TOPK_RATIO = 0.5
+        subctx_config.TOPK_RATIOS = (0.5,)
         second = make_req(
             "r2", [self.HEAD_A, self.MORE + self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1
         )
@@ -1309,7 +1309,7 @@ class TestChainedIndex(unittest.TestCase):
         self.assertEqual(second.cache_protected_len, 40)
         self.assertEqual(second.sub_context_reused_positions(), list(range(80, 119)))
         self.assertEqual(second.sub_context_reused_ours(), [True] * 39)
-        self.assertEqual(second.sub_context_topk_count(), 19)
+        self.assertEqual(second.sub_context_topk_counts([0.5, 0.25]), [19, 9])
 
     def test_a_grown_conversation_is_a_plain_prefix_hit(self):
         cache, _, allocator = self._seeded([self.HEAD_A, self.TAIL])

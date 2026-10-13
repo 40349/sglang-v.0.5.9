@@ -174,15 +174,21 @@ def chat(
 
 
 def arm_tag(sub: dict) -> str:
-    """The server's arm as sglang_server.sh tags it: off, on, rot, idx, cdc, + _rNN."""
+    """The server's arm as sglang_server.sh tags it: off, on, rot, idx, cdc, + _rNN
+    (_rNN-NN-... with one ratio per scored layer)."""
     if not sub.get("split_enabled"):
         return "off"
     if sub.get("index"):
         tag = "cdc" if sub.get("split_mode") == "cdc" else "idx"
     else:
         tag = "rot" if sub.get("rotate") else "on"
-    ratio = float(sub.get("topk_ratio") or 0)
-    return f"{tag}_r{int(ratio * 100 + 0.5):02d}" if ratio > 0 else tag
+    ratios = sub.get("topk_ratios")
+    if ratios is None:  # a server from before 2026-10-12
+        ratios = [sub.get("topk_ratio") or 0]
+    ratios = [float(r) for r in ratios]
+    if ratios[0] <= 0:
+        return tag
+    return f"{tag}_r" + "-".join(f"{int(r * 100 + 0.5):02d}" for r in ratios)
 
 
 def run_task(task, args, base, model, info, tokenizer, scorer) -> None:

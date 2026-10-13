@@ -45,7 +45,7 @@
    算完整條照原生方式存回樹（一條從位置 0 開始的鏈），新存上樹的區塊登記進索引、記下它在樹上的位置。
    `cdc` 再把切點改成依內容決定，不依角色。
 4. **selective recompute**（arm `idx@r`、`cdc@r`）：重用的區塊是在別的前文下算的，挑出 key 偏差最大的
-   比例 r 重算，修正品質。
+   比例 r 重算，修正品質。`cdc@r1,r2,…` 在連續幾層逐層篩選。
 
 **位置的代價**：RoPE 把絕對位置烤進了 K。一塊 KV 是在位置 100 算的，就只能在位置 100 被直接重用。
 所以每個 tree node 要記 `canonical_position`——「我這份 KV 是在哪個絕對位置算出來的」。
@@ -94,8 +94,8 @@ R(p_new) · f(k_raw) == R(p_new − p) · k_cached[loc]
 | `SGLANG_SUBCTX_SPLIT` | `blocks` | `blocks`（依角色）或 `cdc`（依內容） |
 | `SGLANG_SUBCTX_CDC_TARGET` | 256 | cdc 平均 chunk 長度（捨去到 2 的冪） |
 | `SGLANG_SUBCTX_CDC_MAX` | 1024 | cdc 強制切斷長度 |
-| `SGLANG_SUBCTX_TOPK_RATIO` | 0 | selective recompute 重算的比例 |
-| `SGLANG_SUBCTX_TOPK_LAYER` | 1 | 在第幾層比較新舊 key |
+| `SGLANG_SUBCTX_TOPK_RATIO` | 0 | selective recompute 重算的比例；逗號分隔時每個比例對應一個連續的打分層（逐層篩選） |
+| `SGLANG_SUBCTX_TOPK_LAYER` | 1 | 第一個打分層 |
 | `SGLANG_SUBCTX_ROTATE_GPU` | 空 | 旋轉 kernel 的 CUDA event 計時（`rotate_kv.py`） |
 | `SGLANG_SUBCTX_AUDIT` | 空 | slot 歸屬與 double-free 檢查（`radix_cache.py`、`allocator.py`） |
 | `SGLANG_SUBCTX_TRACE` | 空 | 印 TRACE 除錯行 |
@@ -113,8 +113,8 @@ R(p_new) · f(k_raw) == R(p_new − p) · k_cached[loc]
 
 - `SPLIT` 只能是 `blocks` 或 `cdc`。
 - `cdc` 必須搭配內容雜湊命名（`INDEX`、`HASH_KEYS` 或 `INDEX_DRYRUN`），除非設了 `DISABLE`。
-- `TOPK_RATIO` 必須在 [0, 1]，> 0 時必須開 `INDEX`（這條即使設了 `DISABLE` 也會檢查）。
-- `TOPK_LAYER` 不可為負；`TOPK_LAYER = 0` 只允許在 ratio = 1.0（第 0 層的 key 只取決於 token 與位置，分數全為 0）。
+- `TOPK_RATIO` 的每個比例都必須在 [0, 1] 且不遞增；第一個 > 0 時必須開 `INDEX`（這條即使設了 `DISABLE` 也會檢查）。
+- `TOPK_LAYER` 不可為負；`TOPK_LAYER = 0` 只允許第一個比例 = 1.0（第 0 層的 key 只取決於 token 與位置，分數全為 0）。
 
 ---
 
@@ -237,8 +237,8 @@ mrope 餵純量位置時**會通過**自測（它就是 plain RoPE），真正�
 
 | 條件 | 為什麼 |
 |---|---|
-| 模型有 `forward_split_prefill` | token 數要在兩段 layer 之間裁減 |
-| `TOPK_LAYER` 之後至少還有一層 | 否則沒有東西要重算 |
+| 模型有 `forward_split_prefill` | token 數要在打分層之間裁減 |
+| 最後一個打分層之後至少還有一層 | 否則沒有東西要重算 |
 | 沒有 pipeline parallel | 被比較的那層可能在別的 rank |
 | attention TP = 1 | 分數對 head 維度加總，TP 下每個 rank 只看到自己的 head，會選出不同的 token |
 | 沒有 DP attention、`--moe-dense-tp-size 1` | token 被分散到各 rank，全域的列號在每個 rank 指到不同 token |
@@ -571,23 +571,26 @@ req.sub_context_rotated_slots = None     # 責任移轉
 
 ## 9. selective recompute（`TOPK_RATIO > 0`）
 
-重用的區塊是在別的前文下算的，它的 KV 和「在現在這個前文下算」不同。做法（`subctx_blend.py`）：
+重用的區塊是在別的前文下算的，它的 KV 和「在現在這個前文下算」不同。做法（`subctx_blend.py`、
+`ModelRunner.forward_subctx_blend`）：
 
-1. **數量在排程前就決定**：每個 request 重算 `int(打分的重用 token 數 × ratio)` 個（`sub_context_topk_count`）。
-   打分的只有 scan 找到的段；從頭比對到的前綴（`sub_context_exact_len`）是精確的，不打分（`_scored_runs`）。
-   `alloc_for_extend` 多配這麼多 slot；`PrefillAdder` 把它們計入 KV 容量。
+1. **數量在排程前就決定**：`TOPK_RATIO` 是一串比例 `r1,r2,…,rm`（不遞增），對應連續的打分層
+   `TOPK_LAYER, TOPK_LAYER+1, …`。每個 request 在第 i 個打分層之後留下 `int(打分的重用 token 數 × ri)` 個
+   （`sub_context_topk_counts`）。打分的只有 scan 找到的段；從頭比對到的前綴（`sub_context_exact_len`）是精確的，
+   不打分（`_scored_runs`）。不多配 slot：重算的 token 直接寫回它自己的副本（scan 找到的段一律是 request 自己的副本，
+   `build_plan` 會檢查）。
 2. **probe**（第 `[0, TOPK_LAYER]` 層）：每個 request 從它的 probe 起點（`sub_context_probe_start`）跑到 prompt 結尾——
    有 layout 的從精確前綴之後開始，同一批裡其他 request 從它要算的第一個 token 開始。起點之前的 KV 照樣從快取讀，
-   只是不當 query。新 token 的 KV 寫到它的新 slot，重用位置的 KV 寫到 dummy slot 0——所以重用位置的 slot 裡
-   **還是快取的 key**。
-3. **打分**（第 `TOPK_LAYER` 層，attention 之前）：每個重用位置的分數 = `Σ (k_新算 − k_快取)²`
-   （對 head 與維度加總）；每個 request 取分數最高的那些，與新 token 的位置合併、排序。
+   只是不當 query。**每一列都把新算的 K/V 寫進自己的 slot**：新 token 寫它的新 slot，重用位置寫回自己的副本。
+   所以 probe 各層的 attention 讀到的是整段新算的 KV，跟 CacheBlend repo 在第 1 層的做法一樣；ratio 1.0 時
+   不論在第幾層打分，結果都等於整段重算。
+3. **打分**（每個打分層）：這一層跑之前，先把還在跑的重用位置的快取 key 讀出來；這一層跑完後，
+   分數 = `Σ (k_新算 − k_快取)²`（對 head 與維度加總，fp32）。每個 request 在還在跑的重用位置裡取分數最高的那些，
+   和新 token 合併、排序。後一個打分層只從前一層留下的位置裡挑（逐層篩選，CacheBlend 論文 §4.3）。
    挑選在 GPU 上完成，不需要同步回 host。
-4. **寫回**（同一層 attention 之後）：被挑中的位置換到自己的新 slot——前面各層從快取 slot 複製、
-   這一層寫新算的 K/V、後面各層由下一段寫；`req_to_token` 改指向新 slot。
-   被取代的若是自己的旋轉副本就釋放；若是樹的 slot 就不動。
-5. **第二段**（`TOPK_LAYER+1` 之後的層）：hidden states、位置、slot 都裁成「新 token + 被挑中的 token」，
-   重建 attention metadata 再跑（`ModelRunner.forward_subctx_blend`）。這條路不用 CUDA graph。
+4. **裁減**：每個打分層之後，hidden states、residual、位置、寫入的 slot 都裁成「新 token + 留下的重用 token」，
+   重建 attention metadata 再跑下一段。被淘汰的重用 token 在之後的層保留快取的 KV；它跑過的層（含 probe 各層）
+   留下新算的 KV。最後一個打分層之後的層只跑最後留下的那些。這條路不用 CUDA graph。
 
 **`PrefillAdder` 的 probe 規則**：probe 要跑從起點之後的整段（`sub_context_forward_rows`），比「要算的 token」多；
 如果這個 request 不是本批第一個、而多出的列放不進剩餘預算，就等下一輪；

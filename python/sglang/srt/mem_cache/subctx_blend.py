@@ -1,12 +1,14 @@
 """Selective recompute: recompute the reused tokens whose keys moved most.
 
-Layers ``[0, check_layer]`` run each prompt from its probe start on (the probe): past the
-exact prefix of a sparse layout, past the reused prefix of any other request. At ``check_layer`` each
-reused token's fresh key is compared with its cached key, the top ``TOPK_RATIO`` per
-request are selected, and the remaining layers run only the fresh plus selected tokens.
+Layers ``[0, TOPK_LAYER]`` run each prompt from its probe start on (the probe): past the
+exact prefix of a sparse layout, past the reused prefix of any other request. Every row
+writes the K/V it computes into its own slot, a reused row over its copied KV. Each
+scored layer ranks the reused rows still running by how far their key moved from the
+cached one, keeps the top ``TOPK_RATIOS[i]`` of the request's reused tokens, and the
+layers after it run only the fresh plus kept rows.
 
 Counts, offsets and allocations are fixed before the forward; only the choice of
-positions is made on the device, with no host sync.
+positions is made on the device.
 """
 
 from __future__ import annotations
@@ -16,186 +18,141 @@ from typing import List, Optional
 
 import torch
 
+# Rows scored per step, bounding the fp32 temporaries.
+SCORE_CHUNK_ROWS = 8192
+
+
+def _to_device(values: List[int], device) -> torch.Tensor:
+    """``values`` as an int64 tensor on ``device``, copied without a host sync."""
+    return torch.tensor(values, dtype=torch.int64).to(device, non_blocking=True)
+
 
 @dataclass
 class BlendPlan:
-    """Everything the forward needs to score, select, and cut down.
+    """Everything the forward needs to score and cut down, per scored layer.
 
-    Built by ``build_plan`` before the forward; ``select`` fills the ``sel_*`` fields.
+    Built by ``build_plan`` before the forward. ``rows`` and ``reused`` track what is
+    still running; ``select`` advances them past one scored layer.
     """
 
-    check_layer: int
+    # The scored layers, consecutive and ascending.
+    check_layers: List[int]
 
-    # Rows per request: the probe (from `probe_starts` on), and the selection (fresh
-    # tokens plus the recomputed ones).
+    # Per request: probe rows, the position of the first one, and its first row in the
+    # batch.
     probe_lens: List[int]
-    sel_lens: List[int]
-    # Per request: the position of its first probe row.
     probe_starts: List[int]
-
-    # Where the probe layers write KV, per probe row; reused rows go to dummy slot 0.
-    probe_cache_loc: torch.Tensor
-
-    # Per reused position, in the same order: its probe row, its cached slot, and its
-    # flat offset into ``req_to_token``. ``reused_ptr`` splits them per request.
-    reused_rows: torch.Tensor
-    reused_slots: torch.Tensor
-    reused_r2t: torch.Tensor
-    reused_ptr: List[int]
-
-    # Per reused position: whether its slot is this request's rotated copy.
-    reused_ours: torch.Tensor
-
-    # Per request: recomputed-token count, and fresh positions. `topk_slots` holds the
-    # new slots for all of them.
-    topk_counts: List[int]
-    topk_slots: torch.Tensor
-    topk_ptr: List[int]
-    fresh_positions: List[torch.Tensor]
-
-    req_pool_indices: List[int]
     row_offsets: List[int]
 
-    # Filled by ``select`` at the scored layer.
-    sel_rows: Optional[torch.Tensor] = None
-    sel_positions: Optional[torch.Tensor] = None
-    sel_topk_rows: Optional[torch.Tensor] = None
-    sel_topk_slots: Optional[torch.Tensor] = None
-    # Rotated-copy slots the selection displaced; freed by the caller.
-    orphaned_slots: Optional[torch.Tensor] = None
+    # Per request: fresh tokens; and per scored layer, the reused tokens kept after it.
+    fresh_counts: List[int]
+    keep_counts: List[List[int]]
+
+    # Per probe row: the slot its K/V is written to. Fresh rows have new slots, reused
+    # rows the request's own copy.
+    probe_cache_loc: torch.Tensor
+
+    # Probe rows of the fresh positions, and of the reused ones; ``reused_ptr`` splits the
+    # reused rows per request. Both ascending.
+    fresh_rows: torch.Tensor
+    reused_rows: torch.Tensor
+    reused_ptr: List[int]
+
+    # Rows still running, ascending, and the reused ones among them as indices into
+    # ``reused_rows``, grouped per request. Set by ``start``.
+    rows: Optional[torch.Tensor] = None
+    reused: Optional[torch.Tensor] = None
+    # Scored layers passed so far.
+    stage: int = 0
 
     @property
     def batch_size(self) -> int:
         return len(self.probe_lens)
 
-    @property
-    def total_topk(self) -> int:
-        return self.topk_ptr[-1]
-
-    def select(self, k: torch.Tensor, key_buffer: torch.Tensor) -> None:
-        """Score the reused positions and select the top ``topk_counts`` per request.
-
-        The score is ``sum((k_fresh - k_cached) ** 2)`` over heads and dims, where
-        ``k`` is this layer's post-RoPE key per probe row and ``key_buffer`` still holds
-        the cached key at the reused slots. Selected positions are merged with the fresh
-        ones and sorted ascending.
-        """
-        if self.reused_rows.numel() == 0 or self.total_topk == 0:
-            self._select_nothing()
-            return
-
-        diff = k[self.reused_rows] - key_buffer[self.reused_slots]
-        score = (diff * diff).sum(dim=tuple(range(1, diff.dim())), dtype=torch.float32)
-
-        device = k.device
-        sel_rows: List[torch.Tensor] = []
-        sel_positions: List[torch.Tensor] = []
-        topk_rows: List[torch.Tensor] = []
-        for i in range(self.batch_size):
-            lo, hi = self.reused_ptr[i], self.reused_ptr[i + 1]
-            count = self.topk_counts[i]
-            fresh = self.fresh_positions[i]
-            if count == 0:
-                chosen_pos = fresh.new_empty((0,))
-                chosen_idx = self.reused_rows.new_empty((0,))
-            else:
-                local = torch.topk(score[lo:hi], k=count).indices
-                chosen_idx = local + lo
-                chosen_pos = (
-                    self.reused_rows[chosen_idx]
-                    - self.row_offsets[i]
-                    + self.probe_starts[i]
-                ).to(fresh.dtype)
-            positions, _ = torch.sort(torch.cat([fresh, chosen_pos]))
-            sel_positions.append(positions)
-            sel_rows.append(positions - self.probe_starts[i] + self.row_offsets[i])
-            topk_rows.append(chosen_idx)
-
-        self.sel_positions = torch.cat(sel_positions)
-        self.sel_rows = torch.cat(sel_rows).to(device=device, dtype=torch.int64)
-        self.sel_topk_rows = torch.cat(topk_rows)
-        self.sel_topk_slots = self.topk_slots
-
-    def commit(self, k: torch.Tensor, v: torch.Tensor, forward_batch, layer) -> None:
-        """Move each selected position to a slot of its own, and fill that slot.
-
-        Called after the scored layer's attention. Layers before ``check_layer`` are
-        copied from the cached slot, this layer gets the fresh K/V, and later layers are
-        written by the second range. Then req_to_token is re-pointed. The j-th selected
-        position gets ``topk_slots[j]``.
-        """
-        from sglang.srt.mem_cache.memory_pool import move_kv_cache_native
-
-        if self.sel_topk_rows is None or self.sel_topk_rows.numel() == 0:
-            return
-
-        pool = forward_batch.token_to_kv_pool
-        chosen = self.sel_topk_rows
-        slots = self.topk_slots
-
-        # Layers before this one: copy from the cached slot.
-        move_kv_cache_native(
-            pool.k_buffer[: self.check_layer],
-            pool.v_buffer[: self.check_layer],
-            slots,
-            self.reused_slots[chosen],
+    def start(self) -> None:
+        """Every probe row runs, every reused one among them."""
+        self.rows = torch.arange(
+            sum(self.probe_lens), dtype=torch.int64, device=self.probe_cache_loc.device
         )
+        self.reused = torch.arange(
+            self.reused_rows.numel(), dtype=torch.int64, device=self.rows.device
+        )
+        self.stage = 0
 
-        rows = self.reused_rows[chosen]
-        pool.set_kv_buffer(layer, slots, k[rows], v[rows])
+    def reused_counts(self) -> List[int]:
+        """Per request: the reused rows still running."""
+        if self.stage == 0:
+            return [hi - lo for lo, hi in zip(self.reused_ptr, self.reused_ptr[1:])]
+        return self.keep_counts[self.stage - 1]
 
-        req_to_token = forward_batch.req_to_token_pool.req_to_token
-        displaced = self.reused_slots[chosen]
-        req_to_token.view(-1)[self.reused_r2t[chosen]] = slots.to(req_to_token.dtype)
+    def lens(self) -> List[int]:
+        """Per request: the rows still running."""
+        if self.stage == 0:
+            return list(self.probe_lens)
+        return [f + k for f, k in zip(self.fresh_counts, self.keep_counts[self.stage - 1])]
 
-        # Displaced rotated copies are no longer in req_to_token; the caller frees them.
-        # Displaced tree slots stay with the tree.
-        self.orphaned_slots = displaced[self.reused_ours[chosen]]
+    def running_keys(self, key_buffer: torch.Tensor) -> torch.Tensor:
+        """The keys ``key_buffer`` holds at the slots of the reused rows still running."""
+        return key_buffer[self.probe_cache_loc[self.reused_rows[self.reused]]]
 
-    def _select_nothing(self) -> None:
-        """The selection is just the fresh tokens: nothing was reused, or ratio 0."""
-        device = self.probe_cache_loc.device
-        positions = torch.cat(self.fresh_positions) if self.fresh_positions else None
-        rows = [
-            self.fresh_positions[i] - self.probe_starts[i] + self.row_offsets[i]
-            for i in range(self.batch_size)
-        ]
-        self.sel_positions = positions
-        self.sel_rows = torch.cat(rows).to(device=device, dtype=torch.int64)
-        self.sel_topk_rows = self.reused_rows.new_empty((0,))
-        self.sel_topk_slots = self.topk_slots.new_empty((0,))
+    def select(self, cached: torch.Tensor, fresh: torch.Tensor) -> torch.Tensor:
+        """Keep the top scorers of this scored layer, and return the running rows to keep.
+
+        ``cached`` and ``fresh`` are this layer's keys of the reused rows still running,
+        before and after the layer wrote them. The score is ``sum((fresh - cached) ** 2)``
+        over heads and dims. The returned indices address the rows that ran this layer.
+        """
+        keep_counts = self.keep_counts[self.stage]
+        score = torch.empty(fresh.shape[0], dtype=torch.float32, device=fresh.device)
+        for lo in range(0, fresh.shape[0], SCORE_CHUNK_ROWS):
+            hi = lo + SCORE_CHUNK_ROWS
+            diff = fresh[lo:hi].float() - cached[lo:hi].float()
+            score[lo:hi] = diff.square_().flatten(1).sum(dim=1)
+
+        kept: List[torch.Tensor] = []
+        lo = 0
+        for i, count in enumerate(self.reused_counts()):
+            segment = self.reused[lo : lo + count]
+            keep = keep_counts[i]
+            if keep == count:
+                kept.append(segment)
+            elif keep > 0:
+                top = torch.topk(score[lo : lo + count], k=keep).indices
+                kept.append(torch.sort(segment[top]).values)
+            lo += count
+        reused = torch.cat(kept) if kept else self.reused[:0]
+
+        rows = torch.sort(torch.cat([self.fresh_rows, self.reused_rows[reused]])).values
+        keep_rows = torch.searchsorted(self.rows, rows)
+        self.rows = rows
+        self.reused = reused
+        self.stage += 1
+        return keep_rows
 
 
 def build_plan(
     batch,
     out_cache_loc: torch.Tensor,
-    req_pool_indices: List[int],
-    topk_slots: torch.Tensor,
+    ratios: List[float],
     check_layer: int,
 ) -> BlendPlan:
     """Build the plan for one extend batch.
 
-    ``out_cache_loc`` holds the fresh tokens' slots, ``topk_slots`` the slots for the
-    reused tokens that will be recomputed.
+    ``out_cache_loc`` holds the fresh tokens' slots. ``ratios`` gives one scored layer
+    each, from ``check_layer`` on.
     """
     device = out_cache_loc.device
-    req_to_token = batch.req_to_token_pool.req_to_token
-    stride = req_to_token.stride(0)
 
     probe_lens: List[int] = []
     probe_starts: List[int] = []
-    sel_lens: List[int] = []
-    topk_counts: List[int] = []
     row_offsets: List[int] = []
-    fresh_positions: List[torch.Tensor] = []
+    fresh_counts: List[int] = []
+    keep_counts: List[List[int]] = [[] for _ in ratios]
 
     probe_loc_parts: List[torch.Tensor] = []
+    fresh_rows_parts: List[torch.Tensor] = []
     reused_rows_parts: List[torch.Tensor] = []
-    reused_slots_parts: List[torch.Tensor] = []
-    reused_r2t_parts: List[torch.Tensor] = []
-    reused_ours_parts: List[torch.Tensor] = []
     reused_ptr: List[int] = [0]
-    topk_ptr: List[int] = [0]
 
     row_cursor = 0
     fresh_cursor = 0
@@ -203,8 +160,6 @@ def build_plan(
         start = req.sub_context_probe_start()
         rows = len(req.fill_ids) - start
         fresh = batch.subctx_fresh_positions[i]
-        count = req.sub_context_topk_count()
-        req_idx = req_pool_indices[i]
         assert not fresh or fresh[0] >= start, (
             f"{req.rid}: computes position {fresh[0]}, before its probe start {start}"
         )
@@ -212,58 +167,48 @@ def build_plan(
         row_offsets.append(row_cursor)
         probe_lens.append(rows)
         probe_starts.append(start)
-        sel_lens.append(len(fresh) + count)
-        topk_counts.append(count)
-        topk_ptr.append(topk_ptr[-1] + count)
+        fresh_counts.append(len(fresh))
 
-        fresh_t = torch.tensor(fresh, dtype=torch.int64, device=device)
-        fresh_positions.append(fresh_t)
-
-        # Reused rows write to the padded dummy slot 0.
-        loc = torch.zeros(rows, dtype=out_cache_loc.dtype, device=device)
+        fresh_t = _to_device(fresh, device)
+        fresh_rows_parts.append(fresh_t - start + row_cursor)
+        loc = torch.empty(rows, dtype=out_cache_loc.dtype, device=device)
         loc[fresh_t - start] = out_cache_loc[fresh_cursor : fresh_cursor + len(fresh)]
         fresh_cursor += len(fresh)
-        probe_loc_parts.append(loc)
 
         reused = req.sub_context_reused_positions()
+        assert len(fresh) + len(reused) == rows, (
+            f"{req.rid}: {len(fresh)} fresh and {len(reused)} reused positions for "
+            f"{rows} probe rows"
+        )
         if reused:
-            reused_t = torch.tensor(reused, dtype=torch.int64, device=device)
             assert reused[0] >= start, (
                 f"{req.rid}: scores position {reused[0]}, before its probe start {start}"
             )
+            assert all(req.sub_context_reused_ours()), (
+                f"{req.rid}: a scored run is not this request's own copy, and the probe "
+                "writes over the slots it reads"
+            )
+            reused_t = _to_device(reused, device)
             reused_rows_parts.append(reused_t - start + row_cursor)
-            reused_slots_parts.append(
-                torch.cat([s.to(device) for s in req.sub_context_reused_slots()]).long()
-            )
-            reused_r2t_parts.append(reused_t + req_idx * stride)
-            reused_ours_parts.append(
-                torch.tensor(
-                    req.sub_context_reused_ours(), dtype=torch.bool, device=device
-                )
-            )
+            loc[reused_t - start] = torch.cat(
+                [s.to(device) for s in req.sub_context_reused_slots()]
+            ).to(loc.dtype)
+        probe_loc_parts.append(loc)
+        for counts, n in zip(keep_counts, req.sub_context_topk_counts(ratios)):
+            counts.append(n)
         reused_ptr.append(reused_ptr[-1] + len(reused))
         row_cursor += rows
 
     empty = torch.empty(0, dtype=torch.int64, device=device)
     return BlendPlan(
-        check_layer=check_layer,
+        check_layers=list(range(check_layer, check_layer + len(ratios))),
         probe_lens=probe_lens,
-        sel_lens=sel_lens,
         probe_starts=probe_starts,
-        probe_cache_loc=torch.cat(probe_loc_parts),
-        reused_rows=torch.cat(reused_rows_parts) if reused_rows_parts else empty,
-        reused_slots=torch.cat(reused_slots_parts) if reused_slots_parts else empty,
-        reused_r2t=torch.cat(reused_r2t_parts) if reused_r2t_parts else empty,
-        reused_ours=(
-            torch.cat(reused_ours_parts)
-            if reused_ours_parts
-            else empty.to(torch.bool)
-        ),
-        reused_ptr=reused_ptr,
-        topk_counts=topk_counts,
-        topk_slots=topk_slots,
-        topk_ptr=topk_ptr,
-        fresh_positions=fresh_positions,
-        req_pool_indices=req_pool_indices,
         row_offsets=row_offsets,
+        fresh_counts=fresh_counts,
+        keep_counts=keep_counts,
+        probe_cache_loc=torch.cat(probe_loc_parts),
+        fresh_rows=torch.cat(fresh_rows_parts) if fresh_rows_parts else empty,
+        reused_rows=torch.cat(reused_rows_parts) if reused_rows_parts else empty,
+        reused_ptr=reused_ptr,
     )

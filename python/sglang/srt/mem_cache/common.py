@@ -395,19 +395,9 @@ def alloc_for_extend(
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
-    # Extra slots for the reused tokens selective recompute will rewrite; which
-    # positions get them is decided in the forward.
-    topk_counts = [r.sub_context_topk_count() for r in batch.reqs]
-    num_topk = sum(topk_counts)
-
     # Allocate KV cache (throws exception on failure)
     if batch.tree_cache.page_size == 1:
-        out_cache_loc = alloc_token_slots(
-            batch.tree_cache, batch.extend_num_tokens + num_topk
-        )
-        if num_topk:
-            batch.subctx_topk_slots = out_cache_loc[batch.extend_num_tokens :]
-            out_cache_loc = out_cache_loc[: batch.extend_num_tokens]
+        out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc
         last_loc = [
@@ -438,18 +428,10 @@ def alloc_for_extend(
         )
         if batch.subctx_probe_positions is not None:
             from sglang.srt.mem_cache.subctx_blend import build_plan
-            from sglang.srt.utils.subctx_config import TOPK_LAYER
+            from sglang.srt.utils.subctx_config import TOPK_LAYER, TOPK_RATIOS
 
             batch.subctx_blend_plan = build_plan(
-                batch,
-                out_cache_loc,
-                req_pool_indices,
-                (
-                    batch.subctx_topk_slots
-                    if batch.subctx_topk_slots is not None
-                    else out_cache_loc[:0]
-                ),
-                TOPK_LAYER,
+                batch, out_cache_loc, list(TOPK_RATIOS), TOPK_LAYER
             )
         return out_cache_loc, req_pool_indices_device, req_pool_indices
 

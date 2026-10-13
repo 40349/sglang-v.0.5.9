@@ -780,10 +780,10 @@ class Scheduler(
             INDEX_DRYRUN,
             INDEX_SUBCONTEXTS,
             MIN_CHUNK_TOKENS,
-            TOPK_LAYER,
-            TOPK_RATIO,
+            TOPK_RATIOS,
             sparse_prefill_unsupported_reason,
             topk_active,
+            topk_check_layers,
             topk_unsupported_reason,
         )
 
@@ -811,7 +811,8 @@ class Scheduler(
             if reason is not None:
                 raise ValueError(
                     "Selective recompute of reused tokens is enabled "
-                    f"(SGLANG_SUBCTX_TOPK_RATIO={TOPK_RATIO}) but cannot be served: "
+                    f"(SGLANG_SUBCTX_TOPK_RATIO={','.join(map(str, TOPK_RATIOS))}) but "
+                    "cannot be served: "
                     f"{reason}. Set SGLANG_SUBCTX_TOPK_RATIO=0 to reuse blocks whole, "
                     "as the arm did before."
                 )
@@ -833,8 +834,11 @@ class Scheduler(
                 else ", requests stored as prefix chains"
             ),
             (
-                f"; selective recompute of {TOPK_RATIO:.0%} of reused tokens, "
-                f"scored at layer {TOPK_LAYER}"
+                "; selective recompute of reused tokens: "
+                + ", ".join(
+                    f"{r:.0%} kept at layer {layer}"
+                    for r, layer in zip(TOPK_RATIOS, topk_check_layers())
+                )
                 if topk_active()
                 else ""
             ),

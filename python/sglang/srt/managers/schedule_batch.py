@@ -1263,14 +1263,12 @@ class Req(ReqDllmMixin):
             for _ in range(end - start)
         ]
 
-    def sub_context_topk_count(self) -> int:
-        """How many reused tokens this pass recomputes: ``TOPK_RATIO`` of the scored
-        ones.
+    def sub_context_topk_counts(self, ratios: List[float]) -> List[int]:
+        """Per scored layer, the reused tokens this pass keeps recomputing after it:
+        that layer's ratio of the scored ones.
         """
-        if self.sub_context_layout is None or not subctx_config.topk_active():
-            return 0
         n_reused = sum(end - start for start, end, _s, _o in self._scored_runs())
-        return min(n_reused, int(n_reused * subctx_config.TOPK_RATIO))
+        return [min(n_reused, int(n_reused * r)) for r in ratios]
 
     def sub_context_forward_rows(self) -> int:
         """Rows the prefill forward runs: from ``sub_context_probe_start`` on when
@@ -2060,10 +2058,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # prompt). None unless it is on.
     subctx_probe_positions: Optional[List[List[int]]] = None
 
-    # Slots for the reused tokens that will be recomputed, over the whole batch. The
-    # forward writes them into req_to_token.
-    subctx_topk_slots: Optional[torch.Tensor] = None
-
     # Selective recompute plan (``subctx_blend.BlendPlan``) for this batch.
     subctx_blend_plan: Optional[Any] = None
 
@@ -2725,7 +2719,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Clear the prefill's sparse-layout state.
         self.subctx_fresh_positions = None
         self.subctx_probe_positions = None
-        self.subctx_topk_slots = None
         self.subctx_blend_plan = None
 
         self.forward_mode = ForwardMode.DECODE

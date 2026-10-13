@@ -24,7 +24,9 @@
 #   cdc   + cut the blocks on content too, not on the roles the prompt was built from
 #
 # idx and cdc take a recompute ratio after `@`: cdc@0.15 recomputes 15% of the tokens
-# it reuses. The arm is the only place a ratio is set.
+# it reuses, chosen at layer TOPK_LAYER. Several ratios score consecutive layers from
+# TOPK_LAYER on, each picking from what the previous one kept: cdc@0.3,0.2,0.15. The arm
+# is the only place a ratio is set.
 #
 # Knobs:
 #
@@ -92,12 +94,16 @@ if [ "$ARM" != "$NAME" ]; then
     idx|cdc) ;;
     *) echo "REFUSING: ARM=$ARM: only idx and cdc take a ratio"; exit 1 ;;
   esac
-  awk -v r="$RATIO" 'BEGIN { exit !(r ~ /^[0-9]*\.?[0-9]+$/ && r >= 0 && r <= 1) }' || {
-    echo "REFUSING: ARM=$ARM: the ratio must be a number in [0, 1]"; exit 1; }
+  awk -v rs="$RATIO" 'BEGIN { n = split(rs, r, ","); for (i = 1; i <= n; i++) {
+      if (!(r[i] ~ /^[0-9]*\.?[0-9]+$/ && r[i] >= 0 && r[i] <= 1)) exit 1
+      if (i > 1 && r[i] > r[i - 1]) exit 1 } }' || {
+    echo "REFUSING: ARM=$ARM: want ratios in [0, 1], comma-separated, not increasing"
+    exit 1; }
 fi
 TAG=$NAME
-if awk -v r="$RATIO" 'BEGIN { exit !(r > 0) }'; then
-  TAG=${NAME}_r$(awk -v r="$RATIO" 'BEGIN { printf "%02d", int(r * 100 + 0.5) }')
+if awk -v rs="$RATIO" 'BEGIN { split(rs, r, ","); exit !(r[1] > 0) }'; then
+  TAG=${NAME}_r$(awk -v rs="$RATIO" 'BEGIN { n = split(rs, r, ",")
+    for (i = 1; i <= n; i++) printf "%s%02d", (i > 1 ? "-" : ""), int(r[i] * 100 + 0.5) }')
 fi
 
 if [ "${1:-}" = check ]; then echo "$TAG"; exit 0; fi

@@ -279,7 +279,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     positions: torch.Tensor = None
     # Sub-context sparse prefill: attention is masked by position, not by index.
     subctx_sparse: bool = False
-    # Selective recompute plan; the forward then runs in two layer ranges.
+    # Selective recompute plan; the forward is then cut down at each scored layer.
     subctx_blend_plan: Optional[Any] = None
 
     # For extend

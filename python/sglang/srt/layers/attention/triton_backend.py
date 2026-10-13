@@ -877,13 +877,6 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-        plan = forward_batch.subctx_blend_plan
-        if plan is not None and layer.layer_id == plan.check_layer:
-            # Score now: the reused slots still hold the cached key.
-            plan.select(
-                k, forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            )
-
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
         causal = True
@@ -898,13 +891,9 @@ class TritonAttnBackend(AttentionBackend):
             causal = False
 
         if forward_batch.subctx_sparse:
-            out = self._forward_extend_sparse(
+            return self._forward_extend_sparse(
                 q, o, layer, forward_batch, logits_soft_cap
             )
-            if plan is not None and layer.layer_id == plan.check_layer:
-                # After this layer's attention, which read the rows being replaced.
-                plan.commit(k, v, forward_batch, layer)
-            return out
 
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:

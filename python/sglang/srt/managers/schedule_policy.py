@@ -733,10 +733,8 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        # Selective recompute also allocates a slot per recomputed reused token.
         total_tokens = (
             req.extend_input_len
-            + req.sub_context_topk_count()
             + min(
                 max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
                 CLIP_MAX_NEW_TOKENS,

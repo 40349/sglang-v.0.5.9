@@ -626,7 +626,7 @@ async def server_info():
             "split_mode": subctx_config.SPLIT_MODE,
             "cdc_target": subctx_config.CDC_TARGET_TOKENS,
             "cdc_max": subctx_config.CDC_MAX_TOKENS,
-            "topk_ratio": subctx_config.TOPK_RATIO,
+            "topk_ratios": list(subctx_config.TOPK_RATIOS),
             "topk_layer": subctx_config.TOPK_LAYER,
             # With `pid`, tells a stale server from the one just started.
             "audit": radix_cache.AUDIT_ON,

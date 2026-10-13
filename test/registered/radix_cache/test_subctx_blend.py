@@ -1,12 +1,19 @@
 """Unit tests for selective recompute of reused sub-context tokens.
 
-Checked:
+Checked, on the plan alone:
 
-- the selection is the fresh tokens plus the top scorers, ascending, ending on the
-  prompt's last position,
-- a reused row's KV is never written to the cache row it reuses,
-- a selected position gets every layer filled,
-- at ratio 0 the selection is exactly the fresh set.
+- every probe row writes to its own slot: a fresh row to its new slot, a reused row to
+  the request's copy,
+- each scored layer keeps the top scorers of the reused rows still running, nested in
+  what the previous one kept, per request, with the fresh rows always kept,
+- a scored run that is not the request's own copy is refused.
+
+Checked through ``ModelRunner.forward_subctx_blend`` on a small attention model:
+
+- at ratio 1.0 the output and every KV row match a full prefill, scored at layer 1 or 0,
+- a reused token keeps its cached KV on the layers after it was dropped, and has its KV
+  rewritten on every layer it ran,
+- with two scored layers, the second picks by its own deviation among the first's picks.
 
 Usage:
     python test_subctx_blend.py
@@ -19,74 +26,133 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=5, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=5, suite="stage-b-test-small-1-gpu-amd")
 
+import math
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.subctx_blend import build_plan
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import subctx_config
 
-NUM_LAYERS = 4
+NUM_LAYERS = 5
 NUM_HEADS = 2
 HEAD_DIM = 8
+HIDDEN = NUM_HEADS * HEAD_DIM
 NUM_SLOTS = 1024
-CHECK_LAYER = 1
+VOCAB = 256
+MAX_POS = 128
+DTYPE = torch.float64
 
 
 class FakeReqToTokenPool:
-    def __init__(self, size: int = 4, max_context_len: int = 64):
+    def __init__(self, size: int = 4, max_context_len: int = MAX_POS):
         self.req_to_token = torch.zeros((size, max_context_len), dtype=torch.int64)
-
-    def write(self, indices, values):
-        self.req_to_token[indices] = values
 
 
 class FakeKVPool:
-    """A per-layer K/V buffer with ``set_kv_buffer`` as a scatter by slot id."""
+    """Per-layer K/V buffers; slots never written hold NaN."""
 
     def __init__(self):
         self.k_buffer = [
-            torch.zeros(NUM_SLOTS, NUM_HEADS, HEAD_DIM) for _ in range(NUM_LAYERS)
+            torch.full((NUM_SLOTS, NUM_HEADS, HEAD_DIM), math.nan, dtype=DTYPE)
+            for _ in range(NUM_LAYERS)
         ]
-        self.v_buffer = [
-            torch.zeros(NUM_SLOTS, NUM_HEADS, HEAD_DIM) for _ in range(NUM_LAYERS)
-        ]
+        self.v_buffer = [b.clone() for b in self.k_buffer]
 
     def get_key_buffer(self, layer_id):
         return self.k_buffer[layer_id]
 
-    def set_kv_buffer(self, layer, loc, k, v):
-        self.k_buffer[layer.layer_id][loc] = k
-        self.v_buffer[layer.layer_id][loc] = v
+    def set_kv_buffer(self, layer_id, loc, k, v):
+        self.k_buffer[layer_id][loc] = k
+        self.v_buffer[layer_id][loc] = v
 
 
-class FakeLayer:
-    def __init__(self, layer_id):
-        self.layer_id = layer_id
-
-
-class FakeForwardBatch:
-    def __init__(self, kv_pool, req_to_token_pool):
-        self.token_to_kv_pool = kv_pool
-        self.req_to_token_pool = req_to_token_pool
-
-
-class FakeBatch:
-    def __init__(self, reqs, fresh_positions, req_to_token_pool):
-        self.reqs = reqs
-        self.subctx_fresh_positions = fresh_positions
-        self.req_to_token_pool = req_to_token_pool
-
-
-def make_req(prompt_len: int, layout, req_pool_idx: int = 0, ours=None) -> Req:
-    """A request whose reuse lands at ``layout``: (start, end, slots) runs.
-
-    ``ours``, per run: whether the slots are this request's rotated copy (True) or the
-    tree's (False).
+class ToyModel:
+    """Attention-only decoder: each layer's K/V depend on the token's own hidden state,
+    and its attention reads every key at or before the query's position through
+    ``req_to_token``. Layer 0's K/V depend only on the token and its position.
     """
-    ids = list(range(1, prompt_len + 1))
+
+    def __init__(self, seed: int = 0):
+        g = torch.Generator().manual_seed(seed)
+
+        def rand(*shape, scale=1.0):
+            return torch.randn(*shape, generator=g, dtype=DTYPE) * scale
+
+        self.embed = rand(VOCAB, HIDDEN)
+        self.pos = rand(MAX_POS, HIDDEN, scale=0.5)
+        w = HIDDEN**-0.5
+        self.wq = [rand(HIDDEN, HIDDEN, scale=w) for _ in range(NUM_LAYERS)]
+        self.wk = [rand(HIDDEN, HIDDEN, scale=w) for _ in range(NUM_LAYERS)]
+        self.wv = [rand(HIDDEN, HIDDEN, scale=w) for _ in range(NUM_LAYERS)]
+        self.wo = [rand(HIDDEN, HIDDEN, scale=w) for _ in range(NUM_LAYERS)]
+
+    def layer(self, i, positions, hidden, fb, residual):
+        residual = hidden if residual is None else hidden + residual
+        q = (residual @ self.wq[i]).view(-1, NUM_HEADS, HEAD_DIM)
+        k = (residual @ self.wk[i]).view(-1, NUM_HEADS, HEAD_DIM)
+        v = (residual @ self.wv[i]).view(-1, NUM_HEADS, HEAD_DIM)
+        pool = fb.token_to_kv_pool
+        pool.set_kv_buffer(i, fb.out_cache_loc, k, v)
+
+        # Row counts and query positions as the attention metadata last saw them.
+        meta = fb.attn_metadata
+        out = torch.empty_like(q)
+        row = 0
+        for b, n in enumerate(meta.lens):
+            slots = fb.req_to_token_pool.req_to_token[
+                fb.req_pool_indices_cpu[b], : fb.seq_lens_cpu[b]
+            ]
+            keys, values = pool.k_buffer[i][slots], pool.v_buffer[i][slots]
+            qp = meta.q_positions[row : row + n]
+            att = torch.einsum("qhd,khd->hqk", q[row : row + n], keys) / HEAD_DIM**0.5
+            visible = torch.arange(len(slots))[None, :] <= qp[:, None]
+            att = att.masked_fill(~visible[None], -math.inf).softmax(-1)
+            out[row : row + n] = torch.einsum("hqk,khd->qhd", att, values)
+            row += n
+        return torch.tanh(out.reshape(-1, HIDDEN) @ self.wo[i]), residual
+
+    def forward_split_prefill(self, input_ids, positions, fb, interval, **_kwargs):
+        start, end = interval
+        if start == 0:
+            fb.hidden_states = self.embed[input_ids] + self.pos[positions]
+        for i in range(start, end):
+            fb.hidden_states, fb.residual = self.layer(
+                i, positions, fb.hidden_states, fb, fb.residual
+            )
+        if end < NUM_LAYERS:
+            return None
+        return fb.hidden_states + fb.residual
+
+
+def init_attn_metadata(fb):
+    """What the triton backend keeps from ``init_forward_metadata``: copies of the row
+    counts and the query positions."""
+    fb.attn_metadata = SimpleNamespace(
+        lens=list(fb.extend_seq_lens_cpu), q_positions=fb.positions.clone()
+    )
+
+
+class FakeRunner:
+    forward_subctx_blend = ModelRunner.forward_subctx_blend
+    _set_extend_lens = ModelRunner._set_extend_lens
+
+    def __init__(self, model):
+        self.model = model
+        self.model_config = SimpleNamespace(num_hidden_layers=NUM_LAYERS)
+        self.attn_backend = SimpleNamespace(init_forward_metadata=init_attn_metadata)
+
+
+def make_req(
+    prompt_len, layout, req_pool_idx=0, exact=0, ours=None, ids=None
+) -> Req:
+    """A request whose reuse lands at ``layout``: (start, end, first slot) runs, the
+    first ``exact`` positions a plain prefix match. ``ours``, per run: whether its slots
+    are this request's copy (default: every run past the prefix is)."""
+    ids = list(ids) if ids is not None else list(range(1, prompt_len + 1))
     req = Req(
         rid=f"r{req_pool_idx}",
         origin_input_text="",
@@ -100,33 +166,30 @@ def make_req(prompt_len: int, layout, req_pool_idx: int = 0, ours=None) -> Req:
         for start, end, slot0 in layout
     ]
     req.sub_context_layout_ours = (
-        list(ours) if ours is not None else [False] * len(layout)
+        list(ours) if ours is not None else [start >= exact for start, _e, _s in layout]
     )
+    req.sub_context_exact_len = exact
     return req
 
 
-def build(reqs, first_slot: int = 400, check_layer: int = CHECK_LAYER):
-    """Lay out a batch the way ``alloc_for_extend`` would, and hand back the plan."""
+def make_plain_req(prompt_len, prefix_slot0, prefix_len, req_pool_idx, ids=None) -> Req:
+    """An ordinary request in the batch: a plain prefix, then the tokens it computes."""
+    req = make_req(prompt_len, [], req_pool_idx=req_pool_idx, ids=ids)
+    req.sub_context_layout = None
+    req.sub_context_layout_ours = None
+    req.prefix_indices = torch.arange(prefix_slot0, prefix_slot0 + prefix_len)
+    return req
+
+
+def lay_out(reqs, first_slot=600):
+    """What ``alloc_for_extend`` leaves: fresh slots, and req_to_token filled in."""
     pool = FakeReqToTokenPool()
     fresh_positions = [r.sub_context_fresh_positions() for r in reqs]
-    topk_counts = [r.sub_context_topk_count() for r in reqs]
-
     num_fresh = sum(len(p) for p in fresh_positions)
-    out_cache_loc = torch.arange(
-        first_slot, first_slot + num_fresh, dtype=torch.int64
-    )
-    topk_slots = torch.arange(
-        first_slot + num_fresh,
-        first_slot + num_fresh + sum(topk_counts),
-        dtype=torch.int64,
-    )
-
-    # What `write_cache_indices_sparse` puts in the table: reused runs at their
-    # positions, the computed tokens scattered into the gaps.
+    out_cache_loc = torch.arange(first_slot, first_slot + num_fresh, dtype=torch.int64)
     cursor = 0
     for i, req in enumerate(reqs):
         if req.sub_context_layout is None:
-            # An ordinary request in the batch: its prefix, then what it computes.
             prefix = req.prefix_indices
             pool.req_to_token[req.req_pool_idx, : len(prefix)] = prefix
         for start, end, slots in req.sub_context_layout or []:
@@ -136,345 +199,306 @@ def build(reqs, first_slot: int = 400, check_layer: int = CHECK_LAYER):
             cursor : cursor + len(positions)
         ]
         cursor += len(positions)
-
-    batch = FakeBatch(reqs, fresh_positions, pool)
-    plan = build_plan(
-        batch,
-        out_cache_loc,
-        [r.req_pool_idx for r in reqs],
-        topk_slots,
-        check_layer,
+    batch = SimpleNamespace(
+        reqs=reqs, subctx_fresh_positions=fresh_positions, req_to_token_pool=pool
     )
-    return plan, pool, out_cache_loc, topk_slots
+    return batch, out_cache_loc
 
 
-def keys_with_deviation(plan, loud_positions, kv_pool, request=0):
-    """Fresh keys that match the cache everywhere except at ``loud_positions``."""
-    total_rows = sum(plan.probe_lens)
-    cached = kv_pool.get_key_buffer(plan.check_layer)
-    fresh = torch.zeros(total_rows, NUM_HEADS, HEAD_DIM)
-    fresh[plan.reused_rows] = cached[plan.reused_slots]
-    for rank, position in enumerate(loud_positions):
-        row = plan.row_offsets[request] + position - plan.probe_starts[request]
-        # Descending, so the order the positions are given in is the order they should
-        # come back in -- a test that passes on a tie tells us nothing.
-        fresh[row] += float(len(loud_positions) - rank)
-    return fresh
+def reference(model, ids):
+    """Full prefill of ``ids`` from position 0: per-layer K and V, and the output."""
+    n = len(ids)
+    pool = FakeKVPool()
+    r2t = FakeReqToTokenPool()
+    r2t.req_to_token[0, :n] = torch.arange(n)
+    fb = SimpleNamespace(
+        token_to_kv_pool=pool,
+        req_to_token_pool=r2t,
+        out_cache_loc=torch.arange(n),
+        positions=torch.arange(n),
+        extend_seq_lens_cpu=[n],
+        seq_lens_cpu=[n],
+        req_pool_indices_cpu=[0],
+        residual=None,
+    )
+    init_attn_metadata(fb)
+    out = model.forward_split_prefill(
+        torch.tensor(ids), torch.arange(n), fb, (0, NUM_LAYERS)
+    )
+    keys = torch.stack([pool.k_buffer[i][:n] for i in range(NUM_LAYERS)])
+    values = torch.stack([pool.v_buffer[i][:n] for i in range(NUM_LAYERS)])
+    return keys, values, out
 
 
-class TestSelection(unittest.TestCase):
-    def setUp(self):
-        self.ratio = subctx_config.TOPK_RATIO
-        self.index = subctx_config.INDEX_SUBCONTEXTS
-        subctx_config.INDEX_SUBCONTEXTS = True
+def stale(position, layer):
+    """The deviation a reused token's cached KV carries on ``layer`` (none on layer 0)."""
+    if layer == 0:
+        return 0.0
+    return 0.05 * (1 + (position * 7 + layer * 3) % 53)
 
-    def tearDown(self):
-        subctx_config.TOPK_RATIO = self.ratio
-        subctx_config.INDEX_SUBCONTEXTS = self.index
 
-    def test_picks_the_positions_whose_keys_moved_most(self):
-        subctx_config.TOPK_RATIO = 0.25
-        # 32 tokens; [4, 20) is reused, so 16 reused tokens and a quota of 4.
-        req = make_req(32, [(4, 20, 500)])
-        plan, _pool, _fresh_loc, _topk = build([req])
-        self.assertEqual(plan.topk_counts, [4])
-        self.assertEqual(plan.sel_lens, [16 + 4])
+class Scenario:
+    """One batch through ``forward_subctx_blend``, against each request's full prefill.
 
-        kv_pool = FakeKVPool()
-        loud = [7, 12, 5, 18]
-        k = keys_with_deviation(plan, loud, kv_pool)
-        plan.select(k, kv_pool.get_key_buffer(plan.check_layer))
+    Exact prefixes hold the full prefill's KV; reused runs hold it plus ``deviation``
+    from layer 1 on; fresh slots start as NaN.
+    """
 
-        chosen = (plan.reused_rows[plan.sel_topk_rows] - plan.row_offsets[0]).tolist()
-        self.assertEqual(chosen, loud)
+    def __init__(self, reqs, ratios, check_layer, deviation=stale, seed=0):
+        self.model = ToyModel(seed)
+        self.reqs = reqs
+        self.batch, out_cache_loc = lay_out(reqs)
+        self.kv = FakeKVPool()
+        self.refs = [reference(self.model, r.fill_ids) for r in reqs]
+        self.stale_k = {}
+        for req, (keys, values, _out) in zip(reqs, self.refs):
+            row = self.batch.req_to_token_pool.req_to_token[req.req_pool_idx]
+            if req.sub_context_layout is None:
+                held = range(len(req.prefix_indices))
+            else:
+                held = [p for s, e, _ in req.sub_context_layout for p in range(s, e)]
+            exact = req.sub_context_probe_start()
+            for p in held:
+                slot = int(row[p])
+                for layer in range(NUM_LAYERS):
+                    shift = 0.0 if p < exact else deviation(p, layer)
+                    self.kv.k_buffer[layer][slot] = keys[layer, p] + shift
+                    self.kv.v_buffer[layer][slot] = values[layer, p] + shift
+                    self.stale_k[(req.rid, p, layer)] = self.kv.k_buffer[layer][
+                        slot
+                    ].clone()
 
-    def test_selection_is_ascending_and_keeps_the_last_token_last(self):
-        subctx_config.TOPK_RATIO = 0.5
-        req = make_req(24, [(2, 18, 500)])
-        plan, _pool, _fresh_loc, _topk = build([req])
-
-        kv_pool = FakeKVPool()
-        k = keys_with_deviation(plan, [3, 9, 4, 15, 11, 16, 2, 7], kv_pool)
-        plan.select(k, kv_pool.get_key_buffer(plan.check_layer))
-
-        positions = plan.sel_positions.tolist()
-        self.assertEqual(positions, sorted(positions))
-        self.assertEqual(len(positions), plan.sel_lens[0])
-        # The logits processor takes cumsum(extend_seq_lens) - 1 as each request's last
-        # row, so the last prompt position has to be the last row.
-        self.assertEqual(positions[-1], 23)
-        self.assertEqual(plan.sel_rows.tolist(), positions)
-
-    def test_selection_is_the_union_of_fresh_and_chosen(self):
-        subctx_config.TOPK_RATIO = 0.25
-        req = make_req(32, [(4, 20, 500)])
-        plan, _pool, _fresh_loc, _topk = build([req])
-
-        kv_pool = FakeKVPool()
-        k = keys_with_deviation(plan, [6, 11, 17, 19], kv_pool)
-        plan.select(k, kv_pool.get_key_buffer(plan.check_layer))
-
-        fresh = set(req.sub_context_fresh_positions())
-        selected = set(plan.sel_positions.tolist())
-        self.assertTrue(fresh.issubset(selected))
-        self.assertEqual(selected - fresh, {6, 11, 17, 19})
-
-    def test_ratio_zero_selects_exactly_the_fresh_tokens(self):
-        subctx_config.TOPK_RATIO = 0.0
-        req = make_req(32, [(4, 20, 500)])
-        plan, _pool, _fresh_loc, _topk = build([req])
-        self.assertEqual(plan.topk_counts, [0])
-
-        kv_pool = FakeKVPool()
-        k = keys_with_deviation(plan, [6, 11], kv_pool)
-        plan.select(k, kv_pool.get_key_buffer(plan.check_layer))
-
-        self.assertEqual(
-            plan.sel_positions.tolist(), req.sub_context_fresh_positions()
-        )
-        self.assertEqual(plan.sel_topk_rows.numel(), 0)
-
-    def test_the_probe_starts_past_the_exact_prefix(self):
-        """A chained request's prefix is neither probed nor scored; with a plain
-        request in the same batch, that one probes only what it computes."""
-        subctx_config.TOPK_RATIO = 0.25
-        # [0, 12) exact prefix, [20, 36) a scanned run: 16 scored tokens, quota 4.
-        chained = make_req(40, [(0, 12, 100), (20, 36, 500)], req_pool_idx=0, ours=[False, True])
-        chained.sub_context_exact_len = 12
-        plain = make_req(30, [], req_pool_idx=1)
-        plain.sub_context_layout = None
-        plain.prefix_indices = torch.arange(700, 725, dtype=torch.int64)
-        self.assertEqual(chained.sub_context_forward_rows(), 28)
-
-        plan, _pool, _fresh_loc, _topk = build([chained, plain])
-        self.assertEqual(plan.probe_starts, [12, 25])
-        self.assertEqual(plan.probe_lens, [28, 5])
-        self.assertEqual(plan.topk_counts, [4, 0])
-        self.assertEqual(plan.probe_cache_loc.numel(), 33)
-
-        kv_pool = FakeKVPool()
-        loud = [33, 21, 28, 25]
-        k = keys_with_deviation(plan, loud, kv_pool)
-        plan.select(k, kv_pool.get_key_buffer(plan.check_layer))
-
-        positions = plan.sel_positions.tolist()
-        mine = positions[: plan.sel_lens[0]]
-        self.assertEqual(
-            sorted(set(mine) - set(chained.sub_context_fresh_positions())), sorted(loud)
-        )
-        self.assertEqual(positions[plan.sel_lens[0] :], plain.sub_context_fresh_positions())
-        self.assertTrue(all(p >= 12 for p in mine))
-        # Rows index the probe: position - start + offset.
-        self.assertEqual(
-            plan.sel_rows.tolist()[: plan.sel_lens[0]],
-            [p - 12 for p in positions[: plan.sel_lens[0]]],
-        )
-        self.assertEqual(
-            plan.sel_rows.tolist()[plan.sel_lens[0] :],
-            [plan.row_offsets[1] + p - 25 for p in positions[plan.sel_lens[0] :]],
+        self.plan = build_plan(self.batch, out_cache_loc, list(ratios), check_layer)
+        starts = [r.sub_context_probe_start() for r in reqs]
+        ids = [t for r, s in zip(reqs, starts) for t in r.fill_ids[s:]]
+        positions = [p for r, s in zip(reqs, starts) for p in range(s, len(r.fill_ids))]
+        self.fb = SimpleNamespace(
+            input_ids=torch.tensor(ids),
+            positions=torch.tensor(positions),
+            out_cache_loc=out_cache_loc,
+            token_to_kv_pool=self.kv,
+            req_to_token_pool=self.batch.req_to_token_pool,
+            extend_seq_lens=torch.zeros(len(reqs), dtype=torch.int32),
+            extend_seq_lens_cpu=None,
+            seq_lens_cpu=[len(r.fill_ids) for r in reqs],
+            req_pool_indices_cpu=[r.req_pool_idx for r in reqs],
+            hidden_states=None,
+            residual=None,
+            subctx_blend_plan=self.plan,
         )
 
-    def test_each_request_gets_its_own_quota(self):
-        subctx_config.TOPK_RATIO = 0.25
-        # Eight reused tokens for one, sixteen for the other: quotas 2 and 4.
-        first = make_req(16, [(2, 10, 500)], req_pool_idx=0)
-        second = make_req(32, [(4, 20, 600)], req_pool_idx=1)
-        plan, _pool, _fresh_loc, _topk = build([first, second])
-        self.assertEqual(plan.topk_counts, [2, 4])
+        # Which reused positions ran each layer, recorded as the plan advances.
+        self.running = {}
+        select = self.plan.select
 
-        kv_pool = FakeKVPool()
-        cached = kv_pool.get_key_buffer(plan.check_layer)
-        k = torch.zeros(sum(plan.probe_lens), NUM_HEADS, HEAD_DIM)
-        k[plan.reused_rows] = cached[plan.reused_slots]
-        # All deviation is in the second request, with distinct magnitudes (no ties).
-        # Each request fills its own quota.
-        for rank, position in enumerate((5, 6, 7, 8, 9, 10)):
-            k[plan.row_offsets[1] + position] += 6.0 - rank
-        plan.select(k, cached)
+        def recording_select(cached, fresh):
+            self._record()
+            return select(cached, fresh)
 
-        self.assertEqual(plan.sel_positions.numel(), sum(plan.sel_lens))
-        chosen = plan.reused_rows[plan.sel_topk_rows]
-        first_chosen = chosen[chosen < plan.row_offsets[1]]
-        second_chosen = chosen[chosen >= plan.row_offsets[1]] - plan.row_offsets[1]
-        self.assertEqual(first_chosen.numel(), 2)
-        self.assertEqual(sorted(second_chosen.tolist()), [5, 6, 7, 8])
+        self.plan.select = recording_select
+        self.out = FakeRunner(self.model).forward_subctx_blend(self.fb)
+        self._record()
+
+    def _record(self):
+        plan = self.plan
+        rows = plan.reused_rows[plan.reused].tolist()
+        stage = plan.stage
+        layers = (
+            range(0, plan.check_layers[0] + 1)
+            if stage == 0
+            else range(
+                plan.check_layers[stage - 1] + 1,
+                (plan.check_layers[stage] + 1)
+                if stage < len(plan.check_layers)
+                else NUM_LAYERS,
+            )
+        )
+        for layer in layers:
+            self.running[layer] = set(self.position_of(r) for r in rows)
+
+    def position_of(self, row):
+        """``(rid, position)`` of a probe row."""
+        plan = self.plan
+        i = max(j for j, off in enumerate(plan.row_offsets) if off <= row)
+        return self.reqs[i].rid, row - plan.row_offsets[i] + plan.probe_starts[i]
+
+    def slot(self, req, position):
+        return int(self.batch.req_to_token_pool.req_to_token[req.req_pool_idx, position])
 
 
-class TestProbeWrites(unittest.TestCase):
-    def setUp(self):
-        self.ratio = subctx_config.TOPK_RATIO
-        self.index = subctx_config.INDEX_SUBCONTEXTS
-        subctx_config.INDEX_SUBCONTEXTS = True
-        subctx_config.TOPK_RATIO = 0.25
-
-    def tearDown(self):
-        subctx_config.TOPK_RATIO = self.ratio
-        subctx_config.INDEX_SUBCONTEXTS = self.index
-
-    def test_reused_rows_are_written_to_the_discard_slot(self):
+class TestPlan(unittest.TestCase):
+    def test_every_probe_row_writes_to_its_own_slot(self):
+        # [4, 20) reused from slot 500 on; [0, 4) and [20, 32) fresh.
         req = make_req(32, [(4, 20, 500)])
-        plan, _pool, fresh_loc, _topk = build([req])
+        batch, fresh_loc = lay_out([req])
+        plan = build_plan(batch, fresh_loc, [0.25], 1)
 
         loc = plan.probe_cache_loc
-        self.assertEqual(loc.numel(), 32)
-        # Slot 0 is the allocator's padded dummy: never handed out, so a write there
-        # cannot reach another request's KV.
-        self.assertTrue(bool((loc[plan.reused_rows] == 0).all()))
-        fresh_positions = torch.tensor(req.sub_context_fresh_positions())
-        self.assertEqual(loc[fresh_positions].tolist(), fresh_loc.tolist())
+        self.assertEqual(loc[plan.reused_rows].tolist(), list(range(500, 516)))
+        fresh = torch.tensor(req.sub_context_fresh_positions())
+        self.assertEqual(loc[fresh].tolist(), fresh_loc.tolist())
+        self.assertEqual(sorted(loc.tolist()), sorted(set(loc.tolist())))
 
-    def test_every_computed_token_keeps_its_own_slot(self):
+    def test_counts_are_per_request_and_per_scored_layer(self):
         first = make_req(16, [(2, 10, 500)], req_pool_idx=0)
         second = make_req(32, [(4, 20, 600)], req_pool_idx=1)
-        plan, _pool, fresh_loc, _topk = build([first, second])
+        batch, fresh_loc = lay_out([first, second], first_slot=700)
+        plan = build_plan(batch, fresh_loc, [0.5, 0.25], 1)
+        self.assertEqual(plan.check_layers, [1, 2])
+        self.assertEqual(plan.keep_counts, [[4, 8], [2, 4]])
+        self.assertEqual(plan.fresh_counts, [8, 16])
+        plan.start()
+        self.assertEqual(plan.lens(), [16, 32])
 
-        written = plan.probe_cache_loc[plan.probe_cache_loc != 0]
-        self.assertEqual(sorted(written.tolist()), sorted(fresh_loc.tolist()))
+    def test_selection_keeps_the_top_scorers_nested_and_the_fresh_rows(self):
+        first = make_req(16, [(2, 10, 500)], req_pool_idx=0)
+        second = make_req(32, [(4, 20, 600)], req_pool_idx=1)
+        batch, fresh_loc = lay_out([first, second], first_slot=700)
+        plan = build_plan(batch, fresh_loc, [0.5, 0.25], 1)
+        plan.start()
+        n = plan.reused_rows.numel()
 
+        cached = torch.zeros(n, NUM_HEADS, HEAD_DIM)
+        fresh = torch.zeros(n, NUM_HEADS, HEAD_DIM)
+        # Scores 0..23 by index, so the top of each request is its last reused rows.
+        fresh += torch.arange(n, dtype=torch.float32)[:, None, None]
+        keep = plan.select(cached, fresh)
+        first_kept = [r for r in plan.reused_rows[plan.reused].tolist() if r < 16]
+        second_kept = [
+            r - 16 for r in plan.reused_rows[plan.reused].tolist() if r >= 16
+        ]
+        self.assertEqual(first_kept, [6, 7, 8, 9])
+        self.assertEqual(second_kept, list(range(12, 20)))
+        self.assertEqual(plan.lens(), [12, 24])
+        self.assertEqual(keep.tolist(), plan.rows.tolist())
 
-class TestCommit(unittest.TestCase):
-    def setUp(self):
-        self.ratio = subctx_config.TOPK_RATIO
-        self.index = subctx_config.INDEX_SUBCONTEXTS
-        subctx_config.INDEX_SUBCONTEXTS = True
-        subctx_config.TOPK_RATIO = 0.25
+        # Second layer: scores falling with the index among the survivors.
+        m = plan.reused.numel()
+        fresh = torch.zeros(m, NUM_HEADS, HEAD_DIM)
+        fresh += (m - torch.arange(m, dtype=torch.float32))[:, None, None]
+        before = plan.rows.clone()
+        keep = plan.select(torch.zeros_like(fresh), fresh)
+        kept = plan.reused_rows[plan.reused].tolist()
+        self.assertEqual([r for r in kept if r < 16], [6, 7])
+        self.assertEqual([r - 16 for r in kept if r >= 16], [12, 13, 14, 15])
+        self.assertEqual(before[keep].tolist(), plan.rows.tolist())
+        fresh_rows = set(plan.fresh_rows.tolist())
+        self.assertTrue(fresh_rows.issubset(set(plan.rows.tolist())))
+        self.assertEqual(plan.rows.tolist(), sorted(plan.rows.tolist()))
 
-    def tearDown(self):
-        subctx_config.TOPK_RATIO = self.ratio
-        subctx_config.INDEX_SUBCONTEXTS = self.index
-
-    def commit_once(self, loud=(6, 11, 17, 19)):
-        req = make_req(32, [(4, 20, 500)])
-        plan, pool, _fresh_loc, topk_slots = build([req])
-
-        kv_pool = FakeKVPool()
-        # Give every cache row a fingerprint, so a slot that was never filled is
-        # distinguishable from one that was.
-        for layer in range(NUM_LAYERS):
-            kv_pool.k_buffer[layer] = (
-                torch.arange(NUM_SLOTS, dtype=torch.float32)
-                .view(-1, 1, 1)
-                .expand(NUM_SLOTS, NUM_HEADS, HEAD_DIM)
-                .contiguous()
-                + layer * 1000.0
-            )
-            kv_pool.v_buffer[layer] = kv_pool.k_buffer[layer].clone()
-
-        k = keys_with_deviation(plan, list(loud), kv_pool)
-        v = k.clone()
-        plan.select(k, kv_pool.get_key_buffer(plan.check_layer))
-
-        fb = FakeForwardBatch(kv_pool, pool)
-        plan.commit(k, v, fb, FakeLayer(plan.check_layer))
-        return plan, pool, kv_pool, topk_slots, k
-
-    def test_layers_before_the_scored_one_are_seeded_from_the_cache(self):
-        plan, _pool, kv_pool, topk_slots, _k = self.commit_once()
-        source = plan.reused_slots[plan.sel_topk_rows]
-        for layer in range(plan.check_layer):
-            # Not merely non-zero: the value has to be the one the reused row held, or
-            # decode reads a different token's key at that layer.
-            self.assertTrue(
-                torch.equal(
-                    kv_pool.k_buffer[layer][topk_slots],
-                    kv_pool.k_buffer[layer][source],
-                )
-            )
-            self.assertTrue(
-                torch.equal(
-                    kv_pool.v_buffer[layer][topk_slots],
-                    kv_pool.v_buffer[layer][source],
-                )
-            )
-
-    def test_the_scored_layer_holds_the_recomputed_key(self):
-        plan, _pool, kv_pool, topk_slots, k = self.commit_once()
-        rows = plan.reused_rows[plan.sel_topk_rows]
-        self.assertTrue(
-            torch.equal(kv_pool.k_buffer[plan.check_layer][topk_slots], k[rows])
-        )
-
-    def test_later_layers_are_left_for_the_second_range(self):
-        plan, _pool, kv_pool, topk_slots, _k = self.commit_once()
-        # Untouched here, and filled by the layers that run after the cut. Seeding them
-        # too would only be wasted copying.
-        for layer in range(plan.check_layer + 1, NUM_LAYERS):
-            expected = (
-                topk_slots.to(torch.float32).view(-1, 1, 1).expand_as(
-                    kv_pool.k_buffer[layer][topk_slots]
-                )
-                + layer * 1000.0
-            )
-            self.assertTrue(
-                torch.equal(kv_pool.k_buffer[layer][topk_slots], expected)
-            )
-
-    def test_selected_positions_stop_pointing_at_the_tree(self):
-        plan, pool, _kv_pool, topk_slots, _k = self.commit_once()
-        row = pool.req_to_token[0]
-        chosen = (plan.reused_rows[plan.sel_topk_rows] - plan.row_offsets[0]).tolist()
-        self.assertEqual(
-            sorted(row[chosen].tolist()), sorted(topk_slots.tolist())
-        )
-
-        # And the reused positions that were not selected still do -- recomputing four
-        # tokens must not detach the other twelve from the block they came from.
-        untouched = [p for p in range(4, 20) if p not in chosen]
-        self.assertEqual(row[untouched].tolist(), [500 + p - 4 for p in untouched])
-
-    def test_displaced_copies_of_our_own_are_handed_back(self):
-        # A displaced rotated copy is reported in orphaned_slots, to be freed.
-        req = make_req(32, [(4, 20, 500)], ours=[True])
-        plan, pool, _fresh_loc, _topk = build([req])
-        kv_pool = FakeKVPool()
-        k = keys_with_deviation(plan, [6, 11, 17, 19], kv_pool)
-        plan.select(k, kv_pool.get_key_buffer(plan.check_layer))
-        plan.commit(k, k.clone(), FakeForwardBatch(kv_pool, pool), FakeLayer(1))
-
-        # The four rows those positions used to point at, and nothing else.
-        self.assertEqual(
-            sorted(plan.orphaned_slots.tolist()),
-            sorted(500 + p - 4 for p in (6, 11, 17, 19)),
-        )
-        row = pool.req_to_token[0]
-        self.assertTrue(set(plan.orphaned_slots.tolist()).isdisjoint(row.tolist()))
-
-    def test_displaced_tree_rows_are_left_alone(self):
-        # Same displacement, but the rows belong to the tree: other requests are still
-        # served from them, and handing them back would corrupt those.
+    def test_a_run_that_is_not_our_copy_is_refused(self):
         req = make_req(32, [(4, 20, 500)], ours=[False])
-        plan, pool, _fresh_loc, _topk = build([req])
-        kv_pool = FakeKVPool()
-        k = keys_with_deviation(plan, [6, 11, 17, 19], kv_pool)
-        plan.select(k, kv_pool.get_key_buffer(plan.check_layer))
-        plan.commit(k, k.clone(), FakeForwardBatch(kv_pool, pool), FakeLayer(1))
+        batch, fresh_loc = lay_out([req])
+        with self.assertRaises(AssertionError):
+            build_plan(batch, fresh_loc, [0.25], 1)
 
-        self.assertEqual(plan.orphaned_slots.numel(), 0)
+    def test_the_probe_starts_past_the_exact_prefix(self):
+        # [0, 12) exact, [20, 36) a scanned run; a plain request beside it.
+        chained = make_req(40, [(0, 12, 100), (20, 36, 500)], exact=12)
+        plain = make_plain_req(30, 700, 25, req_pool_idx=1)
+        batch, fresh_loc = lay_out([chained, plain], first_slot=800)
+        plan = build_plan(batch, fresh_loc, [0.25], 1)
+        self.assertEqual(plan.probe_starts, [12, 25])
+        self.assertEqual(plan.probe_lens, [28, 5])
+        self.assertEqual(plan.keep_counts, [[4, 0]])
+        self.assertEqual(plan.reused_rows.tolist(), list(range(8, 24)))
 
-    def test_ownership_is_per_run_not_per_request(self):
-        # A prompt can reuse one block where it was cached and another somewhere else.
-        # Only the second is a copy, so only its displaced rows come back.
-        req = make_req(48, [(4, 20, 500), (24, 40, 600)], ours=[False, True])
-        plan, pool, _fresh_loc, _topk = build([req])
-        self.assertEqual(plan.topk_counts, [8])
-        kv_pool = FakeKVPool()
-        k = keys_with_deviation(plan, [5, 6, 7, 8, 25, 26, 27, 28], kv_pool)
-        plan.select(k, kv_pool.get_key_buffer(plan.check_layer))
-        plan.commit(k, k.clone(), FakeForwardBatch(kv_pool, pool), FakeLayer(1))
 
-        self.assertEqual(
-            sorted(plan.orphaned_slots.tolist()),
-            sorted(600 + p - 24 for p in (25, 26, 27, 28)),
-        )
+class TestForward(unittest.TestCase):
+    def assert_matches_full_prefill(self, sc):
+        for i, req in enumerate(sc.reqs):
+            keys, values, out = sc.refs[i]
+            start = req.sub_context_probe_start()
+            for p in range(start, len(req.fill_ids)):
+                slot = sc.slot(req, p)
+                for layer in range(NUM_LAYERS):
+                    torch.testing.assert_close(
+                        sc.kv.k_buffer[layer][slot], keys[layer, p], rtol=0, atol=1e-10
+                    )
+                    torch.testing.assert_close(
+                        sc.kv.v_buffer[layer][slot], values[layer, p], rtol=0, atol=1e-10
+                    )
+        self.assertEqual(sc.fb.extend_seq_lens_cpu, sc.plan.lens())
+        row = 0
+        for i, req in enumerate(sc.reqs):
+            n = sc.plan.lens()[i]
+            start = req.sub_context_probe_start()
+            torch.testing.assert_close(
+                sc.out[row : row + n],
+                sc.refs[i][2][start : start + n],
+                rtol=0,
+                atol=1e-10,
+            )
+            row += n
 
-    def test_the_table_is_what_the_second_range_reads_slots_from(self):
-        plan, pool, _kv_pool, topk_slots, _k = self.commit_once()
-        # `_gather_sel_cache_loc` reads req_to_token rather than reassembling the two
-        # allocations, so every selected position must resolve there.
-        slots = pool.req_to_token[0][plan.sel_positions]
-        self.assertEqual(slots.numel(), plan.sel_lens[0])
-        self.assertTrue(bool((slots != 0).all()))
-        self.assertEqual(len(set(slots.tolist())), slots.numel())
+    def test_ratio_one_at_layer_one_is_a_full_prefill(self):
+        req = make_req(40, [(0, 6, 100), (10, 24, 500), (28, 36, 530)], exact=6)
+        sc = Scenario([req], [1.0], 1)
+        self.assertEqual(sc.plan.lens(), [34])
+        self.assert_matches_full_prefill(sc)
+
+    def test_ratio_one_at_layer_zero_is_a_full_prefill(self):
+        req = make_req(40, [(10, 24, 500), (28, 36, 530)])
+        sc = Scenario([req], [1.0], 0)
+        self.assert_matches_full_prefill(sc)
+
+    def test_ratio_one_twice_is_a_full_prefill_with_a_plain_request_beside(self):
+        chained = make_req(40, [(0, 6, 100), (10, 24, 500)], exact=6)
+        plain = make_plain_req(30, 300, 25, req_pool_idx=1, ids=range(101, 131))
+        sc = Scenario([chained, plain], [1.0, 1.0], 1)
+        self.assert_matches_full_prefill(sc)
+
+    def test_dropped_tokens_keep_their_cached_kv_and_running_ones_are_rewritten(self):
+        req = make_req(48, [(0, 4, 100), (8, 24, 500), (30, 44, 530)], exact=4)
+        sc = Scenario([req], [0.5, 0.25], 1)
+        reused = [p for s, e, _ in req.sub_context_layout[1:] for p in range(s, e)]
+        for p in reused:
+            slot = sc.slot(req, p)
+            for layer in range(NUM_LAYERS):
+                held = sc.kv.k_buffer[layer][slot]
+                cached = sc.stale_k[(req.rid, p, layer)]
+                if (req.rid, p) in sc.running[layer]:
+                    if layer > 0:
+                        self.assertFalse(torch.equal(held, cached), (p, layer))
+                else:
+                    self.assertTrue(torch.equal(held, cached), (p, layer))
+        # Every fresh slot is written on every layer.
+        for p in req.sub_context_fresh_positions():
+            for layer in range(NUM_LAYERS):
+                self.assertFalse(
+                    bool(torch.isnan(sc.kv.k_buffer[layer][sc.slot(req, p)]).any())
+                )
+        self.assertFalse(bool(torch.isnan(sc.out).any()))
+
+    def test_each_scored_layer_picks_by_its_own_deviation(self):
+        req = make_req(48, [(0, 4, 100), (8, 24, 500), (30, 44, 530)], exact=4)
+        sc = Scenario([req], [0.5, 0.25], 1)
+        reused = [p for s, e, _ in req.sub_context_layout[1:] for p in range(s, e)]
+        first = sorted(reused, key=lambda p: -stale(p, 1))[:15]
+        second = sorted(first, key=lambda p: -stale(p, 2))[:7]
+        self.assertEqual({p for _rid, p in sc.running[2]}, set(first))
+        self.assertEqual({p for _rid, p in sc.running[3]}, set(second))
+        self.assertEqual({p for _rid, p in sc.running[4]}, set(second))
+        # The layers both scored layers ran on all probe rows match the full prefill.
+        keys, _values, _out = sc.refs[0]
+        for p in first:
+            for layer in (0, 1, 2):
+                torch.testing.assert_close(
+                    sc.kv.k_buffer[layer][sc.slot(req, p)],
+                    keys[layer, p],
+                    rtol=0,
+                    atol=1e-10,
+                )
+
+    def test_the_last_row_of_each_request_is_its_last_position(self):
+        chained = make_req(40, [(0, 6, 100), (10, 24, 500)], exact=6)
+        plain = make_plain_req(30, 300, 25, req_pool_idx=1, ids=range(101, 131))
+        sc = Scenario([chained, plain], [0.5, 0.2], 1)
+        cursor = 0
+        for i, req in enumerate(sc.reqs):
+            cursor += sc.plan.lens()[i]
+            self.assertEqual(int(sc.fb.positions[cursor - 1]), len(req.fill_ids) - 1)
+        self.assertEqual(sc.fb.positions.numel(), sum(sc.plan.lens()))
 
 
 if __name__ == "__main__":

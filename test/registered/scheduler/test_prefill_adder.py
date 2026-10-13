@@ -323,7 +323,7 @@ class TestPrefillAdder(CustomTestCase):
             rem_chunk_tokens=self.BUDGET,
         )
 
-    def create_prefill_req(self, rid, fresh, prompt=None, topk=0):
+    def create_prefill_req(self, rid, fresh, prompt=None):
         """``fresh`` tokens to compute; with ``prompt``, a sparse layout whose probe
         runs ``prompt`` rows."""
         req = self.create_mock_req(rid, priority=0, max_new_tokens=16)
@@ -336,7 +336,6 @@ class TestPrefillAdder(CustomTestCase):
         req.prefix_indices = [0] * (prompt - fresh)
         req.sub_context_layout = [(0, prompt - fresh, None)] if prompt > fresh else None
         req.sub_context_forward_rows.return_value = prompt
-        req.sub_context_topk_count.return_value = topk
         return req
 
     def test_probe_over_budget_runs_alone(self):
@@ -373,14 +372,12 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.can_run_list, [first, probe])
         self.assertEqual(adder.rem_chunk_tokens, self.BUDGET - 1000 - 3000)
 
-    def test_recomputed_slots_count_toward_kv(self):
-        adder = self.create_budget_adder(available_size=1000)
-        probe = self.create_prefill_req("probe", fresh=100, prompt=3000, topk=950)
-        result = adder.add_one_req(
-            probe, has_chunked_req=False, truncation_align_size=None
-        )
-        self.assertEqual(result, AddReqResult.NO_TOKEN)
-        self.assertEqual(adder.can_run_list, [])
+    def test_recomputed_tokens_take_no_slots_beyond_the_fresh_ones(self):
+        # Recomputed reused tokens are written over their own copies.
+        adder = self.create_budget_adder(available_size=200)
+        probe = self.create_prefill_req("probe", fresh=100, prompt=3000)
+        adder.add_one_req(probe, has_chunked_req=False, truncation_align_size=None)
+        self.assertEqual(adder.can_run_list, [probe])
 
 
 if __name__ == "__main__":

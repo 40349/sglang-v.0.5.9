@@ -2309,72 +2309,59 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         logits processor) to the token set being run.
         """
         forward_batch.extend_seq_lens_cpu = lens
-        forward_batch.extend_seq_lens = torch.tensor(
-            lens, dtype=torch.int32, device=forward_batch.extend_seq_lens.device
+        forward_batch.extend_seq_lens = torch.tensor(lens, dtype=torch.int32).to(
+            forward_batch.extend_seq_lens.device, non_blocking=True
         )
 
     def forward_subctx_blend(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> LogitsProcessorOutput:
-        """Selective-recompute prefill in two layer ranges.
+        """Selective-recompute prefill, cut down at each scored layer.
 
-        Layers ``[0, check_layer]`` run each prompt from its probe start on (the
-        positions in ``forward_batch.positions``); the scored layer selects
-        the tokens to recompute. Layers after it run only the fresh plus selected
-        tokens. The attention metadata is rebuilt in between, since the row count and
-        req_to_token have both changed.
+        Layers ``[0, check_layers[0]]`` run each prompt from its probe start on (the
+        positions in ``forward_batch.positions``), every row writing its K/V into its own
+        slot. Each scored layer keeps the fresh rows and the reused rows whose key moved
+        most; the cached keys are read before the layer writes over them. The attention
+        metadata is rebuilt after each cut.
         """
         plan = forward_batch.subctx_blend_plan
         model = self.model
+        pool = forward_batch.token_to_kv_pool
         num_layers = self.model_config.num_hidden_layers
 
-        # One slot per probe row, for whatever writes this range's KV (the attention
-        # backend, or a model's fused RoPE + KV write).
+        plan.start()
+        # One slot per probe row, for whatever writes the KV (the attention backend, or
+        # a model's fused RoPE + KV write).
         forward_batch.out_cache_loc = plan.probe_cache_loc
-        self._set_extend_lens(forward_batch, plan.probe_lens)
+        self._set_extend_lens(forward_batch, plan.lens())
         self.attn_backend.init_forward_metadata(forward_batch)
-        model.forward_split_prefill(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            (0, plan.check_layer + 1),
-            **kwargs,
-        )
-        assert plan.sel_rows is not None, (
-            "the scored layer never ran: layer "
-            f"{plan.check_layer} did not reach the attention backend, so nothing was "
-            "scored and the cut below would drop rows at random"
-        )
 
-        if plan.orphaned_slots is not None and plan.orphaned_slots.numel():
-            # Displaced rotated copies, no longer in req_to_token.
-            self.token_to_kv_pool_allocator.free(plan.orphaned_slots)
+        start = 0
+        for layer in plan.check_layers:
+            cached = plan.running_keys(pool.get_key_buffer(layer))
+            model.forward_split_prefill(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                (start, layer + 1),
+                **kwargs,
+            )
+            keep = plan.select(cached, plan.running_keys(pool.get_key_buffer(layer)))
+            forward_batch.hidden_states = forward_batch.hidden_states[keep]
+            forward_batch.residual = forward_batch.residual[keep]
+            forward_batch.positions = forward_batch.positions[keep]
+            forward_batch.out_cache_loc = forward_batch.out_cache_loc[keep]
+            self._set_extend_lens(forward_batch, plan.lens())
+            self.attn_backend.init_forward_metadata(forward_batch)
+            start = layer + 1
 
-        forward_batch.hidden_states = forward_batch.hidden_states[plan.sel_rows]
-        forward_batch.residual = forward_batch.residual[plan.sel_rows]
-        forward_batch.positions = plan.sel_positions
-        forward_batch.out_cache_loc = self._gather_sel_cache_loc(forward_batch, plan)
-        self._set_extend_lens(forward_batch, plan.sel_lens)
-
-        self.attn_backend.init_forward_metadata(forward_batch)
         return model.forward_split_prefill(
             forward_batch.input_ids,
             forward_batch.positions,
             forward_batch,
-            (plan.check_layer + 1, num_layers),
+            (start, num_layers),
             **kwargs,
         )
-
-    def _gather_sel_cache_loc(self, forward_batch: ForwardBatch, plan) -> torch.Tensor:
-        """The slot of every selected row, read from req_to_token after ``commit``."""
-        req_to_token = forward_batch.req_to_token_pool.req_to_token
-        parts = []
-        cursor = 0
-        for i, length in enumerate(plan.sel_lens):
-            positions = plan.sel_positions[cursor : cursor + length]
-            parts.append(req_to_token[plan.req_pool_indices[i], positions])
-            cursor += length
-        return torch.cat(parts).to(torch.int64)
 
     def forward_extend(
         self,

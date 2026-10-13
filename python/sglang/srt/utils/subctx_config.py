@@ -50,11 +50,20 @@ SPLIT_MODE = os.environ.get("SGLANG_SUBCTX_SPLIT", "blocks")
 CDC_TARGET_TOKENS = int(os.environ.get("SGLANG_SUBCTX_CDC_TARGET", "256"))
 CDC_MAX_TOKENS = int(os.environ.get("SGLANG_SUBCTX_CDC_MAX", "1024"))
 
-# Fraction of the reused tokens to recompute, picked by how far their key moved.
-# 0 recomputes nothing; 1.0 recomputes every reused token.
-TOPK_RATIO = float(os.environ.get("SGLANG_SUBCTX_TOPK_RATIO", "0"))
+# Fractions of the reused tokens to recompute, picked by how far their key moved, one per
+# scored layer ("0.3,0.2,0.15"): the i-th is taken at layer TOPK_LAYER + i from the tokens
+# the previous one kept, and the last holds for the layers after. 0 recomputes nothing;
+# 1.0 recomputes every reused token.
+_TOPK_RATIO_ENV = os.environ.get("SGLANG_SUBCTX_TOPK_RATIO", "0")
+try:
+    TOPK_RATIOS = tuple(float(r) for r in _TOPK_RATIO_ENV.split(","))
+except ValueError:
+    raise ValueError(
+        f"SGLANG_SUBCTX_TOPK_RATIO={_TOPK_RATIO_ENV!r}; want comma-separated fractions, "
+        "e.g. 0.15 or 0.3,0.2,0.15"
+    ) from None
 
-# Layer whose fresh and cached keys are compared. At layer 0 every score is 0.
+# First layer whose fresh and cached keys are compared. At layer 0 every score is 0.
 TOPK_LAYER = int(os.environ.get("SGLANG_SUBCTX_TOPK_LAYER", "1"))
 
 
@@ -65,7 +74,12 @@ def hash_subcontext_keys() -> bool:
 
 def topk_active() -> bool:
     """Whether any reused token is recomputed."""
-    return TOPK_RATIO > 0.0 and INDEX_SUBCONTEXTS
+    return TOPK_RATIOS[0] > 0.0 and INDEX_SUBCONTEXTS
+
+
+def topk_check_layers() -> range:
+    """The scored layers, one per ratio in ``TOPK_RATIOS``."""
+    return range(TOPK_LAYER, TOPK_LAYER + len(TOPK_RATIOS))
 
 
 if SPLIT_MODE not in ("blocks", "cdc"):
@@ -79,12 +93,18 @@ if SPLIT_MODE == "cdc" and not DISABLE_SUBCONTEXT and not hash_subcontext_keys()
         "SGLANG_SUBCTX_INDEX=1 (or SGLANG_SUBCTX_HASH_KEYS=1)"
     )
 
-if not 0.0 <= TOPK_RATIO <= 1.0:
+if not all(0.0 <= r <= 1.0 for r in TOPK_RATIOS):
     raise ValueError(
-        f"SGLANG_SUBCTX_TOPK_RATIO={TOPK_RATIO}; want a fraction in [0, 1]"
+        f"SGLANG_SUBCTX_TOPK_RATIO={TOPK_RATIOS}; want fractions in [0, 1]"
     )
 
-if TOPK_RATIO > 0.0 and not INDEX_SUBCONTEXTS:
+if any(b > a for a, b in zip(TOPK_RATIOS, TOPK_RATIOS[1:])):
+    raise ValueError(
+        f"SGLANG_SUBCTX_TOPK_RATIO={TOPK_RATIOS}; each scored layer picks from the "
+        "tokens the previous one kept, so the ratios must not increase"
+    )
+
+if TOPK_RATIOS[0] > 0.0 and not INDEX_SUBCONTEXTS:
     raise ValueError(
         "SGLANG_SUBCTX_TOPK_RATIO needs the index's sparse prefill to have something "
         "to recompute into: set SGLANG_SUBCTX_INDEX=1, or leave the ratio at 0"
@@ -93,7 +113,7 @@ if TOPK_RATIO > 0.0 and not INDEX_SUBCONTEXTS:
 if TOPK_LAYER < 0:
     raise ValueError(f"SGLANG_SUBCTX_TOPK_LAYER={TOPK_LAYER}; want a layer index")
 
-if TOPK_LAYER == 0 and 0.0 < TOPK_RATIO < 1.0:
+if TOPK_LAYER == 0 and 0.0 < TOPK_RATIOS[0] < 1.0:
     raise ValueError(
         "SGLANG_SUBCTX_TOPK_LAYER=0 would score every token identically: layer 0's "
         "key depends only on the token and its position, so every deviation is zero. "
@@ -230,9 +250,9 @@ def topk_unsupported_reason(model_runner) -> Optional[str]:
     """Return why reused tokens cannot be selectively recomputed, or None if they can.
 
     The probe runs each prompt from its probe start through layers ``[0, TOPK_LAYER]``,
-    then the token
-    dimension is cut down to the selected rows. Each case below either cannot run a
-    layer range, splits the tokens across ranks, or reads a token count the cut changes.
+    then the token dimension is cut down to the selected rows at each scored layer. Each
+    case below either cannot run a layer range, splits the tokens across ranks, or reads
+    a token count the cut changes.
     """
     from sglang.srt.layers.dp_attention import get_attention_tp_size
 
@@ -246,10 +266,12 @@ def topk_unsupported_reason(model_runner) -> Optional[str]:
         )
 
     num_layers = model_runner.model_config.num_hidden_layers
-    if TOPK_LAYER >= num_layers - 1:
+    last = topk_check_layers()[-1]
+    if last >= num_layers - 1:
         return (
-            f"SGLANG_SUBCTX_TOPK_LAYER={TOPK_LAYER} leaves no layer after it to "
-            f"recompute ({num_layers} layers)"
+            f"SGLANG_SUBCTX_TOPK_LAYER={TOPK_LAYER} with {len(TOPK_RATIOS)} ratios "
+            f"scores up to layer {last}, which leaves no layer after it to recompute "
+            f"({num_layers} layers)"
         )
 
     if args.pp_size > 1:
@@ -292,8 +314,8 @@ def topk_unsupported_reason(model_runner) -> Optional[str]:
         )
     if args.enable_torch_compile:
         return (
-            "torch.compile specialises on shapes, and this pass runs two different "
-            "token counts through the same layer stack"
+            "torch.compile specialises on shapes, and this pass runs a different "
+            "token count through the layer stack after each scored layer"
         )
     if args.enable_return_hidden_states:
         return (
