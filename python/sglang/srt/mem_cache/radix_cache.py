@@ -690,10 +690,10 @@ class RadixCache(BasePrefixCache):
 
         key, value = self.maybe_bigram_convert(key, value)
 
-        prefix_len = self._insert_helper(
+        prefix_len, last_node = self._insert_helper(
             self.root_node, key, value, priority, params.canonical_position
         )
-        return InsertResult(prefix_len=prefix_len)
+        return InsertResult(prefix_len=prefix_len, last_node=last_node)
 
     def _page_align_keys(self, key: list) -> list:
         if self.page_size == 1:
@@ -772,13 +772,9 @@ class RadixCache(BasePrefixCache):
                 kv_indices[req.cache_protected_len : new_prefix_len]
             )
             if self.chains_sub_contexts(req) and len(keys) > new_prefix_len:
-                with host_timer.record("finish_rematch"):
-                    chain_end = self.match_prefix(
-                        MatchPrefixParams(key=radix_key)
-                    ).last_device_node
                 with host_timer.record("register_finished"):
                     self._register_chain(
-                        req, keys, new_prefix_len, chain_end, final=True
+                        req, keys, new_prefix_len, result.last_node, final=True
                     )
         else:
             self.token_to_kv_pool_allocator.free(
@@ -1746,7 +1742,7 @@ class RadixCache(BasePrefixCache):
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
-            return 0
+            return 0, node
 
         child_key = self.get_child_key_fn(key)
 
@@ -1781,7 +1777,8 @@ class RadixCache(BasePrefixCache):
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
-        return total_prefix_length
+            node = new_node
+        return total_prefix_length, node
 
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""

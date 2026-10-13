@@ -552,7 +552,6 @@ STAGE_NOTES = {
     "cache_unfinished": "insert prompt into the tree",
     "register_unfinished": "  register the prompt's new chunks in the index",
     "cache_finished": "release locks / free tail",
-    "finish_rematch": "  match the whole sequence again to find the chain's last node",
     "register_finished": "  register the output's chunks in the index",
     "subctx_rev_rotate": "  of which: reverse-rotate a refused block and file it",
 }
@@ -566,7 +565,6 @@ BREAKDOWN = {
     "scan_locate": "subctx_scan",
     "scan_copy": "subctx_scan",
     "register_unfinished": "cache_unfinished",
-    "finish_rematch": "cache_finished",
     "register_finished": "cache_finished",
     "subctx_lookup": "subctx_stitch",
     "subctx_rotate": "match / cache_unfinished",

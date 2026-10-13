@@ -6,11 +6,13 @@ import logging
 import os
 import time
 import uuid
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 import jinja2
 import numpy as np
 import orjson
+import xxhash
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
@@ -67,6 +69,9 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+# Messages whose cdc cut points are kept, least recently used dropped first.
+MESSAGE_CUTS_CACHED = 1 << 16
 
 if DISABLE_SUBCONTEXT:
     logger.info("Sub-context split DISABLED (baseline mode)")
@@ -131,6 +136,8 @@ class OpenAIServingChat(OpenAIServingBase):
         host_timer.init_host_timer("http")
         self._message_start_probed = False
         self._message_start_id: Optional[int] = None
+        # (length, xxh3 of the int32 token ids) -> cut_points of that message.
+        self._message_cuts: OrderedDict[tuple[int, int], List[int]] = OrderedDict()
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
@@ -436,6 +443,19 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         return self._message_start_id
 
+    def _message_cut_points(self, ids: np.ndarray) -> List[int]:
+        """``cut_points`` of one message's token ids, cached by content."""
+        key = (ids.shape[0], xxhash.xxh3_64_intdigest(ids.tobytes()))
+        cuts = self._message_cuts.get(key)
+        if cuts is not None:
+            self._message_cuts.move_to_end(key)
+            return cuts
+        cuts = cut_points(ids, CDC_TARGET_TOKENS, MIN_CHUNK_TOKENS, CDC_MAX_TOKENS)
+        self._message_cuts[key] = cuts
+        if len(self._message_cuts) > MESSAGE_CUTS_CACHED:
+            self._message_cuts.popitem(last=False)
+        return cuts
+
     @host_timer.timed("subctx_split")
     def _compute_sub_context_ids(
         self,
@@ -467,10 +487,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 starts += [i for i in np.flatnonzero(arr == marker).tolist() if i > 0]
             bounds = [0]
             for a, b in zip(starts, starts[1:] + [len(prompt_ids)]):
-                cuts = cut_points(
-                    arr[a:b], CDC_TARGET_TOKENS, MIN_CHUNK_TOKENS, CDC_MAX_TOKENS
-                )
-                bounds += [a + c for c in cuts] + [b]
+                bounds += [a + c for c in self._message_cut_points(arr[a:b])] + [b]
             if len(bounds) < 3:
                 return None, None
             segments = [prompt_ids[a:b] for a, b in zip(bounds, bounds[1:])]

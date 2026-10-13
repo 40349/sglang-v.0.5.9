@@ -71,6 +71,8 @@ class InsertResult:
 
     prefix_len: int
     mamba_exist: bool = False
+    # Sub-context: the node holding the key's last token (RadixCache only).
+    last_node: Optional[Any] = None
 
 
 @dataclasses.dataclass
