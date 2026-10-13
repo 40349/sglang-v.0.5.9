@@ -1455,7 +1455,7 @@ class TestChainedIndex(unittest.TestCase):
         self.assertEqual(allocator.allocated, [])
         self.assertIsNone(second.sub_context_match_nodes)
         self.assertEqual(cache.protected_size(), 0)
-        self.assertEqual(second.sub_context_tally[4], 1)
+        self.assertEqual(second.sub_context_tally[4:], (1, 39))
         self.assertEqual(second.sub_context_moved, 39)
 
     def test_a_layout_left_too_big_by_failed_copies_keeps_the_prefix_only(self):
@@ -1472,7 +1472,7 @@ class TestChainedIndex(unittest.TestCase):
         self.assertEqual(sorted(allocator.freed), sorted(cache.kv_rotator.calls[-1][1]))
         self.assertIsNone(second.sub_context_match_nodes)
         self.assertEqual(cache.protected_size(), 0)
-        self.assertEqual(second.sub_context_tally[4], 1)
+        self.assertEqual(second.sub_context_tally[4:], (1, 39))
         self.assertEqual((second.sub_context_moved, second.sub_context_rotated), (39, 0))
 
     def test_a_run_out_of_rotation_range_is_never_locked(self):

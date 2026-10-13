@@ -253,8 +253,10 @@ class SubContextIndex:
         self.prefix_tokens = 0
         self.reused_tokens = 0
         self.rotated_tokens = 0
-        # Requests whose layout did not fit one prefill pass and took the prefix only.
+        # Requests whose layout did not fit one prefill pass and took the prefix only,
+        # and the found tokens those requests dropped.
         self.fell_back = 0
+        self.fell_back_tokens = 0
         # Requests refused for KV room with nothing else running; matched on the
         # prefix only from then on.
         self.no_room = 0
@@ -273,7 +275,8 @@ class SubContextIndex:
                 f"scan found {self.reused_tokens} "
                 f"({100.0 * self.reused_tokens / denom:.0f}%), "
                 f"{self.rotated_tokens} of them rotated into place"
-                f" | {self.fell_back} requests too big for one pass, "
+                f" | {self.fell_back} requests too big for one pass "
+                f"({self.fell_back_tokens} found tokens dropped), "
                 f"{self.no_room} refused for room"
             )
         # Dry run.
@@ -285,7 +288,13 @@ class SubContextIndex:
         )
 
     def count_match(
-        self, prompt: int, prefix: int, found: int, rotated: int, fell_back: int
+        self,
+        prompt: int,
+        prefix: int,
+        found: int,
+        rotated: int,
+        fell_back: int,
+        fell_back_tokens: int,
     ) -> None:
         """Add one admitted request's match to the live tallies."""
         self.prompt_tokens += prompt
@@ -293,6 +302,7 @@ class SubContextIndex:
         self.reused_tokens += found
         self.rotated_tokens += rotated
         self.fell_back += fell_back
+        self.fell_back_tokens += fell_back_tokens
 
     def __len__(self) -> int:
         return sum(len(s.chunks) for s in self._scopes.values())

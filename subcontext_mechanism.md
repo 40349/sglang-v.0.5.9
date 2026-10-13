@@ -897,7 +897,7 @@ GPU 上沒有任何線索可查——唯一能發現問題的地方是**記帳**
 | host 階段計時 | `SGLANG_STAGE_TRACE=<前綴>` | 每個 process 寫 `<前綴>.<proc>.json`：`tpl_render`、`subctx_split`（http）；`match`、`subctx_stitch`、`subctx_lookup`、`subctx_scan`、`subctx_rotate`、`subctx_copy`、`subctx_rotate_finish`、`subctx_rev_rotate`、`cache_unfinished`、`cache_finished`（scheduler）。client 建立 `<前綴>.mark` 後另開一份 `measured` 累計，排除 warm-up |
 | 請求錄製 | `SGLANG_CAPTURE_REQUESTS=<檔>` | 每個 chat 請求原文一行，給 `subcontext_bench.py replay` |
 | `/server_info` | — | `sub_context` 物件：所有開關的實際值與 `pid`，給遠端 client 確認 arm（`scripts/subcontext_sim/check_remote_arm.py`）；`chain_storage` 為 true 表示是鏈式儲存的版本 |
-| 索引統計 | 開 index 時 | prefill log 那行後面附 `sub-context index: …`：比對過的 prompt token 數、其中從頭比對到的、scan 找到的、旋轉的，以及放不進一次 prefill、沒空間被拒的請求數。每個請求只在第一次真的執行（`prepare_for_extend`）時算一次，被拒後重新比對、被 retract 後重跑的都不算；4090 smoke 中與 client 端 `prompt_tokens`、`cached_tokens` 加總完全一致。`chunks`、`queries`、`tokens scanned`（開頭三個）仍是每次掃描都算；`tokens scanned` 只算實際取指紋的部分（從「前綴長度 + 最短 chunk − 最長 chunk」起），dry run 掃整條 |
+| 索引統計 | 開 index 時 | prefill log 那行後面附 `sub-context index: …`：比對過的 prompt token 數、其中從頭比對到的、scan 找到的、旋轉的，以及放不進一次 prefill 的請求數與它們丟掉的掃描命中 token 數、沒空間被拒的請求數。每個請求只在第一次真的執行（`prepare_for_extend`）時算一次，被拒後重新比對、被 retract 後重跑的都不算；4090 smoke 中與 client 端 `prompt_tokens`、`cached_tokens` 加總完全一致。`chunks`、`queries`、`tokens scanned`（開頭三個）仍是每次掃描都算；`tokens scanned` 只算實際取指紋的部分（從「前綴長度 + 最短 chunk − 最長 chunk」起），dry run 掃整條 |
 
 ### 防線與偵錯
 

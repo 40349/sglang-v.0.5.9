@@ -681,10 +681,10 @@ class Req(ReqDllmMixin):
         # Chained requests: refused for KV room while holding scanned runs with
         # nothing else running. Matched on the prefix only from then on.
         self.sub_context_index_declined: bool = False
-        # Chained requests: the last match's (prompt, prefix, found, rotated, fell
-        # back) tokens and flag, added to the index tallies the first time the request
-        # runs (`sub_context_counted`).
-        self.sub_context_tally: Optional[Tuple[int, int, int, int, int]] = None
+        # Chained requests: the last match's (prompt, prefix, found, rotated) tokens,
+        # fell-back flag and found tokens dropped by the fall back, added to the index
+        # tallies the first time the request runs (`sub_context_counted`).
+        self.sub_context_tally: Optional[Tuple[int, int, int, int, int, int]] = None
         self.sub_context_counted: bool = False
         # Displaced hits not yet counted as moved, pending `_rotate_append_sub_contexts`.
         self.sub_context_deferred_moved: int = 0
@@ -1375,7 +1375,7 @@ class Req(ReqDllmMixin):
             candidates.append(run)
 
         moved = rotated = discarded = 0
-        fell_back = 0
+        fell_back = fell_back_tokens = 0
         located = []
         for run in index.select(candidates):
             where = tree_cache.chain_chunk_slots(run.chunk_id)
@@ -1397,6 +1397,7 @@ class Req(ReqDllmMixin):
         ):
             # A sparse layout cannot be chunked: keep the prefix only.
             fell_back = 1
+            fell_back_tokens = sum(r.length for r, _s, _n, _d in located)
             for run, _src, node, delta in located:
                 tree_cache.dec_lock_ref(node)
                 if delta:
@@ -1440,10 +1441,11 @@ class Req(ReqDllmMixin):
                 # Copies that failed left more to compute than one pass holds: keep the
                 # prefix only.
                 fell_back = 1
+                fell_back_tokens = sum(e - s for s, e, _ in runs)
                 self.release_sub_context_match_locks(tree_cache)
                 self.release_sub_context_rotated_slots(tree_cache)
                 self.prefix_indices = prefix
-                discarded += sum(e - s for s, e, _ in runs)
+                discarded += fell_back_tokens
                 moved += rotated
                 runs = []
                 rotated = 0
@@ -1457,6 +1459,7 @@ class Req(ReqDllmMixin):
             sum(e - s for s, e, _ in runs),
             rotated,
             fell_back,
+            fell_back_tokens,
         )
 
         if TRACE_ON:

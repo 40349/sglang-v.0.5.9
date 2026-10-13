@@ -215,14 +215,14 @@ grep "sub-context index:" server.log | tail -1
 
 ```
 sub-context index: N chunks, M queries, X tokens scanned | matched P prompt tokens: prefix A (a%),
-scan found B (b%), W of them rotated into place | K requests too big for one pass, R refused for room
+scan found B (b%), W of them rotated into place | K requests too big for one pass (D found tokens dropped), R refused for room
 ```
 
 - `a%` 是從頭比對到的部分（原生 radix cache 也拿得到）。
 - `b%` 是掃描找到的部分 — 原生 radix cache 結構上拿不到的；`W` 是其中靠旋轉撿回來的量。
-- `K` 是放不進一次 prefill、退回只用前綴的 request 數；`R` 是沒空間被拒、之後只用前綴的 request 數。
+- `K` 是放不進一次 prefill、退回只用前綴的 request 數，`D` 是這些 request 因此丟掉的掃描命中 token 數；`R` 是沒空間被拒、之後只用前綴的 request 數。
 
-`P`、`A`、`B`、`K` 是每個請求在真的執行時算一次（被拒、排隊重新比對的那幾次不算），4090 smoke 中與 client 端
+`P`、`A`、`B`、`K`、`D` 是每個請求在真的執行時算一次（被拒、排隊重新比對的那幾次不算），4090 smoke 中與 client 端
 每個請求的 `usage.prompt_tokens`、`usage.prompt_tokens_details.cached_tokens` 加總完全一致（需要 `--enable-cache-report`）。
 開頭的 `M`、`X` 仍是每次掃描都算，負載高時會偏高。報告用的數字仍建議用 client 端的 `cached_tokens` 或 `SGLANG_FORWARD_TRACE`。
 
