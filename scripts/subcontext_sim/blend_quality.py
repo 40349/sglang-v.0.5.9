@@ -15,7 +15,7 @@ Each run's reuse rate is printed: near zero on idx/cdc means the passages were n
 found and the run measured nothing. Requests are streamed, so each answer records its
 TTFT as well as its end-to-end latency.
 
-    python blend_quality.py run http://127.0.0.1:30000          all three tasks
+    python blend_quality.py run http://127.0.0.1:8000          all three tasks
     python blend_quality.py compare ab_out/quality/<model> off cdc cdc_r15
 
 `run` names its output <task>_<arm>.json after the server's own arm (as
@@ -296,7 +296,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
-    r.add_argument("url", help="server base URL, e.g. http://127.0.0.1:30000")
+    r.add_argument("url", help="server base URL, e.g. http://127.0.0.1:8000")
     r.add_argument("--task", nargs="+", choices=sorted(TASKS), default=sorted(TASKS))
     r.add_argument("--inputs", default=os.path.expanduser("~/Desktop/MiaoChen/CacheBlend/inputs"),
                    help="CacheBlend's inputs/ directory")

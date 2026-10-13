@@ -35,7 +35,7 @@ ARMS = {
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("url", help="server base URL, e.g. http://140.118.202.100:30000")
+    ap.add_argument("url", help="server base URL, e.g. http://140.118.202.100:8000")
     ap.add_argument(
         "--arm",
         default=None,
