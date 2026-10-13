@@ -772,10 +772,14 @@ class RadixCache(BasePrefixCache):
                 kv_indices[req.cache_protected_len : new_prefix_len]
             )
             if self.chains_sub_contexts(req) and len(keys) > new_prefix_len:
-                chain_end = self.match_prefix(
-                    MatchPrefixParams(key=radix_key)
-                ).last_device_node
-                self._register_chain(req, keys, new_prefix_len, chain_end, final=True)
+                with host_timer.record("finish_rematch"):
+                    chain_end = self.match_prefix(
+                        MatchPrefixParams(key=radix_key)
+                    ).last_device_node
+                with host_timer.record("register_finished"):
+                    self._register_chain(
+                        req, keys, new_prefix_len, chain_end, final=True
+                    )
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : len(keys)]
@@ -1310,7 +1314,10 @@ class RadixCache(BasePrefixCache):
         req.last_node = new_last_node
 
         if self.chains_sub_contexts(req):
-            self._register_chain(req, keys, new_prefix_len, new_last_node, final=False)
+            with host_timer.record("register_unfinished"):
+                self._register_chain(
+                    req, keys, new_prefix_len, new_last_node, final=False
+                )
             # The locks on the nodes the scan copied from.
             req.release_sub_context_match_locks(self)
 

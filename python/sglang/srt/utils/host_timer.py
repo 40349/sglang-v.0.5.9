@@ -93,7 +93,7 @@ class HostTimer:
                 self._since_dump >= _DUMP_EVERY_N
                 or time.perf_counter() - self._last_dump > _DUMP_INTERVAL_S
             )
-        if due:
+        if due and _depth() == 0:
             self.dump()
 
     @staticmethod
@@ -127,6 +127,12 @@ class HostTimer:
 
 _timer: Optional[HostTimer] = None
 _init_done = False
+# Per thread: how many record/timed spans are open.
+_open_spans = threading.local()
+
+
+def _depth() -> int:
+    return getattr(_open_spans, "n", 0)
 
 
 def init_host_timer(proc: str) -> None:
@@ -156,11 +162,14 @@ def record(stage: str):
     if _timer is None:
         yield
         return
+    _open_spans.n = _depth() + 1
     t0 = time.perf_counter_ns()
     try:
         yield
     finally:
-        _timer.add(stage, time.perf_counter_ns() - t0)
+        ns = time.perf_counter_ns() - t0
+        _open_spans.n -= 1
+        _timer.add(stage, ns)
 
 
 def timed(stage: str):
@@ -171,11 +180,14 @@ def timed(stage: str):
         def wrapper(*args, **kwargs):
             if _timer is None:
                 return fn(*args, **kwargs)
+            _open_spans.n = _depth() + 1
             t0 = time.perf_counter_ns()
             try:
                 return fn(*args, **kwargs)
             finally:
-                _timer.add(stage, time.perf_counter_ns() - t0)
+                ns = time.perf_counter_ns() - t0
+                _open_spans.n -= 1
+                _timer.add(stage, ns)
 
         return wrapper
 

@@ -109,8 +109,11 @@ fi
 if [ "${1:-}" = check ]; then echo "$TAG"; exit 0; fi
 
 if command -v ml > /dev/null 2>&1; then ml load miniconda3; fi
+# conda's shell hook and activate/deactivate scripts run with nounset off
+set +u
 eval "$(conda shell.bash hook)"
 conda activate "${ENV:-sglangv59}"
+set -u
 
 export PYTHONPATH=$REPO/python
 export PYTHONNOUSERSITE=1

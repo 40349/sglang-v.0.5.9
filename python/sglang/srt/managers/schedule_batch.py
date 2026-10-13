@@ -1335,11 +1335,12 @@ class Req(ReqDllmMixin):
         self.sub_context_next_boundary = None
         self.sub_context_deferred_moved = 0
 
-        match = tree_cache.match_prefix(
-            MatchPrefixParams(
-                key=RadixKey(token_ids=token_ids, extra_key=self.extra_key)
+        with host_timer.record("scan_prefix"):
+            match = tree_cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(token_ids=token_ids, extra_key=self.extra_key)
+                )
             )
-        )
         prefix = match.device_indices
         exact = len(prefix)
         self.prefix_indices = prefix
@@ -1358,73 +1359,76 @@ class Req(ReqDllmMixin):
         head = {}
         candidates = []
         # Requests returning logprobs take the prefix only under selective recompute.
-        found_runs = (
-            []
-            if self.sub_context_index_declined
-            or (self.return_logprob and subctx_config.topk_active())
-            else index.scan(
-                self.fill_ids, self.extra_key, min_end=exact + index.min_chunk_tokens
+        with host_timer.record("scan_index"):
+            found_runs = (
+                []
+                if self.sub_context_index_declined
+                or (self.return_logprob and subctx_config.topk_active())
+                else index.scan(
+                    self.fill_ids, self.extra_key, min_end=exact + index.min_chunk_tokens
+                )
             )
-        )
-        for found in found_runs:
-            start, end = max(found.start, exact), min(found.end, limit)
-            if end - start < index.min_chunk_tokens:
-                continue
-            run = SubContextMatch(start, end, found.chunk_id)
-            head[run] = start - found.start
-            candidates.append(run)
+            for found in found_runs:
+                start, end = max(found.start, exact), min(found.end, limit)
+                if end - start < index.min_chunk_tokens:
+                    continue
+                run = SubContextMatch(start, end, found.chunk_id)
+                head[run] = start - found.start
+                candidates.append(run)
 
         moved = rotated = discarded = 0
         fell_back = fell_back_tokens = 0
         located = []
-        for run in index.select(candidates):
-            where = tree_cache.chain_chunk_slots(run.chunk_id)
-            if where is None:
-                discarded += run.length
-                continue
-            slots, node, computed_at = where
-            skip = head[run]
-            delta = run.start - computed_at - skip
-            if delta and (rotator is None or not rotator.can_rotate(delta)):
-                moved += run.length
-                discarded += run.length
-                continue
-            tree_cache.inc_lock_ref(node)
-            located.append((run, slots[skip : skip + run.length], node, delta))
-
-        if located and not self._fits_one_pass(
-            len(self.fill_ids) - exact - sum(r.length for r, _s, _n, _d in located)
-        ):
-            # A sparse layout cannot be chunked: keep the prefix only.
-            fell_back = 1
-            fell_back_tokens = sum(r.length for r, _s, _n, _d in located)
-            for run, _src, node, delta in located:
-                tree_cache.dec_lock_ref(node)
-                if delta:
+        with host_timer.record("scan_locate"):
+            for run in index.select(candidates):
+                where = tree_cache.chain_chunk_slots(run.chunk_id)
+                if where is None:
+                    discarded += run.length
+                    continue
+                slots, node, computed_at = where
+                skip = head[run]
+                delta = run.start - computed_at - skip
+                if delta and (rotator is None or not rotator.can_rotate(delta)):
                     moved += run.length
-                discarded += run.length
-            located = []
+                    discarded += run.length
+                    continue
+                tree_cache.inc_lock_ref(node)
+                located.append((run, slots[skip : skip + run.length], node, delta))
 
-        if located:
-            # Room for the copies, evicted while the prefix and every run are locked.
-            tree_cache.inc_lock_ref(self.last_node)
-            evict_from_tree_cache(tree_cache, sum(r.length for r, _s, _n, _d in located))
-            tree_cache.dec_lock_ref(self.last_node)
-        runs = []
-        nodes = []
-        for run, src, node, delta in located:
-            dst = self._copy_sub_context_run(tree_cache, src, delta)
-            if dst is None:
-                # Out of rotation range, or the pool is full: recompute the run.
-                tree_cache.dec_lock_ref(node)
+        with host_timer.record("scan_copy"):
+            if located and not self._fits_one_pass(
+                len(self.fill_ids) - exact - sum(r.length for r, _s, _n, _d in located)
+            ):
+                # A sparse layout cannot be chunked: keep the prefix only.
+                fell_back = 1
+                fell_back_tokens = sum(r.length for r, _s, _n, _d in located)
+                for run, _src, node, delta in located:
+                    tree_cache.dec_lock_ref(node)
+                    if delta:
+                        moved += run.length
+                    discarded += run.length
+                located = []
+
+            if located:
+                # Room for the copies, evicted while the prefix and every run are locked.
+                tree_cache.inc_lock_ref(self.last_node)
+                evict_from_tree_cache(tree_cache, sum(r.length for r, _s, _n, _d in located))
+                tree_cache.dec_lock_ref(self.last_node)
+            runs = []
+            nodes = []
+            for run, src, node, delta in located:
+                dst = self._copy_sub_context_run(tree_cache, src, delta)
+                if dst is None:
+                    # Out of rotation range, or the pool is full: recompute the run.
+                    tree_cache.dec_lock_ref(node)
+                    if delta:
+                        moved += run.length
+                    discarded += run.length
+                    continue
                 if delta:
-                    moved += run.length
-                discarded += run.length
-                continue
-            if delta:
-                rotated += run.length
-            runs.append((run.start, run.end, dst))
-            nodes.append(node)
+                    rotated += run.length
+                runs.append((run.start, run.end, dst))
+                nodes.append(node)
         self.sub_context_match_nodes = nodes or None
         self.sub_context_match_indices = None
         self.sub_context_match_positions = None

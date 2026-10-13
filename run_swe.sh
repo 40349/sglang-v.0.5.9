@@ -62,8 +62,11 @@ esac
 
 mkdir -p "$OUT"
 if command -v ml > /dev/null 2>&1; then ml load miniconda3; fi
+# conda's shell hook and activate/deactivate scripts run with nounset off
+set +u
 eval "$(conda shell.bash hook)"
 conda activate "${ENV:-sglangv59}"
+set -u
 export PYTHONNOUSERSITE=1        # ignore ~/.local
 export PYTHONUNBUFFERED=1
 export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
