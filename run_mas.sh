@@ -1,5 +1,5 @@
 #!/bin/bash
-# MASLab arm of the sub-context A/B. SWE-bench is run_swe.sh.
+# MASLab arm of the sub-context A/B. Other agents: run_toggle.sh.
 #
 #   ARM=on TAG=ag_he  ./run_mas.sh record   run MASLab end to end and record its traffic
 #   TAG=ag_he_ab      ./run_mas.sh toggle   replay a capture, split OFF then ON

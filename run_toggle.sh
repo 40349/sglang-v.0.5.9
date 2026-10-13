@@ -1,28 +1,30 @@
 #!/bin/bash
-#SBATCH --job-name=swe_toggle
+#SBATCH --job-name=toggle
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
-#SBATCH --output=swe_toggle_%j.log
+#SBATCH --output=toggle_%j.log
 #
-# SWE-bench arm of the sub-context A/B. Starts sglang_server.sh once per arm; arms and
-# server knobs are that script's and pass straight through.
+# Record-and-replay A/B of the sub-context arms on any agent's chat traffic (SWE-agent,
+# Terminal-Bench, ...). Starts sglang_server.sh once per arm; arms and server knobs are
+# that script's and pass straight through.
 #
-#   ./run_swe.sh record   start ARM's server and record every chat request; you drive
-#                         the agent
-#   ./run_swe.sh toggle   replay that capture once per arm in ARMS and print the tables
-#   sbatch run_swe.sh toggle     the same as a batch job (submit from the checkout)
+#   ./run_toggle.sh record          start ARM's server and record every chat request;
+#                                   you drive the agent
+#   ./run_toggle.sh toggle          replay that capture once per arm in ARMS and print
+#                                   the tables
+#   sbatch run_toggle.sh toggle     the same as a batch job (submit from the checkout)
 #
-#   ARMS="off cdc cdc@0.15" ./run_swe.sh toggle
-#   ARMS="off rot idx cdc" ./run_swe.sh toggle          the middle rungs; the first arm
+#   ARMS="off cdc cdc@0.15" ./run_toggle.sh toggle
+#   ARMS="off rot idx cdc" ./run_toggle.sh toggle       the middle rungs; the first arm
 #                                                       is the baseline
-#   AUDIT=1 FULL=1 ./run_swe.sh toggle                  correctness pass, timings unusable
+#   AUDIT=1 FULL=1 ./run_toggle.sh toggle               correctness pass, timings unusable
 #   REQUESTS=~/work/traces/requests_on_42.jsonl ...     a capture recorded elsewhere
 #
 # `toggle` reads the traces the server writes locally: run it on the box holding the
-# GPU. Output lands in ab_out/swe.
+# GPU. Output lands in ab_out unless OUT is set.
 set -euo pipefail
 
 # sbatch runs a spool copy of this file; the checkout is then where it was submitted.
@@ -30,7 +32,7 @@ REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 [ -d "$REPO/python/sglang" ] || REPO=${SLURM_SUBMIT_DIR:-}
 [ -d "$REPO/python/sglang" ] || { echo "REFUSING: no checkout found; submit from it"; exit 1; }
 SERVER=$REPO/sglang_server.sh
-OUT=${OUT:-$REPO/ab_out/swe}
+OUT=${OUT:-$REPO/ab_out}
 GEN_TOKENS=${GEN_TOKENS:-32}  # fixed generated length per replayed request
 CONC=${CONC:-1}               # requests in flight
 # Use each request's own max_tokens instead of pinning the length with ignore_eos.
@@ -39,7 +41,6 @@ FULL=${FULL:-}
 AUDIT=${AUDIT:-}
 # Override to replay a capture recorded elsewhere.
 REQUESTS=${REQUESTS:-$OUT/requests.jsonl}
-SWE_TEST=${SWE_TEST:-/home/t2503-3090/Desktop/MiaoChen/swe_bench/swe_test.sh}
 CHECK_ARM=$REPO/scripts/subcontext_sim/check_remote_arm.py
 
 ARM=${ARM:-on}
@@ -164,9 +165,9 @@ case "${1:-}" in
     verify_arm "$ARM"
     cat <<TXT
 
-Recording every chat request. This does NOT run SWE-bench -- drive it yourself:
+Recording every chat request. This does NOT run the agent -- drive it yourself:
 
-  in another shell:   bash $SWE_TEST
+  in another shell:   the agent's runner (swe_bench/sweagent_test.sh, terminal_bench/tbench_test.sh)
   when it finishes:   $0 toggle
 
 Watch the capture grow with:  wc -l $REQUESTS
@@ -227,7 +228,7 @@ TXT
 
   *)
     echo "usage: $0 {record|toggle}"
-    echo "  record  server records SWE-bench traffic; you run $SWE_TEST"
+    echo "  record  server records the chat traffic of an agent you run"
     echo "  toggle  replay that capture once per arm  ->  $OUT"
     echo
     echo "  ARM=on                the arm 'record' runs"

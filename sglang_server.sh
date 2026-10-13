@@ -9,7 +9,7 @@
 #SBATCH --error=sglang_%j.err
 #
 # sglang server for the sub-context experiments, one arm per start. This is the only
-# place an arm becomes server settings; run_swe.sh starts it once per arm as well.
+# place an arm becomes server settings; run_toggle.sh starts it once per arm as well.
 #
 #   ARM=cdc@0.15 sbatch sglang_server.sh          a job
 #   ARM=cdc@0.15 bash sglang_server.sh            this box
