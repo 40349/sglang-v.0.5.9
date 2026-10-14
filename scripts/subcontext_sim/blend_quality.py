@@ -11,7 +11,7 @@ only runs on /v1/chat/completions), so the paper's `[INST] ... [/INST]` becomes 
 user message each for the prefix, every passage and the question -- cdc cuts before
 every message, so a passage is found whole, as the paper reuses it; F1 tokenizes with
 the served model's tokenizer; thinking is off.
-Each run's reuse rate is printed: near zero on idx/cdc means the passages were not
+Each run's reuse rate is printed: near zero on cdc means the passages were not
 found and the run measured nothing. Requests are streamed, so each answer records its
 TTFT as well as its end-to-end latency.
 
@@ -174,21 +174,14 @@ def chat(
 
 
 def arm_tag(sub: dict) -> str:
-    """The server's arm as sglang_server.sh tags it: off, on, rot, idx, cdc, + _rNN
+    """The server's arm as sglang_server.sh tags it: off, or cdc + _rNN
     (_rNN-NN-... with one ratio per scored layer)."""
     if not sub.get("split_enabled"):
         return "off"
-    if sub.get("index"):
-        tag = "cdc" if sub.get("split_mode") == "cdc" else "idx"
-    else:
-        tag = "rot" if sub.get("rotate") else "on"
-    ratios = sub.get("topk_ratios")
-    if ratios is None:  # a server from before 2026-10-12
-        ratios = [sub.get("topk_ratio") or 0]
-    ratios = [float(r) for r in ratios]
+    ratios = [float(r) for r in sub["topk_ratios"]]
     if ratios[0] <= 0:
-        return tag
-    return f"{tag}_r" + "-".join(f"{int(r * 100 + 0.5):02d}" for r in ratios)
+        return "cdc"
+    return "cdc_r" + "-".join(f"{int(r * 100 + 0.5):02d}" for r in ratios)
 
 
 def run_task(task, args, base, model, info, tokenizer, scorer) -> None:
@@ -208,8 +201,8 @@ def run_task(task, args, base, model, info, tokenizer, scorer) -> None:
         if not docs:
             continue
         if not args.no_prime:
-            # Two tokens, EOS ignored: on the split arms a request that finishes during
-            # its prefill step is never filed, and its passage would not be found.
+            # Each passage alone, two tokens with EOS ignored: its chunks are in the
+            # index before the question arrives.
             for d in docs:
                 chat(base, model, [d], 2, args.thinking, ignore_eos=True)
         text, usage, ttft, latency = chat(
@@ -253,8 +246,14 @@ def cmd_run(args) -> int:
 
     base = args.url.rstrip("/").removesuffix("/v1")
     info = get(base + "/server_info")
-    if info.get("sub_context") is None:
+    sub = info.get("sub_context")
+    if sub is None:
         print("REFUSING: /server_info has no sub_context block; this is not the fork.", file=sys.stderr)
+        return 1
+    if "split_mode" in sub or "topk_ratios" not in sub:
+        print("REFUSING: the server runs a build from before 2026-10-14 (it reports split_mode "
+              "or no topk_ratios), whose arms arm_tag cannot name; update it and restart.",
+              file=sys.stderr)
         return 1
     model = args.model or get(base + "/v1/models")["data"][0]["id"]
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer or info["model_path"])

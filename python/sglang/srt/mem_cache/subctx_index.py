@@ -82,7 +82,7 @@ class Match(NamedTuple):
 
 
 def chunk_id(token_ids: Sequence[int], extra_key: Optional[str] = None) -> str:
-    """Namespace for the KV of ``token_ids`` under ``extra_key`` (cache_salt + lora_id).
+    """Id of the chunk ``token_ids`` under ``extra_key`` (cache_salt + lora_id).
 
     Position-independent. The ids are hashed as fixed-width int32.
     """
@@ -239,13 +239,6 @@ class SubContextIndex:
         self.registered = 0
         self.scanned_queries = 0
         self.scanned_tokens = 0
-        # Dry-run tallies. `beyond_stitch_tokens`: found, still cached, and past the
-        # stitched prefix.
-        self.found_tokens = 0
-        self.resident_tokens = 0
-        self.beyond_stitch_tokens = 0
-        self.displaced_tokens = 0
-        self.stitched_tokens = 0
         # Live tallies, counted once per request that runs (`count_match`).
         # `prompt_tokens`: matched; `prefix_tokens`: reached by the plain prefix match;
         # `reused_tokens`: found by the scan past it.
@@ -267,24 +260,18 @@ class SubContextIndex:
             f"sub-context index: {len(self)} chunks, {self.scanned_queries} queries, "
             f"{self.scanned_tokens} tokens scanned"
         )
-        if self.prompt_tokens:
-            denom = self.prompt_tokens
-            return (
-                f"{head} | matched {self.prompt_tokens} prompt tokens: prefix "
-                f"{self.prefix_tokens} ({100.0 * self.prefix_tokens / denom:.0f}%), "
-                f"scan found {self.reused_tokens} "
-                f"({100.0 * self.reused_tokens / denom:.0f}%), "
-                f"{self.rotated_tokens} of them rotated into place"
-                f" | {self.fell_back} requests too big for one pass "
-                f"({self.fell_back_tokens} found tokens dropped), "
-                f"{self.no_room} refused for room"
-            )
-        # Dry run.
+        if not self.prompt_tokens:
+            return head
+        denom = self.prompt_tokens
         return (
-            f"{head} | stitched {self.stitched_tokens} | scan found "
-            f"{self.found_tokens} ({self.resident_tokens} still cached, "
-            f"{self.displaced_tokens} of those at another position) | "
-            f"reachable only by placing blocks freely: {self.beyond_stitch_tokens}"
+            f"{head} | matched {self.prompt_tokens} prompt tokens: prefix "
+            f"{self.prefix_tokens} ({100.0 * self.prefix_tokens / denom:.0f}%), "
+            f"scan found {self.reused_tokens} "
+            f"({100.0 * self.reused_tokens / denom:.0f}%), "
+            f"{self.rotated_tokens} of them rotated into place"
+            f" | {self.fell_back} requests too big for one pass "
+            f"({self.fell_back_tokens} found tokens dropped), "
+            f"{self.no_room} refused for room"
         )
 
     def count_match(

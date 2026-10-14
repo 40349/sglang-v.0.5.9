@@ -15,16 +15,14 @@
 #   ARM=cdc@0.15 bash sglang_server.sh            this box
 #   ARM=cdc@0.15 bash sglang_server.sh check      validate, print the arm's file tag
 #
-# Arms:
+# Arms (ARM is required):
 #
-#   off   no split -- the stock single-namespace radix cache
-#   on    split into per-block namespaces, displaced hits dropped
-#   rot   + rotate a displaced hit to where it is reused, + Stage 2
-#   idx   + find blocks by content anywhere in the prompt, and prefill the gaps
-#   cdc   + cut the blocks on content too, not on the roles the prompt was built from
+#   off   no split -- the stock radix cache
+#   cdc   cut each prompt by content, match its prefix, find its cached chunks past the
+#         prefix in the index, rotate the displaced ones into place, prefill the gaps
 #
-# idx and cdc take a recompute ratio after `@`: cdc@0.15 recomputes 15% of the tokens
-# it reuses, chosen at layer TOPK_LAYER. Several ratios score consecutive layers from
+# cdc takes a recompute ratio after `@`: cdc@0.15 recomputes 15% of the tokens it
+# reuses, chosen at layer TOPK_LAYER. Several ratios score consecutive layers from
 # TOPK_LAYER on, each picking from what the previous one kept: cdc@0.3,0.2,0.15. The arm
 # is the only place a ratio is set.
 #
@@ -48,12 +46,12 @@ REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 [ -d "$REPO/python/sglang" ] || { echo "REFUSING: no checkout found; submit from it"; exit 1; }
 WORK_DIR=${WORK_DIR:-$(dirname "$REPO")}
 
-ARM=${ARM:-on}
+ARM=${ARM:?set ARM=off, cdc or cdc@ratio}
 MODEL=${MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}
 CTXLEN=${CTXLEN:-81920}
 PORT=${PORT:-8000}
 MEMFRAC=${MEMFRAC:-0.90}
-# Same backend for every arm; idx/cdc need triton (per-position mask).
+# Same backend for every arm; cdc needs triton (per-position mask).
 BACKEND=${BACKEND:-triton}
 CHUNKED_PREFILL=${CHUNKED_PREFILL:-}
 # No colon: an explicitly empty value drops the flag.
@@ -71,11 +69,9 @@ for v in "TOPK_RATIO|write the ratio into the arm, e.g. ARM=cdc@0.15" \
     echo "REFUSING: ${v%%|*} is no longer read; ${v#*|}."; exit 1
   fi
 done
-for v in SGLANG_DISABLE_SUBCONTEXT SGLANG_SUBCONTEXT_ROTATE SGLANG_SUBCONTEXT_ROTATE_ACROSS \
-         SGLANG_SUBCTX_INDEX SGLANG_SUBCTX_SPLIT SGLANG_SUBCTX_TOPK_RATIO \
-         SGLANG_SUBCTX_TOPK_LAYER SGLANG_SUBCTX_CDC_TARGET SGLANG_SUBCTX_MIN_CHUNK \
-         SGLANG_SUBCTX_CDC_MAX SGLANG_SUBCTX_AUDIT SGLANG_SUBCTX_TRACE \
-         SGLANG_SUBCTX_ROTATE_GPU SGLANG_DUMP_TREE; do
+for v in SGLANG_DISABLE_SUBCONTEXT SGLANG_SUBCTX_TOPK_RATIO SGLANG_SUBCTX_TOPK_LAYER \
+         SGLANG_SUBCTX_CDC_TARGET SGLANG_SUBCTX_MIN_CHUNK SGLANG_SUBCTX_CDC_MAX \
+         SGLANG_SUBCTX_AUDIT SGLANG_SUBCTX_TRACE SGLANG_SUBCTX_ROTATE_GPU SGLANG_DUMP_TREE; do
   if [ -n "$(printenv "$v")" ]; then
     echo "REFUSING: $v is set in the environment; the arm and the knobs above set it."
     exit 1
@@ -86,14 +82,11 @@ NAME=${ARM%%@*}
 RATIO=0
 case "$ARM" in *@*) RATIO=${ARM#*@} ;; esac
 case "$NAME" in
-  off|on|rot|idx|cdc) ;;
-  *) echo "REFUSING: unknown ARM='$ARM'; want off|on|rot|idx|cdc, idx/cdc@ratio"; exit 1 ;;
+  off|cdc) ;;
+  *) echo "REFUSING: unknown ARM='$ARM'; want off, cdc or cdc@ratio"; exit 1 ;;
 esac
 if [ "$ARM" != "$NAME" ]; then
-  case "$NAME" in
-    idx|cdc) ;;
-    *) echo "REFUSING: ARM=$ARM: only idx and cdc take a ratio"; exit 1 ;;
-  esac
+  [ "$NAME" = cdc ] || { echo "REFUSING: ARM=$ARM: only cdc takes a ratio"; exit 1; }
   awk -v rs="$RATIO" 'BEGIN { n = split(rs, r, ","); for (i = 1; i <= n; i++) {
       if (!(r[i] ~ /^[0-9]*\.?[0-9]+$/ && r[i] >= 0 && r[i] <= 1)) exit 1
       if (i > 1 && r[i] > r[i - 1]) exit 1 } }' || {
@@ -150,15 +143,10 @@ if [ "$rc" != 7 ]; then
   exit 1
 fi
 
-export SGLANG_DISABLE_SUBCONTEXT= SGLANG_SUBCONTEXT_ROTATE= SGLANG_SUBCONTEXT_ROTATE_ACROSS= \
-  SGLANG_SUBCTX_INDEX= SGLANG_SUBCTX_SPLIT=blocks SGLANG_SUBCTX_TOPK_RATIO=0
+export SGLANG_DISABLE_SUBCONTEXT= SGLANG_SUBCTX_TOPK_RATIO=0
 case "$NAME" in
   off) SGLANG_DISABLE_SUBCONTEXT=1 ;;
-  on)  ;;
-  rot) SGLANG_SUBCONTEXT_ROTATE=1 SGLANG_SUBCONTEXT_ROTATE_ACROSS=1 ;;
-  idx) SGLANG_SUBCONTEXT_ROTATE=1 SGLANG_SUBCTX_INDEX=1 SGLANG_SUBCTX_TOPK_RATIO=$RATIO ;;
-  cdc) SGLANG_SUBCONTEXT_ROTATE=1 SGLANG_SUBCTX_INDEX=1 SGLANG_SUBCTX_SPLIT=cdc \
-         SGLANG_SUBCTX_TOPK_RATIO=$RATIO ;;
+  cdc) SGLANG_SUBCTX_TOPK_RATIO=$RATIO ;;
 esac
 export SGLANG_SUBCTX_AUDIT=$AUDIT SGLANG_SUBCTX_TRACE=$TRACE \
   SGLANG_SUBCTX_ROTATE_GPU=${ROTATE_GPU:-} SGLANG_DUMP_TREE=${DUMP_TREE:-}

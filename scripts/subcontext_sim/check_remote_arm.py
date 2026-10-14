@@ -4,9 +4,7 @@ Reads the ``sub_context`` block of ``/server_info`` (absent on a server not runn
 this fork). Exits non-zero with the reason on any mismatch.
 
 Usage:
-    check_remote_arm.py URL --arm off|on|rot|idx|cdc[@ratio[,ratio...]] [--audit B]
-    check_remote_arm.py URL --split true|false --rotate true|false \
-        [--index B] [--split-mode blocks|cdc] [--topk-ratio R] [--audit B]
+    check_remote_arm.py URL --arm off|cdc[@ratio[,ratio...]] [--audit B]
 """
 
 from __future__ import annotations
@@ -25,63 +23,27 @@ def _ratios(v: str) -> list:
     return [float(r) for r in v.split(",")]
 
 
-# What each arm of sglang_server.sh leaves the server reporting.
-ARMS = {
-    "off": dict(split=False, rotate=False, index=False, split_mode="blocks"),
-    "on": dict(split=True, rotate=False, index=False, split_mode="blocks"),
-    "rot": dict(split=True, rotate=True, index=False, split_mode="blocks"),
-    "idx": dict(split=True, rotate=True, index=True, split_mode="blocks"),
-    "cdc": dict(split=True, rotate=True, index=True, split_mode="cdc"),
-}
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("url", help="server base URL, e.g. http://140.118.202.100:8000")
     ap.add_argument(
         "--arm",
-        default=None,
-        help="an arm as sglang_server.sh takes it, e.g. cdc@0.15; sets --split, "
-        "--rotate, --index, --split-mode and --topk-ratio",
-    )
-    ap.add_argument("--split", type=_bool, default=None)
-    ap.add_argument(
-        "--split-mode",
-        choices=("blocks", "cdc"),
-        default=None,
-        help="require the boundaries to come from roles (blocks) or content (cdc)",
-    )
-    ap.add_argument("--rotate", type=_bool, default=None)
-    ap.add_argument(
-        "--index",
-        type=_bool,
-        default=None,
-        help="require the content-addressed index on or off (unchecked by default)",
-    )
-    ap.add_argument(
-        "--topk-ratio",
-        type=_ratios,
-        default=None,
-        help="require these selective-recompute ratios, one per scored layer "
-        "(e.g. 0.15 or 0.3,0.2,0.15)",
+        required=True,
+        help="an arm as sglang_server.sh takes it: off, cdc or cdc@ratio[,ratio...]",
     )
     ap.add_argument(
         "--audit",
         type=_bool,
         default=None,
-        help="require the slot-ownership audit on or off (also catches a stale "
-        "server still holding the port)",
+        help="require the audit on or off (also catches a stale server still holding "
+        "the port)",
     )
     args = ap.parse_args()
-    if args.arm is not None:
-        name, _, ratio = args.arm.partition("@")
-        if name not in ARMS:
-            ap.error(f"unknown arm {args.arm!r}")
-        for key, value in ARMS[name].items():
-            setattr(args, key, value)
-        args.topk_ratio = _ratios(ratio or "0")
-    elif args.split is None or args.rotate is None:
-        ap.error("give --arm, or both --split and --rotate")
+    name, _, ratio = args.arm.partition("@")
+    if name not in ("off", "cdc") or (ratio and name != "cdc"):
+        ap.error(f"unknown arm {args.arm!r}; want off, cdc or cdc@ratio")
+    want_split = name == "cdc"
+    want_ratios = _ratios(ratio or "0")
 
     base = args.url.rstrip("/")
     try:
@@ -102,55 +64,34 @@ def main() -> int:
         )
         return 1
 
-    if sub["split_enabled"] != args.split or sub["rotate"] != args.rotate:
+    if "split_mode" in sub:
         print(
-            f"REFUSING: asked for split={args.split} rotate={args.rotate}, but the "
-            f"server reports {sub}",
+            "REFUSING: the server reports `split_mode`, so it runs a build from before "
+            "the on/rot/idx arms were removed (2026-10-14), whatever arm it serves. "
+            "Update that checkout and restart the server.",
             file=sys.stderr,
         )
         return 1
 
-    if args.index is not None and bool(sub.get("index")) != args.index:
+    if sub["split_enabled"] != want_split:
         print(
-            f"REFUSING: asked for index={args.index} but the server reports "
-            f"index={sub.get('index')!r}. A server old enough to have no `index` key "
-            "at all reports None here, which is the same failure as the missing "
-            "sub_context block above: it is not this checkout.",
+            f"REFUSING: asked for {args.arm} (split={want_split}), but the server "
+            f"reports {sub}",
             file=sys.stderr,
         )
         return 1
 
-    if args.index and not sub.get("chain_storage"):
+    got = sub.get("topk_ratios")
+    if got is None or len(got) != len(want_ratios) or any(
+        abs(float(g) - w) > 1e-9 for g, w in zip(got, want_ratios)
+    ):
         print(
-            "REFUSING: the server runs the index arm with per-block namespaces (no "
-            "`chain_storage`), the storage before 2026-10-05. Its numbers do not "
-            "compare with chained runs; update that checkout and restart the server.",
+            f"REFUSING: asked for topk_ratios={want_ratios} but the server reports "
+            f"topk_ratios={got!r}. Ratios are swept within one arm name, so a mismatch "
+            "here produces a table whose rows are all the same run.",
             file=sys.stderr,
         )
         return 1
-
-    if args.split_mode is not None and sub.get("split_mode") != args.split_mode:
-        print(
-            f"REFUSING: asked for split_mode={args.split_mode} but the server reports "
-            f"split_mode={sub.get('split_mode')!r}.",
-            file=sys.stderr,
-        )
-        return 1
-
-    if args.topk_ratio is not None:
-        got = sub.get("topk_ratios")
-        if got is None and "topk_ratio" in sub:  # a server from before 2026-10-12
-            got = [sub["topk_ratio"]]
-        if got is None or len(got) != len(args.topk_ratio) or any(
-            abs(float(g) - w) > 1e-9 for g, w in zip(got, args.topk_ratio)
-        ):
-            print(
-                f"REFUSING: asked for topk_ratios={args.topk_ratio} but the server "
-                f"reports topk_ratios={got!r}. Ratios are swept within one arm name, "
-                "so a mismatch here produces a table whose rows are all the same run.",
-                file=sys.stderr,
-            )
-            return 1
 
     if args.audit is not None and bool(sub.get("audit")) != args.audit:
         print(

@@ -9,44 +9,39 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-# Baseline arm: chat requests carry no split and take the stock radix path.
+# Baseline arm: chat requests carry no split and take the stock radix path. Unset, the
+# chat path cuts each prompt by content, matches its prefix, finds its cached chunks past
+# the prefix in the index, rotates the displaced ones into place and stores the request
+# as one chain.
 DISABLE_SUBCONTEXT = os.environ.get("SGLANG_DISABLE_SUBCONTEXT", "") not in ("", "0")
 
-# Insert the generated tokens into the last block's namespace at finish. Off frees them.
-CACHE_SUBCONTEXT_OUTPUT = os.environ.get(
-    "SGLANG_SUBCONTEXT_CACHE_OUTPUT", "1"
-) not in ("", "0")
-
-# Stage 1: rotate a displaced hit's cached K by `offset - canonical` and reuse it.
-ROTATE_SUBCONTEXT = os.environ.get("SGLANG_SUBCONTEXT_ROTATE", "") not in ("", "0")
-
-# Stage 2: end a prefill chunk at a block edge so the next block can be rotated in.
-ROTATE_ACROSS_RECOMPUTE = os.environ.get(
-    "SGLANG_SUBCONTEXT_ROTATE_ACROSS", ""
-) not in ("", "0")
+# Switches of the removed on / rot / idx arms (2026-10-14). Setting any of them is refused.
+_REMOVED_SWITCHES = (
+    "SGLANG_SUBCTX_SPLIT",
+    "SGLANG_SUBCTX_INDEX",
+    "SGLANG_SUBCONTEXT_ROTATE",
+    "SGLANG_SUBCONTEXT_ROTATE_ACROSS",
+    "SGLANG_SUBCTX_HASH_KEYS",
+    "SGLANG_SUBCTX_INDEX_DRYRUN",
+    "SGLANG_SUBCONTEXT_CACHE_OUTPUT",
+)
+_removed_set = [v for v in _REMOVED_SWITCHES if os.environ.get(v, "")]
+if _removed_set:
+    raise ValueError(
+        f"{', '.join(_removed_set)}: removed with the on / rot / idx arms on 2026-10-14. "
+        "The split is now always cdc (index, rotation and chain storage); unset these, "
+        "and set SGLANG_DISABLE_SUBCONTEXT=1 for the stock prefix cache."
+    )
 
 # Debug: pure-torch rotation instead of the Triton kernel.
 ROTATE_NATIVE = os.environ.get("SGLANG_SUBCONTEXT_ROTATE_NATIVE", "") not in ("", "0")
 
-# Name each block's namespace by a hash of its tokens and the request's `extra_key`
-# instead of by role ("system_prompt_key", ...). Prefill still takes the stitch path.
-HASH_SUBCONTEXT_KEYS = os.environ.get("SGLANG_SUBCTX_HASH_KEYS", "") not in ("", "0")
-
-# Find cached blocks anywhere in the prompt by scanning it against the chunk index, and
-# prefill only the gaps between them in one pass. Implies HASH_SUBCONTEXT_KEYS.
-INDEX_SUBCONTEXTS = os.environ.get("SGLANG_SUBCTX_INDEX", "") not in ("", "0")
-
-# Scan and report what the index would find, but serve through the stitch path.
-INDEX_DRYRUN = os.environ.get("SGLANG_SUBCTX_INDEX_DRYRUN", "") not in ("", "0")
-
 # Shortest chunk the index registers or reuses.
 MIN_CHUNK_TOKENS = int(os.environ.get("SGLANG_SUBCTX_MIN_CHUNK", "64"))
 
-# Block boundaries: "blocks" cuts at the roles (system / tools / messages); "cdc" cuts
-# where the fingerprint of the next tokens is 0 mod CDC_TARGET_TOKENS, i.e. by content.
-SPLIT_MODE = os.environ.get("SGLANG_SUBCTX_SPLIT", "blocks")
-
-# "cdc" average chunk length (rounded down to a power of two), and the forced-cut length.
+# Block boundaries: a cut before every message, then cuts where the fingerprint of the
+# next tokens is 0 mod CDC_TARGET_TOKENS, i.e. by content. CDC_TARGET_TOKENS is the
+# average chunk length (rounded down to a power of two), CDC_MAX_TOKENS the forced cut.
 CDC_TARGET_TOKENS = int(os.environ.get("SGLANG_SUBCTX_CDC_TARGET", "256"))
 CDC_MAX_TOKENS = int(os.environ.get("SGLANG_SUBCTX_CDC_MAX", "1024"))
 
@@ -67,31 +62,15 @@ except ValueError:
 TOPK_LAYER = int(os.environ.get("SGLANG_SUBCTX_TOPK_LAYER", "1"))
 
 
-def hash_subcontext_keys() -> bool:
-    """Whether block namespaces are addressed by content."""
-    return HASH_SUBCONTEXT_KEYS or INDEX_SUBCONTEXTS or INDEX_DRYRUN
-
-
 def topk_active() -> bool:
     """Whether any reused token is recomputed."""
-    return TOPK_RATIOS[0] > 0.0 and INDEX_SUBCONTEXTS
+    return TOPK_RATIOS[0] > 0.0 and not DISABLE_SUBCONTEXT
 
 
 def topk_check_layers() -> range:
     """The scored layers, one per ratio in ``TOPK_RATIOS``."""
     return range(TOPK_LAYER, TOPK_LAYER + len(TOPK_RATIOS))
 
-
-if SPLIT_MODE not in ("blocks", "cdc"):
-    raise ValueError(
-        f"SGLANG_SUBCTX_SPLIT={SPLIT_MODE!r}; want 'blocks' or 'cdc'"
-    )
-
-if SPLIT_MODE == "cdc" and not DISABLE_SUBCONTEXT and not hash_subcontext_keys():
-    raise ValueError(
-        "SGLANG_SUBCTX_SPLIT=cdc needs content-addressed namespaces: set "
-        "SGLANG_SUBCTX_INDEX=1 (or SGLANG_SUBCTX_HASH_KEYS=1)"
-    )
 
 if not all(0.0 <= r <= 1.0 for r in TOPK_RATIOS):
     raise ValueError(
@@ -104,10 +83,10 @@ if any(b > a for a, b in zip(TOPK_RATIOS, TOPK_RATIOS[1:])):
         "tokens the previous one kept, so the ratios must not increase"
     )
 
-if TOPK_RATIOS[0] > 0.0 and not INDEX_SUBCONTEXTS:
+if TOPK_RATIOS[0] > 0.0 and DISABLE_SUBCONTEXT:
     raise ValueError(
-        "SGLANG_SUBCTX_TOPK_RATIO needs the index's sparse prefill to have something "
-        "to recompute into: set SGLANG_SUBCTX_INDEX=1, or leave the ratio at 0"
+        "SGLANG_SUBCTX_TOPK_RATIO recomputes reused chunks, and SGLANG_DISABLE_SUBCONTEXT=1 "
+        "reuses none: leave the ratio at 0"
     )
 
 if TOPK_LAYER < 0:
@@ -134,21 +113,20 @@ def unsupported_reason(tree_cache) -> Optional[str]:
     if not isinstance(tree_cache, RadixCache):
         return (
             f"the {type(tree_cache).__name__} prefix cache does not implement the "
-            "per-namespace insert path (--disable-radix-cache, hybrid SWA/mamba "
+            "sub-context chain storage (--disable-radix-cache, hybrid SWA/mamba "
             "pools and the experimental C++ radix tree all select such a cache)"
         )
     if type(tree_cache) is not RadixCache:
         return (
             f"{type(tree_cache).__name__} extends the radix cache with a tier the "
-            "per-namespace insert path does not maintain (e.g. the host tier of "
+            "sub-context chain storage does not maintain (e.g. the host tier of "
             "--enable-hierarchical-cache)"
         )
     if tree_cache.disable:
         return "prefix caching is disabled (--disable-radix-cache)"
     if tree_cache.page_size != 1:
         return (
-            f"page_size is {tree_cache.page_size}, the per-namespace insert path "
-            "needs 1"
+            f"page_size is {tree_cache.page_size}, the sub-context path needs 1"
         )
     if tree_cache.is_eagle:
         return "EAGLE speculative decoding rewrites the radix keys into bigrams"

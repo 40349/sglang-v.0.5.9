@@ -193,7 +193,7 @@ class SchedulePolicy:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             # NOTE: the prefix_indices must always be aligned with last_node
-            # Sub-context requests are re-matched per namespace in
+            # Sub-context requests are matched again, with the index scan, in
             # Req.init_next_round_input; this match only orders the queue.
             match_result = self.tree_cache.match_prefix(
                 MatchPrefixParams(
@@ -788,14 +788,6 @@ class PrefillAdder:
             ):
                 return AddReqResult.OTHER
 
-            # Stage 2: tokens to compute up to the next rotatable block edge, if that
-            # fits the remaining prefill budget.
-            boundary_trunc = None
-            if req.sub_context_next_boundary is not None:
-                gap = req.sub_context_next_boundary - prefix_len
-                if 0 < gap <= self.rem_input_tokens:
-                    boundary_trunc = gap
-
             if (self.prefill_delayer_single_pass is not None) and (
                 not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                     local_prefillable=True
@@ -813,25 +805,6 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif (
-                boundary_trunc is not None
-                and boundary_trunc < input_tokens
-                and truncation_align_size is None
-                and (
-                    self.rem_chunk_tokens is None
-                    or boundary_trunc <= self.rem_chunk_tokens
-                )
-            ):
-                # Stage 2: end this chunk on the block edge (not under a truncation
-                # alignment).
-                req.set_extend_input_len(boundary_trunc)
-                req.fill_ids = req.fill_ids[: prefix_len + boundary_trunc]
-
-                self.can_run_list.append(req)
-                self.new_chunked_req = req
-
-                self._req_inc_lock_ref(req)
-                self._update_prefill_budget(prefix_len, boundary_trunc, 0)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
@@ -851,7 +824,7 @@ class PrefillAdder:
                         self.rem_chunk_tokens -= probe_extra
             elif req.sub_context_layout is not None:
                 # A sparse layout cannot be chunked: wait for a pass with room. The scan
-                # already sent requests that can never fit to the stitch.
+                # keeps a layout only if it fits one pass.
                 return AddReqResult.OTHER
             else:
                 # Make sure at least one page is available

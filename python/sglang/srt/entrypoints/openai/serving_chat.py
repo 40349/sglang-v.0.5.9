@@ -61,7 +61,6 @@ from sglang.srt.utils.subctx_config import (
     CDC_TARGET_TOKENS,
     DISABLE_SUBCONTEXT,
     MIN_CHUNK_TOKENS,
-    SPLIT_MODE,
 )
 
 if TYPE_CHECKING:
@@ -346,7 +345,6 @@ class OpenAIServingChat(OpenAIServingBase):
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             sub_context_ids=processed_messages.sub_context_ids,
-            sub_context_extra_keys=processed_messages.sub_context_extra_keys,
             require_reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
@@ -458,93 +456,26 @@ class OpenAIServingChat(OpenAIServingBase):
 
     @host_timer.timed("subctx_split")
     def _compute_sub_context_ids(
-        self,
-        request: ChatCompletionRequest,
-        messages: List[Dict],
-        tools: Optional[List[Dict]],
-        prompt_ids: List[int],
-    ) -> tuple[Optional[List[List[int]]], Optional[List[str]]]:
-        """Split ``prompt_ids`` into blocks, each cached in its own radix namespace.
+        self, messages: List[Dict], prompt_ids: List[int]
+    ) -> Optional[List[List[int]]]:
+        """Split ``prompt_ids`` into blocks: a cut before every message, then
+        ``cut_points`` on each message's token ids. ``concat(blocks) == prompt_ids``.
 
-        ``SPLIT_MODE == "blocks"``: system prompt, tool definitions, conversation,
-        located by re-rendering the leading messages (no split if the template does not
-        render them as a literal prefix). ``"cdc"``: a cut before every message, then
-        ``cut_points`` on each message's token ids.
-        Either way ``concat(segments) == prompt_ids``.
+        None when the split is off or leaves a single block.
         """
-
-        def _is_prefix(head: List[int], full: List[int]) -> bool:
-            return bool(head) and len(full) >= len(head) and full[: len(head)] == head
-
         if DISABLE_SUBCONTEXT or not prompt_ids or not messages:
-            return None, None
-
-        if SPLIT_MODE == "cdc":
-            arr = np.asarray(prompt_ids, dtype=np.int32)
-            starts = [0]
-            marker = self._message_start_token()
-            if marker is not None:
-                starts += [i for i in np.flatnonzero(arr == marker).tolist() if i > 0]
-            bounds = [0]
-            for a, b in zip(starts, starts[1:] + [len(prompt_ids)]):
-                bounds += [a + c for c in self._message_cut_points(arr[a:b])] + [b]
-            if len(bounds) < 3:
-                return None, None
-            segments = [prompt_ids[a:b] for a, b in zip(bounds, bounds[1:])]
-            # Placeholders; `Req.__init__` replaces them with content hashes.
-            return segments, [f"cdc_{i}" for i in range(len(segments))]
-
-        n_sys = 0
-        while n_sys < len(messages) and messages[n_sys].get("role") == "system":
-            n_sys += 1
-
-        tokenizer = self.tokenizer_manager.tokenizer
-        template_kwargs = dict(
-            tokenize=True,
-            add_generation_prompt=False,
-            reasoning_effort=request.reasoning_effort,
-            return_dict=False,
-            **(request.chat_template_kwargs if request.chat_template_kwargs else {}),
-        )
-
-        def render(msgs, tls) -> Optional[List[int]]:
-            try:
-                return list(tokenizer.apply_chat_template(msgs, tools=tls, **template_kwargs))
-            except Exception as e:
-                logger.debug("Sub-context: sub-context boundary render failed: %s", e)
-                return None
-
-        # Head candidates, narrowest first: the system messages, then also the first
-        # user message (templates that put tools there, e.g. Llama 3.x).
-        head = None
-        head_with_tools = None
-        for k in ([n_sys, n_sys + 1] if n_sys else [1, 2]):
-            if k > len(messages):
-                continue
-            # k == len(messages) is allowed (the tail is then the generation prompt).
-            rendered = render(messages[:k], tools)
-            if rendered is not None and _is_prefix(rendered, prompt_ids):
-                head, head_with_tools = messages[:k], rendered
-                break
-        if head_with_tools is None:
-            return None, None
-
-        segments: List[tuple[List[int], str]] = []
-        if tools:
-            head_no_tools = render(head, None)
-            if head_no_tools is not None and _is_prefix(head_no_tools, head_with_tools):
-                # Tools rendered after the system content: a block of their own.
-                segments.append((head_no_tools, "system_prompt_key"))
-                segments.append((head_with_tools[len(head_no_tools) :], "tools_key"))
-        if not segments:
-            # No tools, or they are interleaved into the system block -- keep as one.
-            segments.append((head_with_tools, "system_prompt_key"))
-        segments.append((prompt_ids[len(head_with_tools) :], "messages_key"))
-
-        segments = [(ids, key) for ids, key in segments if ids]
-        if len(segments) < 2:
-            return None, None
-        return [ids for ids, _ in segments], [key for _, key in segments]
+            return None
+        arr = np.asarray(prompt_ids, dtype=np.int32)
+        starts = [0]
+        marker = self._message_start_token()
+        if marker is not None:
+            starts += [i for i in np.flatnonzero(arr == marker).tolist() if i > 0]
+        bounds = [0]
+        for a, b in zip(starts, starts[1:] + [len(prompt_ids)]):
+            bounds += [a + c for c in self._message_cut_points(arr[a:b])] + [b]
+        if len(bounds) < 3:
+            return None
+        return [prompt_ids[a:b] for a, b in zip(bounds, bounds[1:])]
 
     @host_timer.timed("tpl_render")
     def _apply_jinja_template(
@@ -557,7 +488,6 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt = ""
         prompt_ids = []
         sub_context_ids = None
-        sub_context_extra_keys = None
         openai_compatible_messages = []
         image_data = []
         video_data = []
@@ -699,8 +629,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
             else:
                 # Not split on the multimodal path, which re-tokenizes decoded text.
-                sub_context_ids, sub_context_extra_keys = self._compute_sub_context_ids(
-                    request, openai_compatible_messages, tools, prompt_ids
+                sub_context_ids = self._compute_sub_context_ids(
+                    openai_compatible_messages, prompt_ids
                 )
 
         stop = request.stop
@@ -717,7 +647,6 @@ class OpenAIServingChat(OpenAIServingBase):
             modalities=modalities,
             stop=stop,
             sub_context_ids=sub_context_ids,
-            sub_context_extra_keys=sub_context_extra_keys,
         )
 
     def _apply_conversation_template(

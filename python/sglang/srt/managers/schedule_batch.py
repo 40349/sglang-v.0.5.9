@@ -72,7 +72,6 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.subctx_index import Match as SubContextMatch
-from sglang.srt.mem_cache.subctx_index import chunk_id as sub_context_chunk_id
 from sglang.srt.utils import subctx_config
 from sglang.srt.utils.subctx_trace import TRACE_ON, trace
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -121,8 +120,8 @@ def _warn_sub_contexts_unsupported_once(tree_cache) -> None:
     from sglang.srt.utils.subctx_config import unsupported_reason
 
     logger.warning(
-        "Sub-context: ignoring the per-namespace split for requests that carry one, "
-        "because %s. They are served as ordinary single-namespace requests.",
+        "Sub-context: ignoring the split for requests that carry one, because %s. "
+        "They are served as ordinary requests.",
         unsupported_reason(tree_cache),
     )
 
@@ -565,7 +564,6 @@ class Req(ReqDllmMixin):
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         sub_context_ids: Optional[List[List[int]]] = None,
-        sub_context_extra_keys: Optional[List[str]] = None,
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
@@ -630,74 +628,36 @@ class Req(ReqDllmMixin):
 
         self.extra_key = extra_key
 
-        # Sub-context: ordered per-block token ids and their radix namespaces.
+        # Sub-context: ordered per-block token ids, cut by content.
         # concat(sub_context_ids) == origin_input_ids. None for normal requests.
-        # Unless noted, the per-block lists below are parallel to sub_context_ids.
         self.sub_context_ids = sub_context_ids
-        self.sub_context_extra_keys = sub_context_extra_keys
-        # The split as it arrived; `_scan_sub_contexts` re-cuts from this every time.
-        self.sub_context_ids_as_sent = sub_context_ids
-        if sub_context_ids and subctx_config.hash_subcontext_keys():
-            # Content-addressed namespaces, derived from the final `extra_key`
-            # (cache_salt + lora_id), replacing the caller's role names.
-            self.sub_context_extra_keys = [
-                sub_context_chunk_id(seg, self.extra_key) for seg in sub_context_ids
-            ]
-        # Per-block hit length in its own namespace.
-        self.sub_context_match_lens: Optional[List[int]] = None
         # Tokens matched in the tree but not reused. Drained by the forward trace.
         self.sub_context_discarded: int = 0
-        # Per-block matched slots and the locked nodes holding them (None on a miss).
-        # Cleared together by `release_sub_context_match_locks`.
-        self.sub_context_match_indices: Optional[List[Optional[torch.Tensor]]] = None
-        self.sub_context_match_nodes: Optional[List[Optional[Any]]] = None
-        # Per-namespace nodes locked by `cache_unfinished_req`, released at finish.
-        # None until that pass runs (a request finishing at prefill never runs it).
-        self.sub_context_last_nodes: Optional[List] = None
-        # Per-block tokens this request has inserted into its namespace so far.
-        self.sub_context_owned_lens: Optional[List[int]] = None
-        # Per-block position the hit was computed at (None on a miss).
-        self.sub_context_match_positions: Optional[List[Optional[int]]] = None
-        # Matched at another position and not rotated in; part of `discarded`.
+        # The nodes the scan copied runs from, locked until the copies are in the tree.
+        self.sub_context_match_nodes: Optional[List[Any]] = None
+        # Found at another position and not rotated in; part of `discarded`.
         self.sub_context_moved: int = 0
-        # Displaced hits rotated into place. Drained by the forward trace.
+        # Displaced runs rotated into place. Drained by the forward trace.
         self.sub_context_rotated: int = 0
-        # Rotated copies this request allocated. Cleared (not freed) once
-        # `prepare_for_extend` has written them into req_to_token.
+        # Copies this request allocated. Cleared (not freed) once `prepare_for_extend`
+        # has written them into req_to_token.
         self.sub_context_rotated_slots: Optional[List[torch.Tensor]] = None
-        # Per block: skip it on both insert paths.
-        self.sub_context_no_insert: Optional[List[bool]] = None
-        # Per block: the namespace holding its slots when that is not its own address
-        # (a run reused only in part). Read by the free paths.
-        self.sub_context_source_key: Optional[List[Optional[str]]] = None
-        # Scan path: reused runs as ordered, non-overlapping (start, end, slots). The
-        # rest of the prompt is computed. None on the stitch path.
+        # Reused runs as ordered, non-overlapping (start, end, slots). The rest of the
+        # prompt is computed. None when only a prefix is reused.
         self.sub_context_layout: Optional[List[Tuple[int, int, torch.Tensor]]] = None
         # Parallel to the layout: whether the run sits on this request's rotated copy.
         self.sub_context_layout_ours: Optional[List[bool]] = None
-        # Chained requests: the prefix the plain match reached. The layout's run over
-        # it is exact and is not scored by selective recompute.
+        # The prefix the plain match reached. The layout's run over it is exact and is
+        # not scored by selective recompute.
         self.sub_context_exact_len: int = 0
-        # Chained requests: refused for KV room while holding scanned runs with
-        # nothing else running. Matched on the prefix only from then on.
+        # Refused for KV room while holding scanned runs with nothing else running.
+        # Matched on the prefix only from then on.
         self.sub_context_index_declined: bool = False
-        # Chained requests: the last match's (prompt, prefix, found, rotated) tokens,
-        # fell-back flag and found tokens dropped by the fall back, added to the index
-        # tallies the first time the request runs (`sub_context_counted`).
+        # The last match's (prompt, prefix, found, rotated) tokens, fell-back flag and
+        # found tokens dropped by the fall back, added to the index tallies the first
+        # time the request runs (`sub_context_counted`).
         self.sub_context_tally: Optional[Tuple[int, int, int, int, int, int]] = None
         self.sub_context_counted: bool = False
-        # Displaced hits not yet counted as moved, pending `_rotate_append_sub_contexts`.
-        self.sub_context_deferred_moved: int = 0
-        # Stage 2: offset of the next block that only needs a rotation. The prefill
-        # chunk is cut here. None when there is none or Stage 2 is off.
-        self.sub_context_next_boundary: Optional[int] = None
-        # Per block: whether the tree owns its range of req_to_token.
-        self.sub_context_tree_owned: Optional[List[bool]] = None
-        # Per block: the position the tree holds it at (differs from the offset after
-        # `_reverse_rotate_insert_sub_contexts`).
-        self.sub_context_tree_canonical: Optional[List[Optional[int]]] = None
-        # Tokens rotated back and filed at finish. Drained by the forward trace.
-        self.sub_context_reinserted: int = 0
 
         self.lora_id = lora_id
         self.routing_key = routing_key
@@ -910,30 +870,16 @@ class Req(ReqDllmMixin):
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
 
-        if TRACE_ON and self.sub_context_extra_keys:
+        if TRACE_ON and self.sub_context_ids:
             trace(
-                f"[TRACE-3 Scheduler] sub_context_extra_keys={self.sub_context_extra_keys} "
-                f"segment_lens={[len(s) for s in (self.sub_context_ids or [])]}"
+                f"[TRACE-3 Scheduler] rid={self.rid} "
+                f"segment_lens={[len(s) for s in self.sub_context_ids]}"
             )
 
     @property
     def has_sub_contexts(self) -> bool:
-        """Sub-context: whether this request was split into per-namespace blocks."""
-        return bool(self.sub_context_extra_keys) and bool(self.sub_context_ids)
-
-    def iter_sub_contexts(self):
-        """Yield ``(segment_token_ids, extra_key, offset)`` for each block in order.
-
-        ``offset`` is the block's start within ``origin_input_ids``.
-        """
-        if not self.has_sub_contexts:
-            return
-        offset = 0
-        for seg_ids, seg_key in zip(
-            self.sub_context_ids, self.sub_context_extra_keys
-        ):
-            yield seg_ids, seg_key, offset
-            offset += len(seg_ids)
+        """Sub-context: whether this request's prompt was split into blocks."""
+        return bool(self.sub_context_ids)
 
     @property
     def seqlen(self) -> int:
@@ -1025,11 +971,6 @@ class Req(ReqDllmMixin):
 
         if tree_cache is not None and tree_cache.chains_sub_contexts(self):
             self._scan_sub_contexts(tree_cache, token_ids)
-        elif tree_cache is not None and tree_cache.serves_sub_contexts(self):
-            # Matched per namespace only; never against the default namespace.
-            self._stitch_sub_contexts(tree_cache)
-            if subctx_config.INDEX_DRYRUN:
-                self._measure_sub_context_scan(tree_cache)
         elif tree_cache is not None:
             if self.has_sub_contexts and not tree_cache.supports_sub_contexts():
                 _warn_sub_contexts_unsupported_once(tree_cache)
@@ -1073,20 +1014,12 @@ class Req(ReqDllmMixin):
         self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
 
     def release_sub_context_match_locks(self, tree_cache: BasePrefixCache) -> None:
-        """Drop the per-block match locks and clear the matched slots with them.
-
-        Idempotent.
-        """
+        """Drop the locks on the nodes the scan copied runs from. Idempotent."""
         if self.sub_context_match_nodes is None:
-            self.sub_context_match_indices = None
-            self.sub_context_match_positions = None
             return
         for node in self.sub_context_match_nodes:
-            if node is not None:
-                tree_cache.dec_lock_ref(node)
+            tree_cache.dec_lock_ref(node)
         self.sub_context_match_nodes = None
-        self.sub_context_match_indices = None
-        self.sub_context_match_positions = None
 
     def release_sub_context_scan(
         self, tree_cache: BasePrefixCache, no_room: bool = False
@@ -1139,35 +1072,6 @@ class Req(ReqDllmMixin):
         self.sub_context_layout_ours = None
         self.sub_context_exact_len = 0
 
-    def _next_rotatable_boundary(
-        self,
-        tree_cache: BasePrefixCache,
-        match_lens: List[int],
-        match_positions: List[Optional[int]],
-        stitched: int,
-    ) -> Optional[int]:
-        """Offset of the first block at or after ``stitched`` that hit in full at
-        another position, or None. A prefill chunk ending there lets
-        ``_rotate_append_sub_contexts`` rotate the block in.
-        """
-        from sglang.srt.utils import subctx_config
-
-        if not subctx_config.ROTATE_ACROSS_RECOMPUTE:
-            return None
-        if getattr(tree_cache, "kv_rotator", None) is None:
-            return None
-        for i, (seg_ids, _seg_key, offset) in enumerate(self.iter_sub_contexts()):
-            if not seg_ids or offset < stitched:
-                continue
-            position = match_positions[i]
-            if (
-                match_lens[i] == len(seg_ids)
-                and position is not None
-                and position != offset
-            ):
-                return offset
-        return None
-
     def _rotate_sub_context_block(
         self, tree_cache: BasePrefixCache, src_indices: torch.Tensor, delta: int
     ) -> Optional[torch.Tensor]:
@@ -1214,7 +1118,7 @@ class Req(ReqDllmMixin):
 
     def sub_context_fresh_positions(self) -> List[int]:
         """The positions this pass computes, ascending: the tail after the reused
-        prefix on the stitch path, or the gaps between the runs of a sparse layout.
+        prefix, or the gaps between the runs of a sparse layout.
         """
         n = len(self.fill_ids)
         if self.sub_context_layout is None:
@@ -1243,8 +1147,8 @@ class Req(ReqDllmMixin):
     def sub_context_reused_positions(self) -> List[int]:
         """The scored positions this pass reads from the cache, ascending.
 
-        Same order as the slots ``sub_context_reused_slots`` returns. Empty on the
-        stitch path.
+        Same order as the slots ``sub_context_reused_slots`` returns. Empty without a
+        sparse layout.
         """
         reused: List[int] = []
         for start, end, _slots, _ours in self._scored_runs():
@@ -1325,15 +1229,6 @@ class Req(ReqDllmMixin):
         self.sub_context_layout = None
         self.sub_context_layout_ours = None
         self.sub_context_exact_len = 0
-        self.sub_context_ids = self.sub_context_ids_as_sent
-        self.sub_context_no_insert = None
-        self.sub_context_source_key = None
-        self.sub_context_match_lens = None
-        self.sub_context_owned_lens = None
-        self.sub_context_tree_owned = None
-        self.sub_context_tree_canonical = None
-        self.sub_context_next_boundary = None
-        self.sub_context_deferred_moved = 0
 
         with host_timer.record("scan_prefix"):
             match = tree_cache.match_prefix(
@@ -1430,8 +1325,6 @@ class Req(ReqDllmMixin):
                 runs.append((run.start, run.end, dst))
                 nodes.append(node)
         self.sub_context_match_nodes = nodes or None
-        self.sub_context_match_indices = None
-        self.sub_context_match_positions = None
 
         if runs:
             layout = ([(0, exact, prefix)] if exact else []) + runs
@@ -1473,207 +1366,6 @@ class Req(ReqDllmMixin):
                 f"rotated={rotated} discarded={discarded} "
                 f"layout={[(s, e) for s, e, _ in (self.sub_context_layout or [])]}"
             )
-
-    @host_timer.timed("subctx_scan")
-    def _measure_sub_context_scan(self, tree_cache: BasePrefixCache) -> None:
-        """Dry run: tally what a content scan would find beyond the stitch.
-
-        Changes no request state. Each hit is looked up in the tree, which refreshes
-        its access time.
-        """
-        index = getattr(tree_cache, "sub_context_index", None)
-        if index is None or not self.fill_ids:
-            return
-
-        matches = index.select(index.scan(self.fill_ids, self.extra_key))
-        reused = len(self.prefix_indices)
-        resident = beyond = displaced = 0
-        for match in matches:
-            seg = self.fill_ids[match.start : match.end]
-            probe = tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(token_ids=seg, extra_key=match.chunk_id)
-                )
-            )
-            hit = len(probe.device_indices)
-            if hit == 0:
-                continue
-            resident += hit
-            beyond += max(0, min(match.start + hit, len(self.fill_ids)) - max(match.start, reused))
-            canonical = tree_cache.matched_canonical_position(probe.last_device_node, hit)
-            if canonical is not None and canonical != match.start:
-                displaced += hit
-
-        index.found_tokens += sum(m.length for m in matches)
-        index.resident_tokens += resident
-        index.beyond_stitch_tokens += beyond
-        index.displaced_tokens += displaced
-        index.stitched_tokens += reused
-
-        if TRACE_ON:
-            trace(
-                f"[TRACE-4 SUBCTX-SCAN] rid={self.rid} prompt={len(self.fill_ids)} "
-                f"stitched={reused} scan_found={sum(m.length for m in matches)} "
-                f"resident={resident} beyond_stitch={beyond} displaced={displaced} "
-                f"blocks={[(m.start, m.end) for m in matches]}"
-            )
-
-    @host_timer.timed("subctx_stitch")
-    def _stitch_sub_contexts(self, tree_cache: BasePrefixCache) -> None:
-        """Match each block in its own namespace and reuse the contiguous prefix.
-
-        Every non-empty block is matched and its hit locked, used or not. Reuse stops at
-        the first miss, partial hit, the ``len(fill_ids) - 1`` cap, or a displaced hit
-        that cannot be rotated (a displaced hit is rotated by ``offset - canonical``).
-        The reused slots become ``prefix_indices`` and seed ``sub_context_owned_lens``.
-        """
-
-        def _preview(ids, head: int = 10, tail: int = 5) -> str:
-            ids = list(ids)
-            if len(ids) <= head + tail:
-                return str(ids)
-            return f"{ids[:head]} ... {ids[-tail:]}"
-
-        # A re-scheduled request stitches again: drop the previous pass's locks and
-        # rotated copies, and any layout a scan left.
-        self.release_sub_context_match_locks(tree_cache)
-        self.release_sub_context_rotated_slots(tree_cache)
-        self.sub_context_layout = None
-        self.sub_context_layout_ours = None
-        self.sub_context_no_insert = None
-        self.sub_context_source_key = None
-
-        max_prefix_len = max(len(self.fill_ids) - 1, 0)
-        stitched: List[torch.Tensor] = []
-        match_lens: List[int] = []
-        owned: List[int] = []
-        match_indices: List[Optional[torch.Tensor]] = []
-        match_nodes: List[Optional[Any]] = []
-        match_positions: List[Optional[int]] = []
-        moved = 0
-        rotated = 0
-        total = 0
-        contiguous = True
-        for seg_ids, seg_key, _offset in self.iter_sub_contexts():
-            if len(seg_ids) == 0:
-                match_lens.append(0)
-                owned.append(0)
-                match_indices.append(None)
-                match_nodes.append(None)
-                match_positions.append(None)
-                continue
-            with host_timer.record("subctx_lookup"):
-                seg_match = tree_cache.match_prefix(
-                    MatchPrefixParams(key=RadixKey(token_ids=seg_ids, extra_key=seg_key))
-                )
-            hit = len(seg_match.device_indices)
-            match_lens.append(hit)
-            canonical = tree_cache.matched_canonical_position(
-                seg_match.last_device_node, hit
-            )
-            match_positions.append(canonical)
-            if hit > 0:
-                tree_cache.inc_lock_ref(seg_match.last_device_node)
-                match_nodes.append(seg_match.last_device_node)
-                match_indices.append(seg_match.device_indices)
-            else:
-                match_nodes.append(None)
-                match_indices.append(None)
-            # Computed at another position: reusable only after rotating it.
-            displaced = canonical is not None and canonical != _offset
-            if displaced:
-                moved += hit
-            if TRACE_ON:
-                trace(
-                    f"[TRACE-4 RadixCache] sub-context match rid={self.rid} "
-                    f"extra_key={seg_key!r} hit={hit}/{len(seg_ids)} "
-                    f"offset={_offset} canonical={canonical}"
-                    f"{' MOVED' if displaced else ''} "
-                    f"hit_tokens={_preview(seg_ids[:hit])}"
-                )
-            take = 0
-            if contiguous:
-                if hit == 0:
-                    contiguous = False
-                elif displaced:
-                    # Rotate by `_offset - canonical`. A partial take (the cap) is fine:
-                    # every token of the block moves by the same delta.
-                    take = min(hit, max_prefix_len - total)
-                    rotated_indices = None
-                    if take > 0:
-                        rotated_indices = self._rotate_sub_context_block(
-                            tree_cache,
-                            seg_match.device_indices[:take],
-                            _offset - canonical,
-                        )
-                    if rotated_indices is None:
-                        # Rotation off, delta out of range, or the pool is full.
-                        take = 0
-                        contiguous = False
-                    else:
-                        stitched.append(rotated_indices)
-                        total += take
-                        moved -= take
-                        rotated += take
-                        if take < len(seg_ids):
-                            contiguous = False
-                else:
-                    take = min(hit, max_prefix_len - total)
-                    if take <= 0:
-                        take = 0
-                        contiguous = False
-                    else:
-                        stitched.append(seg_match.device_indices[:take])
-                        total += take
-                        if take < len(seg_ids):
-                            contiguous = False
-            owned.append(take)
-
-        self.sub_context_match_lens = match_lens
-        self.sub_context_owned_lens = owned
-        # Rebuilt by the next insert pass.
-        self.sub_context_tree_owned = None
-        self.sub_context_tree_canonical = None
-        self.sub_context_match_indices = match_indices
-        self.sub_context_match_nodes = match_nodes
-        self.sub_context_match_positions = match_positions
-        boundary = self._next_rotatable_boundary(
-            tree_cache, match_lens, match_positions, total
-        )
-        # Displaced hits Stage 2 will try next pass; counted as moved only if it fails.
-        deferred = 0
-        if boundary is not None:
-            for i, (seg_ids, _seg_key, off) in enumerate(self.iter_sub_contexts()):
-                if off < boundary or not seg_ids:
-                    continue
-                position = match_positions[i]
-                if (
-                    match_lens[i] == len(seg_ids)
-                    and position is not None
-                    and position != off
-                ):
-                    deferred += match_lens[i]
-                else:
-                    break  # the append stops at this block
-            moved -= deferred
-
-        self.sub_context_moved = moved
-        self.sub_context_deferred_moved = deferred
-        self.sub_context_rotated = rotated
-        self.sub_context_next_boundary = boundary
-        # Matched but not stitched, minus what Stage 2 will still try.
-        self.sub_context_discarded = sum(match_lens) - sum(owned) - deferred
-        if stitched:
-            self.prefix_indices = torch.cat(stitched)
-        else:
-            self.prefix_indices = torch.empty(
-                (0,), dtype=torch.int64, device=tree_cache.device
-            )
-        self.last_node = tree_cache.root_node
-        self.last_host_node = tree_cache.root_node
-        self.host_hit_length = 0
-        self.mamba_branching_seqlen = None
-        self.cache_protected_len = len(self.prefix_indices)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):

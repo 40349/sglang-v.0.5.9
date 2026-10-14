@@ -25,8 +25,8 @@ register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu-amd")
 import itertools
 import random
 import unittest
+from collections import OrderedDict
 from types import SimpleNamespace
-from unittest import mock
 
 import numpy as np
 
@@ -404,9 +404,8 @@ class TestCdcSplit(unittest.TestCase):
         chat.tokenizer_manager = SimpleNamespace(tokenizer=tokenizer)
         chat._message_start_probed = False
         chat._message_start_id = None
-        with mock.patch.object(self.serving_chat, "SPLIT_MODE", "cdc"):
-            segs, keys = chat._compute_sub_context_ids(None, messages, None, ids)
-        return ids, segs, keys
+        chat._message_cuts = OrderedDict()
+        return ids, chat._compute_sub_context_ids(messages, ids)
 
     def test_every_message_starts_a_segment(self):
         msgs = [
@@ -415,9 +414,8 @@ class TestCdcSplit(unittest.TestCase):
             {"role": "assistant", "content": self.text(40)},
             {"role": "user", "content": self.text(700)},
         ]
-        ids, segs, keys = self.split(msgs)
+        ids, segs = self.split(msgs)
         self.assertEqual([t for s in segs for t in s], ids)
-        self.assertEqual(len(keys), len(segs))
         bounds = set(itertools.accumulate(len(s) for s in segs))
         marker = self.tok.convert_tokens_to_ids("<|im_start|>")
         starts = {i for i, t in enumerate(ids) if t == marker and i > 0}
@@ -427,11 +425,11 @@ class TestCdcSplit(unittest.TestCase):
     def test_a_passage_is_cut_the_same_alone_and_among_others(self):
         """CacheBlend's setting: every chunk of a primed passage is in the full prompt."""
         passage = {"role": "user", "content": self.text(600)}
-        _, alone, _ = self.split([passage])
+        _, alone = self.split([passage])
         own = [tuple(s) for s in alone[:-1]]  # the last one is the generation prompt
         self.assertGreater(len(own), 1)
         others = [{"role": "user", "content": self.text(n)} for n in (20, 550, 610)]
-        _, full, _ = self.split([others[0], others[1], passage, others[2]])
+        _, full = self.split([others[0], others[1], passage, others[2]])
         self.assertTrue(set(own) <= {tuple(s) for s in full})
 
     def test_without_a_message_token_it_cuts_on_content_only(self):
@@ -448,7 +446,7 @@ class TestCdcSplit(unittest.TestCase):
             convert_ids_to_tokens=str,
         )
         msgs = [{"role": "user", "content": self.text(1500)}]
-        ids, segs, _ = self.split(msgs, plain)
+        ids, segs = self.split(msgs, plain)
         bounds = [0, *cut_points(ids, 256, 64, 1024), len(ids)]
         self.assertEqual(segs, [ids[a:b] for a, b in zip(bounds, bounds[1:])])
 

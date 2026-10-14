@@ -12,9 +12,7 @@ Subcommands:
 
 `replay` re-sends one captured request sequence, so every arm sees the same input.
 Each turn is pinned to --gen-tokens with ignore_eos (--full uses each request's own
-max_tokens). Keep --gen-tokens at 2 or more: a request that finishes at prefill never
-inserts its prompt into the namespaces, so the next request misses them. Decode GPU
-time is the control and should not move between arms.
+max_tokens). Decode GPU time is the control and should not move between arms.
 
 Replay streams by default so TTFT can be measured (--no-stream reports end-to-end
 latency only). --concurrency defaults to 1; above 1, reuse depends on how requests
@@ -390,12 +388,6 @@ def summarize(rows: List[dict]) -> Dict[str, float]:
         if any("rotated_tokens" in r for r in ext)
         else None
     )
-    # Declined blocks rotated back and filed at finish (reused by later requests).
-    reinserted_tok = (
-        sum(r.get("reinserted_tokens", 0) for r in ext)
-        if any("reinserted_tokens" in r for r in ext)
-        else None
-    )
     sub_reqs = sum(r["sub_reqs"] for r in ext) if all("sub_reqs" in r for r in ext) else None
 
     return {
@@ -403,7 +395,6 @@ def summarize(rows: List[dict]) -> Dict[str, float]:
         "discarded_tokens": discarded_tok,
         "moved_tokens": moved_tok,
         "rotated_tokens": rotated_tok,
-        "reinserted_tokens": reinserted_tok,
         "sub_reqs": sub_reqs,
         "prefill_passes": len(ext),
         "prefill_gpu_ms": ext_ms,
@@ -460,7 +451,6 @@ def cmd_report(args: argparse.Namespace) -> int:
         ("discarded_tokens", "  ...matched but DROPPED", "tok"),
         ("moved_tokens", "     ...dropped as MOVED", "tok"),
         ("rotated_tokens", "  ...MOVED but ROTATED in", "tok"),
-        ("reinserted_tokens", "REVERSE-ROTATED into tree", "tok"),
         ("hit_rate", "hit rate (cached / prompt)", "%"),
         ("prefill_gpu_ms", "PREFILL GPU time", "ms"),
         ("prefill_ms_median", "  median pass", "ms"),
@@ -500,21 +490,13 @@ def cmd_report(args: argparse.Namespace) -> int:
             f"\nprefill GPU time saved: {saved:,.1f} ms "
             f"({100.0 * saved / a['prefill_gpu_ms']:+.1f}%)"
         )
-    if (a["discarded_tokens"] or 0) < 0 or (b["discarded_tokens"] or 0) < 0:
-        print(
-            "\nNOTE: a negative DROPPED count means this trace predates the fix that\n"
-            "records the drop at stitch time. It was derived by subtracting a\n"
-            "per-pass length from a per-request one, so every chunked-prefill\n"
-            "continuation pass reads one chunk short. Re-run to get a real number;\n"
-            "the other rows are unaffected."
-        )
-    # Different chunking (e.g. Stage 2): cross-check reuse against the prompt total.
+    # Different chunking: cross-check reuse against the prompt total.
     if a["prefill_passes"] != b["prefill_passes"]:
         prompt = min(a["prefill_total_tokens"], b["prefill_total_tokens"])
         print(
             f"\nNOTE: pass counts differ ({a['prefill_passes']:,} vs "
             f"{b['prefill_passes']:,}), so the two arms did NOT chunk the same way.\n"
-            "That is expected when one arm cuts chunks at block boundaries; it does\n"
+            "That is expected when the arms chunk a prompt differently; it does\n"
             "not by itself mean the request sequences differed, and the token rows\n"
             "above stay comparable -- each is counted once per request. Cross-check\n"
             "against the prompt total, which no counter can move:"
@@ -538,27 +520,22 @@ def cmd_report(args: argparse.Namespace) -> int:
 STAGE_NOTES = {
     "tpl_render": "chat template render (INCLUDES subctx_split)",
     "subctx_split": "  DECOMPOSITION: finding the block boundaries",
-    "match": "prefix match / per-namespace stitch",
-    "subctx_stitch": "  the split's own match+stitch, inside match",
+    "match": "prefix match (cdc: + the index scan)",
     "subctx_scan": "  the index's scan + lookups, inside match",
     "scan_prefix": "    plain prefix match",
     "scan_index": "    fingerprint past the prefix and look up registered chunks",
     "scan_locate": "    pick runs and find each chunk's slots in the tree",
     "scan_copy": "    copy (and rotate) the found runs into this request's slots",
-    "subctx_lookup": "    LOOKUP: one match_prefix per namespace",
-    "subctx_rotate": "    ROTATE: copy a displaced block, rotated, before prefill",
-    "subctx_rotate_finish": "  ROTATE: rotate a block back at finish, to file it",
+    "subctx_rotate": "      ROTATE: copy a displaced run, rotated, before prefill",
     "subctx_rotate_gpu": "  ROTATE on the GPU (SGLANG_SUBCTX_ROTATE_GPU=1; NOT host time)",
     "cache_unfinished": "insert prompt into the tree",
     "register_unfinished": "  register the prompt's new chunks in the index",
     "cache_finished": "release locks / free tail",
     "register_finished": "  register the output's chunks in the index",
-    "subctx_rev_rotate": "  of which: reverse-rotate a refused block and file it",
 }
 
 # Stages nested in another counted stage: shown, but kept out of the total.
 BREAKDOWN = {
-    "subctx_stitch": "match",
     "subctx_scan": "match",
     "scan_prefix": "subctx_scan",
     "scan_index": "subctx_scan",
@@ -566,11 +543,13 @@ BREAKDOWN = {
     "scan_copy": "subctx_scan",
     "register_unfinished": "cache_unfinished",
     "register_finished": "cache_finished",
+    "subctx_rotate": "scan_copy",
+    "subctx_rotate_gpu": "GPU, not host",
+    # Stages of the removed on / rot arms, nested as they were in their stage files.
+    "subctx_stitch": "match",
     "subctx_lookup": "subctx_stitch",
-    "subctx_rotate": "match / cache_unfinished",
     "subctx_rev_rotate": "cache_finished",
     "subctx_rotate_finish": "cache_finished",
-    "subctx_rotate_gpu": "GPU, not host",
 }
 
 # child -> enclosing stage. Only the child enters the total (the parent's delta is
@@ -704,7 +683,7 @@ def cmd_parity(args: argparse.Namespace) -> int:
     """Compare the two arms' generated text, request by request (by hash).
 
     Identical text is expected only where the reused KV is exact (e.g. an arm against
-    itself); rotated or cross-namespace reuse changes the KV and can change the text.
+    itself); rotated or non-prefix reuse changes the KV and can change the text.
     """
     _, a = load_client(args.baseline)
     _, b = load_client(args.treatment)
@@ -745,10 +724,7 @@ def cmd_parity(args: argparse.Namespace) -> int:
 # File stem -> column label, in table order.
 ARM_STEMS = (
     ("base", "baseline"),
-    ("sub", "sub-context"),
-    ("rot", "+ rotation"),
-    ("idx", "+ index"),
-    ("cdc", "+ content-cut blocks"),
+    ("cdc", "cdc"),
 )
 
 
@@ -893,34 +869,23 @@ _OVERHEAD_METRICS = (
     ("decomposition (subctx_split)", "subctx_split", True, True),
     ("match, total added", "match", False, True),
     ("  index scan (subctx_scan)", "subctx_scan", True, False),
-    ("  lookup (subctx_lookup)", "subctx_lookup", True, False),
-    ("  assembly (stitch - lookup - rotate)", None, True, False),
     ("  rotate, before prefill", "subctx_rotate", True, False),
     ("insert into tree, added", "cache_unfinished", False, True),
     ("release / free, added", "cache_finished", False, True),
-    ("  reverse-rotate and re-file", "subctx_rev_rotate", True, False),
-    ("  rotate, at finish", "subctx_rotate_finish", True, False),
     ("[GPU] rotation kernel", "subctx_rotate_gpu", True, False),
 )
 
 
 def _overhead_value(
-    arm: dict, base: dict, stage: Optional[str], own: bool, n_req: Optional[float]
+    arm: dict, base: dict, stage: str, own: bool, n_req: Optional[float]
 ) -> Optional[float]:
-    if stage is None:  # assembly: what the stitch spends outside its own children
-        stitch = _stage_us_per_req(arm, "subctx_stitch", n_req)
-        if stitch is None:
-            return None
-        lookup = _stage_us_per_req(arm, "subctx_lookup", n_req) or 0.0
-        rotate = _stage_us_per_req(arm, "subctx_rotate", n_req) or 0.0
-        return stitch - lookup - rotate
     if own:  # a stage the baseline does not have at all
         return _stage_us_per_req(arm, stage, n_req)
     return _added_us_per_req(arm, base, stage, n_req)
 
 
 def _split_ratio_stem(stem: str) -> Tuple[str, Optional[int]]:
-    """``"idx_r15"`` -> ``("idx", 15)``; any other stem -> ``(stem, None)``."""
+    """``"cdc_r15"`` -> ``("cdc", 15)``; any other stem -> ``(stem, None)``."""
     base, _, tail = stem.rpartition("_r")
     if base and tail.isdigit():
         return base, int(tail)
@@ -934,7 +899,7 @@ def cmd_summary(args: argparse.Namespace) -> int:
     if unknown:
         print(f"unknown arm(s) {', '.join(unknown)}; want any of "
               f"{', '.join(s for s, _ in ARM_STEMS)}, optionally with a recompute "
-              f"ratio appended as _rNN (e.g. idx_r15)", file=sys.stderr)
+              f"ratio appended as _rNN (e.g. cdc_r15)", file=sys.stderr)
         return 1
     arms = []
     # Arm order first, then ratio, so a sweep of one arm reads left to right.
@@ -1124,9 +1089,9 @@ def main() -> int:
                        help="one table over every arm of a completed toggle run")
     m.add_argument("dir", nargs="?", default=".",
                    help="directory holding client_/trace_/stage_ files (default .)")
-    m.add_argument("--arms", default="base,sub,rot,idx,cdc",
+    m.add_argument("--arms", default="base,cdc",
                    help="which arms to put in the table, comma separated "
-                        "(base, sub, rot, idx, cdc). An arm whose files are missing is left "
+                        "(base, cdc). An arm whose files are missing is left "
                         "out either way; this drops one that IS there. Deltas are "
                         "always against the leftmost column")
     m.set_defaults(func=cmd_summary)

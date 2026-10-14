@@ -331,7 +331,6 @@ class TestPrefillAdder(CustomTestCase):
         req.extend_input_len = fresh
         req.host_hit_length = 0
         req.last_node = MagicMock()
-        req.sub_context_next_boundary = None
         prompt = prompt or fresh
         req.prefix_indices = [0] * (prompt - fresh)
         req.sub_context_layout = [(0, prompt - fresh, None)] if prompt > fresh else None

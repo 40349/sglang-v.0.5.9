@@ -251,11 +251,10 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
-    # Pre-split token ids, parallel to ``sub_context_extra_keys``. Set only by the
-    # OpenAI chat path; `/generate` drops them from the request body.
-    # Dropped with a warning unless ``concat(sub_context_ids) == input_ids``.
+    # Pre-split token ids. Set only by the OpenAI chat path; `/generate` drops them
+    # from the request body. Dropped with a warning unless
+    # ``concat(sub_context_ids) == input_ids``.
     sub_context_ids: Optional[List[List[int]]] = None
-    sub_context_extra_keys: Optional[List[str]] = None
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
@@ -685,7 +684,6 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             priority=self.priority,
             extra_key=self.extra_key,
             sub_context_ids=self.sub_context_ids,
-            sub_context_extra_keys=self.sub_context_extra_keys,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -761,10 +759,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
 
-    # Sub-context: per-block token ids and namespaces, in prompt order.
+    # Sub-context: per-block token ids, in prompt order.
     # ``concat(sub_context_ids) == input_ids``. None when not split.
     sub_context_ids: Optional[List[List[int]]] = None
-    sub_context_extra_keys: Optional[List[str]] = None
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None

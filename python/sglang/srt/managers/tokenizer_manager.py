@@ -180,19 +180,18 @@ class ReqState:
 
 def _clip_sub_contexts_to_input(
     sub_context_ids: List[List[int]],
-    sub_context_extra_keys: List[str],
     input_len: int,
     rid: str,
-) -> Tuple[Optional[List[List[int]]], Optional[List[str]]]:
+) -> Optional[List[List[int]]]:
     """Restore ``concat(sub_context_ids) == input_ids`` after auto-truncation.
 
     Truncation removes a suffix: keep whole blocks while they fit, clip the straddling
-    one, drop the rest. ``(None, None)`` if nothing is left or the blocks are shorter
-    than the prompt.
+    one, drop the rest. None if nothing is left or the blocks are shorter than the
+    prompt.
     """
     total = sum(len(seg) for seg in sub_context_ids)
     if total == input_len:
-        return sub_context_ids, sub_context_extra_keys
+        return sub_context_ids
 
     if total < input_len:
         # Not a truncation (e.g. a multimodal processor rewrote input_ids).
@@ -203,17 +202,15 @@ def _clip_sub_contexts_to_input(
             total,
             input_len,
         )
-        return None, None
+        return None
 
     clipped_ids: List[List[int]] = []
-    clipped_keys: List[str] = []
     remaining = input_len
-    for seg, key in zip(sub_context_ids, sub_context_extra_keys):
+    for seg in sub_context_ids:
         if remaining <= 0:
             break
         take = min(len(seg), remaining)
         clipped_ids.append(seg[:take])
-        clipped_keys.append(key)
         remaining -= take
 
     logger.warning(
@@ -226,8 +223,8 @@ def _clip_sub_contexts_to_input(
         len(sub_context_ids),
     )
     if not clipped_ids:
-        return None, None
-    return clipped_ids, clipped_keys
+        return None
+    return clipped_ids
 
 
 class InputFormat(Enum):
@@ -797,12 +794,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Pre-split ids (OpenAI chat path): accept only if they concatenate to input_ids.
         sub_context_ids = None
-        sub_context_extra_keys = None
         if getattr(obj, "sub_context_ids", None):
             flat = [tok for seg in obj.sub_context_ids for tok in seg]
             if input_ids is not None and flat == list(input_ids):
                 sub_context_ids = obj.sub_context_ids
-                sub_context_extra_keys = obj.sub_context_extra_keys
             else:
                 logger.warning(
                     "Sub-context: ignoring sub_context_ids that do not concatenate to "
@@ -814,8 +809,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self._validate_one_request(obj, input_ids)
         # `_validate_one_request` may have truncated input_ids (--allow-auto-truncate).
         if sub_context_ids is not None:
-            sub_context_ids, sub_context_extra_keys = _clip_sub_contexts_to_input(
-                sub_context_ids, sub_context_extra_keys, len(input_ids), obj.rid
+            sub_context_ids = _clip_sub_contexts_to_input(
+                sub_context_ids, len(input_ids), obj.rid
             )
         trace_slice_end(RequestStage.TOKENIZE, obj.rid)
         return self._create_tokenized_object(
@@ -826,7 +821,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             mm_inputs,
             token_type_ids,
             sub_context_ids=sub_context_ids,
-            sub_context_extra_keys=sub_context_extra_keys,
         )
 
     def _validate_one_request(
@@ -981,7 +975,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         mm_inputs: Optional[Dict] = None,
         token_type_ids: Optional[List[int]] = None,
         sub_context_ids: Optional[List[List[int]]] = None,
-        sub_context_extra_keys: Optional[List[str]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
         # Parse sampling parameters
@@ -1027,7 +1020,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 sub_context_ids=sub_context_ids,
-                sub_context_extra_keys=sub_context_extra_keys,
                 routing_key=obj.routing_key,
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
@@ -1047,13 +1039,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
 
         if TRACE_ON:
-            _sc_keys = getattr(tokenized_obj, "sub_context_extra_keys", None)
-            if _sc_keys:
-                _sc_ids = getattr(tokenized_obj, "sub_context_ids", None) or []
-                _sc_lens = [len(seg) for seg in _sc_ids]
+            _sc_ids = getattr(tokenized_obj, "sub_context_ids", None)
+            if _sc_ids:
                 trace(
-                    f"[TRACE-2 Tokenizer] sub_contexts: extra_keys={_sc_keys} "
-                    f"segment_token_lens={_sc_lens}"
+                    f"[TRACE-2 Tokenizer] sub_contexts: "
+                    f"segment_token_lens={[len(seg) for seg in _sc_ids]}"
                 )
 
         return tokenized_obj

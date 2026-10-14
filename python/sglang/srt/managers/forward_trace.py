@@ -60,13 +60,6 @@ class ForwardTracer:
             moved_tokens = 0
             # Displaced hits rotated into place; part of `cached_tokens`.
             rotated_tokens = 0
-            # Declined blocks rotated back and filed at finish. Cache-level: it is
-            # reported by whichever pass comes next, not by the request that did it.
-            reinserted_tokens = 0
-            cache = getattr(batch, "tree_cache", None)
-            if getattr(cache, "sub_context_reinserted_tokens", 0):
-                reinserted_tokens = cache.sub_context_reinserted_tokens
-                cache.sub_context_reinserted_tokens = 0
             for req in reqs:
                 # Charge only the increase of the client-facing `cached_tokens`.
                 c = getattr(req, "cached_tokens", 0) or 0
@@ -96,7 +89,6 @@ class ForwardTracer:
             discarded_tokens = 0
             moved_tokens = 0
             rotated_tokens = 0
-            reinserted_tokens = 0
             sub_reqs = 0
 
         return {
@@ -109,7 +101,6 @@ class ForwardTracer:
             "discarded_tokens": discarded_tokens,
             "moved_tokens": moved_tokens,
             "rotated_tokens": rotated_tokens,
-            "reinserted_tokens": reinserted_tokens,
             "sub_reqs": sub_reqs,
             "t_rel": round(time.perf_counter() - self._t0, 6),
         }

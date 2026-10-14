@@ -1369,10 +1369,8 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[ToolCallConstraint] = None
-    # Sub-context: prompt_ids split into blocks, and each block's namespace. None when
-    # the prompt was not split.
+    # Sub-context: prompt_ids split into blocks. None when the prompt was not split.
     sub_context_ids: Optional[List[List[int]]] = None
-    sub_context_extra_keys: Optional[List[str]] = None
 
 
 class ToolCallProcessingResult(NamedTuple):

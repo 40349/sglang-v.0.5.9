@@ -17,11 +17,9 @@
 #                                   the tables
 #   sbatch run_toggle.sh toggle     the same as a batch job (submit from the checkout)
 #
-#   ARMS="off cdc cdc@0.15" ./run_toggle.sh toggle
-#   ARMS="off rot idx cdc" ./run_toggle.sh toggle       the middle rungs; the first arm
-#                                                       is the baseline
+#   ARMS="off cdc cdc@0.15" ./run_toggle.sh toggle      the first arm is the baseline
 #   AUDIT=1 FULL=1 ./run_toggle.sh toggle               correctness pass, timings unusable
-#   REQUESTS=~/work/traces/requests_on_42.jsonl ...     a capture recorded elsewhere
+#   REQUESTS=~/work/traces/requests_cdc_r15_42.jsonl ... a capture recorded elsewhere
 #
 # `toggle` reads the traces the server writes locally: run it on the box holding the
 # GPU. Output lands in ab_out unless OUT is set.
@@ -37,13 +35,14 @@ GEN_TOKENS=${GEN_TOKENS:-32}  # fixed generated length per replayed request
 CONC=${CONC:-1}               # requests in flight
 # Use each request's own max_tokens instead of pinning the length with ignore_eos.
 FULL=${FULL:-}
-# Slot-ownership audits in the server (a full tree walk per pass; timings include it).
+# Server audits: double frees in the KV pool, and each reused chunk's tokens against
+# the location it is read from (timings include them).
 AUDIT=${AUDIT:-}
 # Override to replay a capture recorded elsewhere.
 REQUESTS=${REQUESTS:-$OUT/requests.jsonl}
 CHECK_ARM=$REPO/scripts/subcontext_sim/check_remote_arm.py
 
-ARM=${ARM:-on}
+ARM=${ARM:-}
 ARMS=${ARMS:-"off cdc"}
 export MODEL=${MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}
 export PORT=${PORT:-8000}
@@ -72,11 +71,10 @@ export PYTHONNOUSERSITE=1        # ignore ~/.local
 export PYTHONUNBUFFERED=1
 export PYTHONPATH=$REPO/python   # run THIS checkout, not the installed sglang
 
-# File stem per arm, as `summary` expects: off -> base, on -> sub, others by their tag.
+# File stem per arm, as `summary` expects: off -> base, others by their tag.
 arm_stem() {
   case "${1%%@*}" in
     off) echo base ;;
-    on)  echo sub ;;
     *)   ARM=$1 bash "$SERVER" check ;;
   esac
 }
@@ -190,7 +188,7 @@ TXT
         CLIENT=$OUT/client_$stem.json replay
       # The index's own counters.
       case "${arm%%@*}" in
-        idx|cdc) grep "sub-context index:" "$log" | tail -1 || true ;;
+        cdc) grep "sub-context index:" "$log" | tail -1 || true ;;
       esac
     done
 
@@ -199,8 +197,8 @@ TXT
     {
       if [ -n "$AUDIT" ] || [ -n "$FULL" ]; then
         echo
-        [ -n "$AUDIT" ] && echo "!! AUDIT=1: every pass walked the whole tree, so the" \
-          "GPU and HOST numbers below price the audit, not the split."
+        [ -n "$AUDIT" ] && echo "!! AUDIT=1: every free and every chunk read was checked, so" \
+          "the GPU and HOST numbers below price the audit, not the split."
         [ -n "$FULL" ] && echo "!! FULL=1: the arms generated different amounts, so the" \
           "timing columns are not comparable between them."
         echo "!! Correctness only."
@@ -231,10 +229,10 @@ TXT
     echo "  record  server records the chat traffic of an agent you run"
     echo "  toggle  replay that capture once per arm  ->  $OUT"
     echo
-    echo "  ARM=on                the arm 'record' runs"
+    echo "  ARM=cdc@0.15          the arm 'record' runs (required for record)"
     echo "  ARMS='off cdc@0.15'   which arms 'toggle' replays, in order; the first is the"
-    echo "                        baseline. off|on|rot|idx|cdc, idx/cdc@ratio (sglang_server.sh)"
-    echo "  AUDIT=1               turn on the leak/ownership audits (timings unusable)"
+    echo "                        baseline. off|cdc|cdc@ratio (sglang_server.sh)"
+    echo "  AUDIT=1               turn on the double-free and chunk-token audits (timings unusable)"
     echo "  FULL=1                let requests stop naturally, so one can stop during"
     echo "                        prefill -- the path a pinned replay never reaches"
     echo "  REQUESTS=<path>       replay a capture recorded elsewhere (e.g. the H200)"

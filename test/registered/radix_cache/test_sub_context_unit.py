@@ -1,15 +1,16 @@
 """
 Unit tests for the sub-context path of RadixCache.
 
-A sub-context request has its prompt split into ordered blocks, each matched and
-inserted under its own ``extra_key`` namespace. These drive the full lifecycle on
-CPU tensors -- match, insert, finish -- and cover its invariants:
+A sub-context request carries its prompt cut into blocks by content. It is matched on
+its prefix, then the index finds its registered chunks past the prefix; each found run
+is copied (rotated when it sits at another position) into the request's own slots, and
+the request is stored as one chain like a plain one. These drive match, insert and
+finish on CPU tensors and cover:
 
-- read and write must agree on whether the cache can serve the split at all,
-- a namespace must stay pinned to one absolute position in the prompt,
-- a hit at another position is rotated to where it is reused, or dropped -- never
-  stitched as it is, and never freed while a node still points at it,
-- a finished request's generated tokens extend its last block's namespace.
+- which caches can serve the split at all,
+- a node's position along its chain,
+- auto-truncation of the block list,
+- the index: chunk locations, copies, rotation, fall backs, locks and slot ownership.
 
 Usage:
     python test_sub_context_unit.py
@@ -26,8 +27,8 @@ import unittest
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Req, sub_context_chunk_id
-from sglang.srt.mem_cache.subctx_index import SubContextIndex
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.subctx_index import SubContextIndex, chunk_id
 from sglang.srt.utils import subctx_config
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -38,10 +39,6 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
-
-SYS_KEY = "system_prompt_key"
-MSG_KEY = "messages_key"
-
 
 class FakeReqToTokenPool:
     """Just the two members the cache paths touch."""
@@ -78,9 +75,7 @@ class FakeAllocator:
         self.freed.extend(indices.tolist())
 
     def available_size(self):
-        # Capacity is unbounded here, so "how many slots have come back" is the only
-        # meaningful reading -- and it is what the finish-path leak audit needs, since
-        # that only ever looks at the delta across one call.
+        # The number of slots freed so far.
         return len(self.freed)
 
 
@@ -93,17 +88,13 @@ class FakeRotator:
     def __init__(self, max_delta: int = 10**6):
         self.max_delta = max_delta
         self.calls = []
-        self.stages = []
         self.copies = []
 
     def can_rotate(self, delta: int) -> bool:
         return delta != 0 and abs(delta) <= self.max_delta
 
     def rotate_into(self, dst_loc, src_loc, delta, stage="subctx_rotate"):
-        # `stage` only names the host timer the real rotator charges the call to.
-        # Recorded so a test can tell a read-path rotation from a finish-path one.
         self.calls.append((src_loc.tolist(), dst_loc.tolist(), delta))
-        self.stages.append(stage)
 
     def copy_into(self, dst_loc, src_loc, stage="subctx_copy"):
         self.copies.append((src_loc.tolist(), dst_loc.tolist()))
@@ -131,7 +122,7 @@ def make_cache(
     return cache, pool, allocator
 
 
-def make_req(rid: str, blocks, keys, req_pool_idx: int = 0) -> Req:
+def make_req(rid: str, blocks, req_pool_idx: int = 0) -> Req:
     ids = [tok for block in blocks for tok in block]
     req = Req(
         rid=rid,
@@ -139,14 +130,13 @@ def make_req(rid: str, blocks, keys, req_pool_idx: int = 0) -> Req:
         origin_input_ids=ids,
         sampling_params=SamplingParams(max_new_tokens=8),
         sub_context_ids=blocks,
-        sub_context_extra_keys=keys,
     )
     req.req_pool_idx = req_pool_idx
     return req
 
 
 def prefill(cache, pool, req: Req, first_slot: int) -> None:
-    """Match, hand the request its KV slots, then insert per namespace."""
+    """Match, hand the request its KV slots, then insert the prompt."""
     req.init_next_round_input(cache)
     n = len(req.origin_input_ids)
     slots = torch.arange(first_slot, first_slot + n, dtype=torch.int64)
@@ -162,21 +152,6 @@ def prefill(cache, pool, req: Req, first_slot: int) -> None:
     cache.cache_unfinished_req(req)
 
 
-def prefill_chunk(cache, pool, req: Req, upto: int, first_slot: int) -> None:
-    """One chunked-prefill pass covering origin_input_ids[:upto].
-
-    Like `prefill`, but the next pass continues from the `prefix_indices` that
-    `cache_unfinished_req` left (the scheduler does not re-match a chunked request).
-    """
-    reused = len(req.prefix_indices)
-    pool.req_to_token[req.req_pool_idx, :reused] = req.prefix_indices
-    fresh = torch.arange(first_slot, first_slot + (upto - reused), dtype=torch.int64)
-    pool.req_to_token[req.req_pool_idx, reused:upto] = fresh
-    req.sub_context_rotated_slots = None  # as prepare_for_extend does
-    req.fill_ids = list(req.origin_input_ids[:upto])
-    cache.cache_unfinished_req(req, chunked=True)
-
-
 def decode_and_finish(cache, pool, req: Req, output_ids, first_slot: int) -> None:
     """Append generated tokens with their own slots, then finish the request."""
     n = len(req.origin_input_ids)
@@ -189,7 +164,7 @@ def decode_and_finish(cache, pool, req: Req, output_ids, first_slot: int) -> Non
 
 
 class TestSubContextSupportGate(unittest.TestCase):
-    """Read and write path must agree on whether the split can be served."""
+    """Which caches can serve the split."""
 
     def test_plain_radix_cache_supports(self):
         cache, _, _ = make_cache()
@@ -222,19 +197,18 @@ class TestSubContextSupportGate(unittest.TestCase):
                 page_size=1,
             )
         )
-        req = make_req("r", [[1, 2, 3], [4, 5]], [SYS_KEY, MSG_KEY])
+        req = make_req("r", [[1, 2, 3], [4, 5]])
         req.init_next_round_input(cache)  # used to raise AttributeError
         self.assertEqual(len(req.prefix_indices), 0)
 
-    def test_page_size_gt_1_uses_the_default_namespace_end_to_end(self):
-        """No namespace is written, so none may be matched either."""
+    def test_page_size_gt_1_serves_the_split_request_as_a_plain_one(self):
+        """The prompt is stored as a plain request, and a second request with the same
+        prompt hits it."""
         cache, pool, _ = make_cache(page_size=4)
-        req = make_req("r", [[1, 2, 3, 4], [5, 6, 7, 8]], [SYS_KEY, MSG_KEY])
+        req = make_req("r", [[1, 2, 3, 4], [5, 6, 7, 8]])
         prefill(cache, pool, req, first_slot=100)
-        self.assertIsNone(req.sub_context_last_nodes)
-        # The prompt went into the default namespace, and a second request with the
-        # same prompt hits it there.
-        again = make_req("r2", [[1, 2, 3, 4], [5, 6, 7, 8]], [SYS_KEY, MSG_KEY])
+        self.assertIsNone(req.sub_context_layout)
+        again = make_req("r2", [[1, 2, 3, 4], [5, 6, 7, 8]])
         again.init_next_round_input(cache)
         self.assertGreater(len(again.prefix_indices), 0)
 
@@ -252,751 +226,16 @@ class TestCanonicalPosition(unittest.TestCase):
         ).last_device_node
         self.assertEqual(node.canonical_position, 0)
 
-    def test_block_insert_records_its_offset(self):
-        cache, _, _ = make_cache()
-        cache.insert(
-            InsertParams(
-                key=RadixKey([7, 8], MSG_KEY),
-                value=torch.tensor([70, 80]),
-                canonical_position=3,
-            )
-        )
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey([7, 8], MSG_KEY)))
-        self.assertEqual(cache.matched_canonical_position(m.last_device_node, 2), 3)
-
     def test_split_divides_the_position(self):
         cache, _, _ = make_cache()
         cache.insert(
-            InsertParams(
-                key=RadixKey([7, 8, 9], MSG_KEY),
-                value=torch.tensor([70, 80, 90]),
-                canonical_position=3,
-            )
+            InsertParams(key=RadixKey([7, 8, 9]), value=torch.tensor([70, 80, 90]))
         )
         # Matching a shorter key splits the node; both halves keep a true position.
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey([7, 8], MSG_KEY)))
-        self.assertEqual(m.last_device_node.canonical_position, 3)
-        self.assertEqual(cache.matched_canonical_position(m.last_device_node, 2), 3)
-        tail = cache.match_prefix(MatchPrefixParams(key=RadixKey([7, 8, 9], MSG_KEY)))
-        self.assertEqual(tail.last_device_node.canonical_position, 5)
-        self.assertEqual(cache.matched_canonical_position(tail.last_device_node, 3), 3)
-
-    def test_position_of_a_partial_match_is_the_chain_start(self):
-        cache, pool, _ = make_cache()
-        req = make_req("r1", [[1, 2, 3], [7, 8]], [SYS_KEY, MSG_KEY])
-        prefill(cache, pool, req, first_slot=100)
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey([7], MSG_KEY)))
-        self.assertEqual(cache.matched_canonical_position(m.last_device_node, 1), 3)
-
-    def test_no_match_has_no_position(self):
-        cache, _, _ = make_cache()
-        self.assertIsNone(cache.matched_canonical_position(None, 0))
-
-
-class TestMovedBlocks(unittest.TestCase):
-    """A block whose KV was computed elsewhere is dropped, not stitched."""
-
-    def _seed_and_move(self):
-        """Cache [7,8] at offset 3, then ask for it at offset 2."""
-        cache, pool, allocator = make_cache()
-        first = make_req("r1", [[1, 2, 3], [7, 8]], [SYS_KEY, MSG_KEY])
-        prefill(cache, pool, first, first_slot=100)
-        decode_and_finish(cache, pool, first, [], first_slot=200)
-        second = make_req("r2", [[1, 2], [7, 8]], [SYS_KEY, MSG_KEY], req_pool_idx=1)
-        return cache, pool, allocator, second
-
-    def test_moved_hit_is_not_stitched(self):
-        cache, _, _, second = self._seed_and_move()
-        second.init_next_round_input(cache)
-        # The head still hits at its own position and is still reused; only the
-        # block whose KV was computed elsewhere is dropped.
-        self.assertEqual(second.sub_context_match_lens, [2, 2])
-        self.assertEqual(second.sub_context_match_positions, [0, 3])
-        self.assertEqual(second.prefix_indices.tolist(), [100, 101])
-        self.assertEqual(second.sub_context_moved, 2)
-        self.assertEqual(second.sub_context_discarded, 2)
-        second.release_sub_context_match_locks(cache)
-
-    def test_moved_hit_stays_locked_for_a_later_rotation(self):
-        """The dropped slots are the raw material Stage 1 rotates; keep them."""
-        cache, _, _, second = self._seed_and_move()
-        second.init_next_round_input(cache)
-        self.assertIsNotNone(second.sub_context_match_indices[1])
-        self.assertIsNotNone(second.sub_context_match_nodes[1])
-        self.assertGreater(cache.protected_size(), 0)
-        second.release_sub_context_match_locks(cache)
-
-    def test_first_writer_keeps_the_tree_copy(self):
-        cache, pool, _, second = self._seed_and_move()
-        prefill(cache, pool, second, first_slot=300)
-        # The namespace still holds the original copy at its original position.
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey([7, 8], MSG_KEY)))
-        self.assertEqual(m.device_indices.tolist(), [103, 104])
-        self.assertEqual(cache.matched_canonical_position(m.last_device_node, 2), 3)
-        # The second request keeps its own slots for that block: not tree-owned,
-        # so they are still pointed at by req_to_token and freed at finish.
-        self.assertEqual(pool.req_to_token[1, 2:4].tolist(), [302, 303])
-        self.assertEqual(second.cache_protected_len, 2)
-
-    def test_moved_block_is_freed_once_at_finish(self):
-        cache, pool, allocator, second = self._seed_and_move()
-        prefill(cache, pool, second, first_slot=300)
-        allocator.freed.clear()
-        decode_and_finish(cache, pool, second, [9], first_slot=400)
-        # Its own copy of [7,8] plus the generated token; the tree's copy untouched.
-        self.assertEqual(sorted(allocator.freed), [302, 303, 400])
-        self.assertEqual(
-            cache.match_prefix(
-                MatchPrefixParams(key=RadixKey([7, 8], MSG_KEY))
-            ).device_indices.tolist(),
-            [103, 104],
-        )
-
-    def test_one_node_per_token_sequence(self):
-        """No fragmentation: the moved request must not add a second copy."""
-        cache, pool, _, second = self._seed_and_move()
-        before = cache.total_size()
-        prefill(cache, pool, second, first_slot=300)
-        # [1,2] was already there as a prefix (it only splits a node) and [7,8] was
-        # refused, so the tree still holds exactly one copy of each token sequence.
-        self.assertEqual(cache.total_size(), before)
-
-
-class TestRotatedBlocks(unittest.TestCase):
-    """A displaced hit is copied to fresh slots and rotated, instead of dropped."""
-
-    TOOLS_KEY = "tools_key"
-
-    def _seed(self, rotator=None, capacity: int = 10**6):
-        """Cache SYS[1,2,3]@0, TOOLS[7,8]@3, MSG[20,21]@5."""
-        cache, pool, allocator = make_cache(rotator=rotator, capacity=capacity)
-        first = make_req(
-            "r1",
-            [[1, 2, 3], [7, 8], [20, 21]],
-            [SYS_KEY, self.TOOLS_KEY, MSG_KEY],
-        )
-        prefill(cache, pool, first, first_slot=100)
-        decode_and_finish(cache, pool, first, [], first_slot=200)
-        return cache, pool, allocator
-
-    def _shifted_req(self):
-        """TOOLS[7,8] now sits at offset 2 instead of 3, so delta is -1."""
-        return make_req(
-            "r2",
-            [[1, 2], [7, 8], [40, 41]],
-            [SYS_KEY, self.TOOLS_KEY, MSG_KEY],
-            req_pool_idx=1,
-        )
-
-    def test_displaced_hit_is_rotated_into_the_prefix(self):
-        rotator = FakeRotator()
-        cache, pool, allocator = self._seed(rotator)
-        req = self._shifted_req()
-        req.init_next_round_input(cache)
-
-        # The head is reused where it is; the displaced block is rotated by
-        # offset - canonical = 2 - 3 and stitched from its fresh copy.
-        self.assertEqual(rotator.calls, [([103, 104], [900, 901], -1)])
-        self.assertEqual(req.prefix_indices.tolist(), [100, 101, 900, 901])
-        self.assertEqual(req.sub_context_rotated, 2)
-        self.assertEqual(req.sub_context_moved, 0)
-        req.release_sub_context_match_locks(cache)
-        req.release_sub_context_rotated_slots(cache)
-
-    def test_without_a_rotator_the_hit_is_still_dropped(self):
-        cache, pool, allocator = self._seed(rotator=None)
-        req = self._shifted_req()
-        req.init_next_round_input(cache)
-
-        self.assertEqual(req.prefix_indices.tolist(), [100, 101])
-        self.assertEqual(req.sub_context_rotated, 0)
-        self.assertEqual(req.sub_context_moved, 2)
-        req.release_sub_context_match_locks(cache)
-
-    def test_a_full_pool_falls_back_to_dropping(self):
-        """An allocator that cannot hand out slots must not change the outcome."""
-        rotator = FakeRotator()
-        cache, pool, allocator = self._seed(rotator, capacity=0)
-        req = self._shifted_req()
-        req.init_next_round_input(cache)
-
-        self.assertEqual(rotator.calls, [])
-        self.assertEqual(req.prefix_indices.tolist(), [100, 101])
-        self.assertEqual(req.sub_context_rotated, 0)
-        self.assertEqual(req.sub_context_moved, 2)
-        req.release_sub_context_match_locks(cache)
-
-    def test_rotated_copy_is_never_inserted(self):
-        """The tree keeps one rotation per token sequence: the first writer's."""
-        rotator = FakeRotator()
-        cache, pool, allocator = self._seed(rotator)
-        req = self._shifted_req()
-        prefill(cache, pool, req, first_slot=300)
-
-        hit = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey([7, 8], self.TOOLS_KEY))
-        )
-        self.assertEqual(hit.device_indices.tolist(), [103, 104])
-        self.assertEqual(cache.matched_canonical_position(hit.last_device_node, 2), 3)
-        # ... and the block after the un-inserted one still gets cached, which a
-        # `break` on the position conflict would have prevented.
-        self.assertEqual(
-            cache.match_prefix(
-                MatchPrefixParams(key=RadixKey([40, 41], MSG_KEY))
-            ).device_indices.tolist(),
-            [304, 305],
-        )
-        self.assertEqual(req.sub_context_tree_owned, [True, False, True])
-
-    def test_restitch_clears_stale_ownership(self):
-        """A re-scheduled request does not inherit the last attempt's tree ownership."""
-        rotator = FakeRotator()
-        cache, pool, allocator = self._seed(rotator)
-        req = self._shifted_req()
-        prefill(cache, pool, req, first_slot=300)
-        self.assertEqual(req.sub_context_tree_owned, [True, False, True])
-
-        req.init_next_round_input(cache)  # as a retracted request would re-stitch
-        self.assertIsNone(req.sub_context_tree_owned)
-        req.release_sub_context_match_locks(cache)
-        req.release_sub_context_rotated_slots(cache)
-
-    def test_rotated_copy_is_freed_exactly_once(self):
-        rotator = FakeRotator()
-        cache, pool, allocator = self._seed(rotator)
-        req = self._shifted_req()
-        prefill(cache, pool, req, first_slot=300)
-        allocator.freed.clear()
-        decode_and_finish(cache, pool, req, [9], first_slot=400)
-
-        # Freed: only the rotated copy of [7,8], a duplicate of what the namespace held.
-        # Token 400 is cached with the reply, since the re-file made the prompt
-        # tree-owned.
-        self.assertEqual(sorted(allocator.freed), [900, 901])
-        self.assertEqual(len(allocator.freed), len(set(allocator.freed)))
-
-    def test_append_leaves_a_token_to_compute(self):
-        """A pass with nothing to compute is not a valid batch, so the append stops
-        one token short of the prompt exactly as the stitch does."""
-        import sglang.srt.utils.subctx_config as subctx_config
-
-        rotator = FakeRotator()
-        cache, pool, allocator = self._seed(rotator)
-        original = subctx_config.ROTATE_ACROSS_RECOMPUTE
-        subctx_config.ROTATE_ACROSS_RECOMPUTE = True
-        try:
-            # Six prompt tokens, and the rotatable block is the last one: taking it
-            # whole would cover the lot.
-            req = make_req(
-                "r2",
-                [[1, 2, 9, 10], [7, 8]],
-                [SYS_KEY, self.TOOLS_KEY],
-                req_pool_idx=1,
-            )
-            req.init_next_round_input(cache)
-            self.assertEqual(req.sub_context_next_boundary, 4)
-
-            prefill_chunk(cache, pool, req, upto=4, first_slot=300)
-
-            # One of the block's two tokens is rotated in; the other is recomputed.
-            self.assertEqual(rotator.calls, [([103], [900], 1)])
-            self.assertEqual(req.sub_context_rotated, 1)
-            # The token the cap refused is a genuine drop, and it is reported by this
-            # pass -- the one that gave up on it -- not by the stitch.
-            self.assertEqual(req.sub_context_moved, 1)
-            self.assertEqual(req.sub_context_deferred_moved, 0)
-            self.assertEqual(len(req.prefix_indices), 5)
-
-            req.init_next_round_input()
-            self.assertEqual(req.extend_input_len, 1)
-        finally:
-            subctx_config.ROTATE_ACROSS_RECOMPUTE = original
-
-    def test_block_after_a_recompute_is_rotated_in(self):
-        """Stage 2: block 0 partially hits; the chunk is cut at block 1's offset and
-        block 1 is rotated onto the end of the prefix.
-        """
-        import sglang.srt.utils.subctx_config as subctx_config
-
-        rotator = FakeRotator()
-        cache, pool, allocator = self._seed(rotator)
-        original = subctx_config.ROTATE_ACROSS_RECOMPUTE
-        subctx_config.ROTATE_ACROSS_RECOMPUTE = True
-        try:
-            req = make_req(
-                "r2",
-                [[1, 2, 9, 10], [7, 8], [22, 23]],
-                [SYS_KEY, self.TOOLS_KEY, MSG_KEY],
-                req_pool_idx=1,
-            )
-            req.init_next_round_input(cache)
-
-            # [1,2] of the head hits, [9,10] must be computed, so the stitch stops at
-            # 2 and the boundary is where TOOLS starts in THIS prompt.
-            self.assertEqual(req.prefix_indices.tolist(), [100, 101])
-            self.assertEqual(req.sub_context_next_boundary, 4)
-            # Held back, not reported as a drop: the append is about to attempt it,
-            # and a pass that reported the drop would have to un-report it later.
-            self.assertEqual(req.sub_context_moved, 0)
-            self.assertEqual(req.sub_context_deferred_moved, 2)
-
-            # The chunk the scheduler would cut at that boundary.
-            prefill_chunk(cache, pool, req, upto=4, first_slot=300)
-
-            # TOOLS was rotated by 4 - 3 and appended, so the prefix now runs past it.
-            self.assertEqual(rotator.calls, [([103, 104], [900, 901], 1)])
-            self.assertEqual(
-                req.prefix_indices.tolist(), [100, 101, 300, 301, 900, 901]
-            )
-            self.assertEqual(req.sub_context_rotated, 2)
-            # The append took all of it, so nothing was dropped after all.
-            self.assertEqual(req.sub_context_moved, 0)
-            self.assertEqual(req.sub_context_deferred_moved, 0)
-            # Only the head is tree-owned so far; the rotated block is this
-            # request's, and MSG has not been reached by any chunk yet.
-            self.assertEqual(req.cache_protected_len, 4)
-            self.assertEqual(req.sub_context_tree_owned, [True, False, False])
-
-            # The next pass picks up where this one left off: it has 2 tokens left.
-            req.init_next_round_input()
-            self.assertEqual(req.extend_input_len, 2)
-        finally:
-            subctx_config.ROTATE_ACROSS_RECOMPUTE = original
-
-
-class TestSubContextLifecycle(unittest.TestCase):
-    """Match -> per-namespace insert -> finish, and the reuse it enables."""
-
-    def test_read_and_write_gates_agree(self):
-        """The read path and both write paths make the same `serves_sub_contexts` decision in every state."""
-        for label, page_size, mutate in (
-            ("fresh request", 1, lambda r: None),
-            # `fill_ids = origin_input_ids + output_ids`, so a retracted request comes
-            # back longer than the prompt its blocks describe. That is what the write
-            # gate's old length clause tripped on.
-            ("retracted, fill_ids past the split prompt", 1,
-             lambda r: r.output_ids.extend([61, 62, 63])),
-            # No unfinished pass ran: the state a request finishing during prefill
-            # arrives in.
-            ("no unfinished pass ran", 1,
-             lambda r: setattr(r, "sub_context_last_nodes", None)),
-            # A cache that cannot serve the split must turn BOTH paths off, or matches
-            # land in namespaces that nothing ever inserts into.
-            ("cache does not support the split", 4, lambda r: None),
-        ):
-            with self.subTest(label):
-                cache, pool, _ = make_cache(page_size=page_size)
-                req = make_req("r1", [[1, 2, 3], [4, 5]], [SYS_KEY, MSG_KEY])
-                mutate(req)
-                req.init_next_round_input(cache)
-                read_took_split = req.sub_context_match_lens is not None
-                self.assertEqual(
-                    read_took_split,
-                    cache.serves_sub_contexts(req),
-                    f"{label}: read path and write gate disagree",
-                )
-
-    def test_finishing_without_an_unfinished_pass_files_nothing_by_default_key(self):
-        """A split request that finishes without an unfinished pass (stop token at
-        prefill, or aborted while queued) files nothing under the default namespace.
-        """
-        cache, pool, allocator = make_cache()
-        seed = make_req("r1", [[1, 2, 3], [7, 8]], [SYS_KEY, MSG_KEY])
-        prefill(cache, pool, seed, first_slot=100)
-        decode_and_finish(cache, pool, seed, [50], first_slot=200)
-
-        req = make_req("r2", [[1, 2, 3], [7, 8]], [SYS_KEY, MSG_KEY], req_pool_idx=1)
-        req.init_next_round_input(cache)
-        n = len(req.origin_input_ids)
-        reused = len(req.prefix_indices)
-        self.assertGreater(reused, 0, "the stitch must have reused namespace slots")
-        pool.req_to_token[req.req_pool_idx, :reused] = req.prefix_indices
-        pool.req_to_token[req.req_pool_idx, reused:n] = torch.arange(
-            300, 300 + (n - reused), dtype=torch.int64
-        )
-        req.sub_context_rotated_slots = None
-        req.fill_ids = list(req.origin_input_ids)
-        req.output_ids = []
-        req.kv_committed_len = n
-        self.assertIsNone(req.sub_context_last_nodes)
-
-        freed_before = set(allocator.freed)
-        cache.cache_finished_req(req)
-
-        owners = {}
-        stack = [cache.root_node]
-        while stack:
-            node = stack.pop()
-            stack.extend(node.children.values())
-            if node is cache.root_node or node.value is None:
-                continue
-            for slot in node.value.tolist():
-                owners.setdefault(slot, []).append(node.key.extra_key)
-
-        self.assertNotIn(
-            None,
-            {k for keys in owners.values() for k in keys},
-            "a split request must never file its slots under the default namespace",
-        )
-        self.assertEqual(
-            {s: k for s, k in owners.items() if len(k) > 1}, {}, "no slot has two owners"
-        )
-        freed = set(allocator.freed) - freed_before
-        self.assertEqual(freed & set(owners), set(), "no tree-owned slot was freed")
-        self.assertEqual(freed, {300}, "only its own freshly computed slot goes back")
-
-    def test_blocks_are_inserted_in_their_own_namespaces(self):
-        cache, pool, _ = make_cache()
-        req = make_req("r1", [[1, 2, 3], [4, 5]], [SYS_KEY, MSG_KEY])
-        prefill(cache, pool, req, first_slot=100)
-
-        sys_hit = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey([1, 2, 3], SYS_KEY))
-        )
-        msg_hit = cache.match_prefix(MatchPrefixParams(key=RadixKey([4, 5], MSG_KEY)))
-        self.assertEqual(len(sys_hit.device_indices), 3)
-        self.assertEqual(len(msg_hit.device_indices), 2)
-        # Same tokens, no namespace: a different tree, still empty.
-        plain = cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 3], None)))
-        self.assertEqual(len(plain.device_indices), 0)
-
-    def test_second_request_reuses_both_blocks(self):
-        cache, pool, _ = make_cache()
-        first = make_req("r1", [[1, 2, 3], [4, 5]], [SYS_KEY, MSG_KEY])
-        prefill(cache, pool, first, first_slot=100)
-        decode_and_finish(cache, pool, first, [9], first_slot=200)
-
-        second = make_req("r2", [[1, 2, 3], [4, 5]], [SYS_KEY, MSG_KEY], req_pool_idx=1)
-        second.init_next_round_input(cache)
-        # input_len - 1 keeps at least one token to compute.
-        self.assertEqual(len(second.prefix_indices), 4)
-        self.assertEqual(second.sub_context_match_lens, [3, 2])
-        second.release_sub_context_match_locks(cache)
-
-    def test_generated_tokens_extend_the_last_namespace(self):
-        """The reply becomes part of next turn's message block, so cache it."""
-        cache, pool, allocator = make_cache()
-        first = make_req("r1", [[1, 2, 3], [4, 5]], [SYS_KEY, MSG_KEY])
-        prefill(cache, pool, first, first_slot=100)
-        decode_and_finish(cache, pool, first, [6, 7], first_slot=200)
-
-        # The generated slots were handed to the tree, not freed.
-        self.assertEqual(allocator.freed, [])
-        extended = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey([4, 5, 6, 7], MSG_KEY))
-        )
-        self.assertEqual(len(extended.device_indices), 4)
-        self.assertEqual(extended.device_indices.tolist(), [103, 104, 200, 201])
-        # The head namespace is untouched by the continuation.
-        self.assertEqual(
-            len(
-                cache.match_prefix(
-                    MatchPrefixParams(key=RadixKey([1, 2, 3], SYS_KEY))
-                ).device_indices
-            ),
-            3,
-        )
-        # Nothing stays locked once the request is done.
-        self.assertEqual(cache.protected_size(), 0)
-
-    def test_next_turn_hits_the_generated_tokens(self):
-        """Turn 2's message block starts with turn 1's reply -- it must hit."""
-        cache, pool, _ = make_cache()
-        first = make_req("r1", [[1, 2, 3], [4, 5]], [SYS_KEY, MSG_KEY])
-        prefill(cache, pool, first, first_slot=100)
-        decode_and_finish(cache, pool, first, [6, 7], first_slot=200)
-
-        # Next turn: same head, message block grew by the reply plus a new question.
-        second = make_req(
-            "r2", [[1, 2, 3], [4, 5, 6, 7, 8]], [SYS_KEY, MSG_KEY], req_pool_idx=1
-        )
-        second.init_next_round_input(cache)
-        self.assertEqual(second.sub_context_match_lens, [3, 4])
-        self.assertEqual(len(second.prefix_indices), 7)
-        self.assertEqual(
-            second.prefix_indices.tolist(), [100, 101, 102, 103, 104, 200, 201]
-        )
-        second.release_sub_context_match_locks(cache)
-
-    def test_output_caching_can_be_turned_off(self):
-        cache, pool, allocator = make_cache()
-        import sglang.srt.mem_cache.radix_cache as radix_cache_module
-
-        original = radix_cache_module.CACHE_SUBCONTEXT_OUTPUT
-        radix_cache_module.CACHE_SUBCONTEXT_OUTPUT = False
-        try:
-            req = make_req("r1", [[1, 2, 3], [4, 5]], [SYS_KEY, MSG_KEY])
-            prefill(cache, pool, req, first_slot=100)
-            decode_and_finish(cache, pool, req, [6, 7], first_slot=200)
-        finally:
-            radix_cache_module.CACHE_SUBCONTEXT_OUTPUT = original
-
-        self.assertEqual(allocator.freed, [200, 201])
-        self.assertEqual(
-            len(
-                cache.match_prefix(
-                    MatchPrefixParams(key=RadixKey([4, 5, 6, 7], MSG_KEY))
-                ).device_indices
-            ),
-            2,
-        )
-
-    def test_duplicate_continuation_is_freed_not_leaked(self):
-        """Two requests generating the same reply must not double-own slots."""
-        cache, pool, allocator = make_cache()
-        first = make_req("r1", [[1, 2, 3], [4, 5]], [SYS_KEY, MSG_KEY])
-        prefill(cache, pool, first, first_slot=100)
-        decode_and_finish(cache, pool, first, [6, 7], first_slot=200)
-
-        second = make_req("r2", [[1, 2, 3], [4, 5]], [SYS_KEY, MSG_KEY], req_pool_idx=1)
-        second.init_next_round_input(cache)
-        second.release_sub_context_match_locks(cache)
-        # Recompute the whole prompt on fresh slots, then generate the same reply.
-        n = len(second.origin_input_ids)
-        pool.req_to_token[1, :n] = torch.arange(300, 300 + n, dtype=torch.int64)
-        second.prefix_indices = torch.empty((0,), dtype=torch.int64)
-        second.cache_protected_len = 0
-        second.fill_ids = list(second.origin_input_ids)
-        cache.cache_unfinished_req(second)
-        allocator.freed.clear()
-        decode_and_finish(cache, pool, second, [6, 7], first_slot=400)
-
-        # The duplicated continuation slots go back to the pool; the tree keeps the
-        # first request's.
-        self.assertEqual(allocator.freed, [400, 401])
-        self.assertEqual(
-            cache.match_prefix(
-                MatchPrefixParams(key=RadixKey([4, 5, 6, 7], MSG_KEY))
-            ).device_indices.tolist(),
-            [103, 104, 200, 201],
-        )
-
-
-class TestReverseRotateInsert(unittest.TestCase):
-    """A block the namespace refused is rotated to the namespace's position and filed there at finish."""
-
-    TOOLS_KEY = "tools_key"
-
-    def _seed(self, rotator=None):
-        """Cache SYS[1,2,3]@0, TOOLS[7,8]@3, MSG[20,21]@5."""
-        cache, pool, allocator = make_cache(rotator=rotator)
-        first = make_req(
-            "r1", [[1, 2, 3], [7, 8], [20, 21]], [SYS_KEY, self.TOOLS_KEY, MSG_KEY]
-        )
-        prefill(cache, pool, first, first_slot=100)
-        decode_and_finish(cache, pool, first, [], first_slot=200)
-        return cache, pool, allocator
-
-    def _shifted(self):
-        """TOOLS[7,8] sits at offset 2 here, so the tree holds it one place later."""
-        return make_req(
-            "r2",
-            [[1, 2], [7, 8], [40, 41]],
-            [SYS_KEY, self.TOOLS_KEY, MSG_KEY],
-            req_pool_idx=1,
-        )
-
-    def _with_new_tail(self):
-        """TOOLS[7,8,30,31] at offset 2: [7,8] is the namespace's, [30,31] is new."""
-        return make_req(
-            "r2",
-            [[1, 2], [7, 8, 30, 31], [40, 41]],
-            [SYS_KEY, self.TOOLS_KEY, MSG_KEY],
-            req_pool_idx=1,
-        )
-
-    def test_a_full_duplicate_is_freed_not_rotated(self):
-        rotator = FakeRotator()
-        cache, pool, allocator = self._seed(rotator)
-        req = self._shifted()
-        prefill(cache, pool, req, first_slot=300)
-        # The write path still refuses it during prefill: the request is decoding over
-        # these slots, so nothing may move them yet.
-        self.assertEqual(req.sub_context_tree_owned, [True, False, True])
-        rotator.calls.clear()
-
-        decode_and_finish(cache, pool, req, [9], first_slot=400)
-
-        # The namespace holds all of [7,8]: rotating the copy back would only produce
-        # a duplicate, so the copy is freed as it is and nothing counts as re-filed.
-        self.assertEqual(rotator.calls, [])
-        self.assertEqual(req.sub_context_reinserted, 0)
-        self.assertEqual(cache.sub_context_reinserted_tokens, 0)
-        self.assertIn(900, allocator.freed)
-        self.assertIn(901, allocator.freed)
-
-    def test_the_reply_is_cached_once_the_hole_is_closed(self):
-        rotator = FakeRotator()
-        cache, pool, allocator = self._seed(rotator)
-        req = self._shifted()
-        prefill(cache, pool, req, first_slot=300)
-        decode_and_finish(cache, pool, req, [9], first_slot=400)
-
-        # MSG is the last block, so the reply extends its namespace -- which the gate
-        # only allows because the re-file left no block un-owned.
-        extended = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey([40, 41, 9], MSG_KEY))
-        )
-        self.assertEqual(extended.device_indices.tolist(), [304, 305, 400])
-
-    def test_the_namespace_keeps_one_position(self):
-        """The re-filed block must read back at the first writer's position."""
-        rotator = FakeRotator()
-        cache, pool, allocator = self._seed(rotator)
-        req = self._shifted()
-        prefill(cache, pool, req, first_slot=300)
-        decode_and_finish(cache, pool, req, [9], first_slot=400)
-
-        m = cache.match_prefix(MatchPrefixParams(key=RadixKey([7, 8], self.TOOLS_KEY)))
-        self.assertEqual(cache.matched_canonical_position(m.last_device_node, 2), 3)
-        # A full duplicate: the tree keeps its own copy and the re-file gave back the
-        # rotated one it no longer needs.
-        self.assertEqual(m.device_indices.tolist(), [103, 104])
-        self.assertIn(900, allocator.freed)
-        self.assertIn(901, allocator.freed)
-
-    def test_a_new_tail_reaches_the_tree(self):
-        """The payoff case: the request's block runs past what the namespace holds."""
-        rotator = FakeRotator()
-        cache, pool, allocator = self._seed(rotator)
-        req = self._with_new_tail()
-        prefill(cache, pool, req, first_slot=300)
-        rotator.calls.clear()
-        decode_and_finish(cache, pool, req, [], first_slot=400)
-
-        # `canonical - offset` = 3 - 2, the read path's rotation run backwards, and in
-        # place: source and destination are the same slots.
-        self.assertEqual(
-            rotator.calls, [([900, 901, 304, 305], [900, 901, 304, 305], 1)]
-        )
-        self.assertEqual(req.sub_context_reinserted, 4)
-
-        # [7,8] was already there at 3; [30,31] is new and lands right after it.
-        m = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey([7, 8, 30, 31], self.TOOLS_KEY))
-        )
-        self.assertEqual(len(m.device_indices), 4)
-        self.assertEqual(cache.matched_canonical_position(m.last_device_node, 4), 3)
-
-    def _declined_block_with_shared_head(self):
-        """A block the write path declined whose head is the tree's own slots.
-
-        Returns the pieces both regressions need, with the request stitched, written to
-        req_to_token, and through `cache_unfinished_req`.
-        """
-        rotator = FakeRotator()
-        cache, pool, allocator = make_cache(rotator=rotator)
-        first = make_req("r1", [[1, 2, 3], [90, 91, 92, 93]], [SYS_KEY, MSG_KEY])
-        prefill(cache, pool, first, first_slot=100)
-        decode_and_finish(cache, pool, first, [], first_slot=200)
-
-        # Same offset, so the stitch reuses the tree's slots for the block's head.
-        second = make_req(
-            "r2", [[1, 2, 3], [90, 91, 92, 93]], [SYS_KEY, MSG_KEY], req_pool_idx=1
-        )
-        second.init_next_round_input(cache)
-        n = len(second.origin_input_ids)
-        reused = len(second.prefix_indices)
-        pool.req_to_token[1, :reused] = second.prefix_indices
-        pool.req_to_token[1, reused:n] = torch.arange(
-            300, 300 + n - reused, dtype=torch.int64
-        )
-        second.sub_context_rotated_slots = None
-        second.fill_ids = list(second.origin_input_ids)
-        tree_slots = pool.req_to_token[1, 3:6].tolist()
-
-        # Another writer moves the namespace between the match and the insert, which is
-        # what makes the block get declined even though its head is the tree's.
-        node = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey([90, 91, 92, 93], MSG_KEY))
-        ).last_device_node
-        node.canonical_position = 99
-        cache.cache_unfinished_req(second)
-        self.assertEqual(second.sub_context_tree_owned, [True, False])
-        return cache, pool, allocator, rotator, second, tree_slots
-
-    def test_a_tree_reused_head_is_never_handed_back(self):
-        """Finishing a declined block does not free the tree's slots at its head."""
-        cache, pool, allocator, _rot, second, tree_slots = (
-            self._declined_block_with_shared_head()
-        )
-        allocator.freed.clear()
-        decode_and_finish(cache, pool, second, [9], first_slot=400)
-        self.assertEqual(
-            [s for s in tree_slots if s in allocator.freed],
-            [],
-            "handed the tree's own slots back to the pool",
-        )
-
-    def test_a_tree_held_slot_is_kept_wherever_it_sits(self):
-        """Tree-held slots are kept even when they do not start at the block's offset
-        (the overlap is compared per position, not as a leading run).
-        """
-        cache, pool, allocator, _rot, second, tree_slots = (
-            self._declined_block_with_shared_head()
-        )
-        pool.req_to_token[1, 3] = 999  # first slot of the block no longer the tree's
-        still_the_trees = pool.req_to_token[1, 4:6].tolist()
-
-        allocator.freed.clear()
-        decode_and_finish(cache, pool, second, [9], first_slot=400)
-        self.assertEqual(
-            [s for s in still_the_trees if s in allocator.freed],
-            [],
-            "a leading-run test missed slots the tree holds behind a diverged head",
-        )
-        self.assertIn(999, allocator.freed, "this request's own slot was not freed")
-
-    def test_a_shared_head_is_never_rotated_in_place(self):
-        """A declined block holding any of a node's slots is never rotated in place."""
-        cache, pool, allocator, rotator, second, tree_slots = (
-            self._declined_block_with_shared_head()
-        )
-        rotator.calls.clear()
-        decode_and_finish(cache, pool, second, [9], first_slot=400)
-
-        touched = [
-            (src, delta)
-            for src, _dst, delta in rotator.calls
-            if delta and set(src) & set(tree_slots)
-        ]
-        self.assertEqual(touched, [], "rotated KV the tree still owns")
-        # And the block stays out of the tree rather than being filed half-rotated.
-        self.assertEqual(second.sub_context_reinserted, 0)
-
-    def test_an_unrotatable_delta_keeps_the_old_behaviour(self):
-        rotator = FakeRotator()
-        cache, pool, allocator = self._seed(rotator)
-        req = self._with_new_tail()  # filing the new tail needs a rotation
-        prefill(cache, pool, req, first_slot=300)  # the read path rotates into 900,901
-        cache.kv_rotator = FakeRotator(max_delta=0)  # ...but the re-file cannot
-        allocator.freed.clear()
-        decode_and_finish(cache, pool, req, [9], first_slot=400)
-
-        self.assertEqual(req.sub_context_reinserted, 0)
-        # The block stays this request's to free, and the reply is dropped as before.
-        self.assertEqual(sorted(allocator.freed), [304, 305, 400, 900, 901])
-        self.assertEqual(
-            len(
-                cache.match_prefix(
-                    MatchPrefixParams(key=RadixKey([40, 41, 9], MSG_KEY))
-                ).device_indices
-            ),
-            2,  # the block, not the reply
-        )
-
-    def test_without_a_rotator_nothing_is_refiled(self):
-        """The plain ON arm must behave exactly as it did before this existed."""
-        cache, pool, allocator = self._seed(rotator=None)
-        req = self._shifted()
-        prefill(cache, pool, req, first_slot=300)
-        allocator.freed.clear()
-        decode_and_finish(cache, pool, req, [9], first_slot=400)
-
-        self.assertEqual(req.sub_context_reinserted, 0)
-        self.assertEqual(cache.sub_context_reinserted_tokens, 0)
-        # Nothing was rotated on the read path either, so [7,8] was recomputed at 302.
-        self.assertEqual(sorted(allocator.freed), [302, 303, 400])
+        m = cache.match_prefix(MatchPrefixParams(key=RadixKey([7, 8])))
+        self.assertEqual(m.last_device_node.canonical_position, 0)
+        tail = cache.match_prefix(MatchPrefixParams(key=RadixKey([7, 8, 9])))
+        self.assertEqual(tail.last_device_node.canonical_position, 2)
 
 
 class TestSubContextTruncation(unittest.TestCase):
@@ -1008,171 +247,32 @@ class TestSubContextTruncation(unittest.TestCase):
         self.clip = _clip_sub_contexts_to_input
 
     def test_untouched_prompt_is_passed_through(self):
-        ids, keys = self.clip([[1, 2], [3, 4]], [SYS_KEY, MSG_KEY], 4, "r")
-        self.assertEqual(ids, [[1, 2], [3, 4]])
-        self.assertEqual(keys, [SYS_KEY, MSG_KEY])
+        self.assertEqual(self.clip([[1, 2], [3, 4]], 4, "r"), [[1, 2], [3, 4]])
 
     def test_trailing_block_is_clipped(self):
-        ids, keys = self.clip([[1, 2], [3, 4]], [SYS_KEY, MSG_KEY], 3, "r")
-        self.assertEqual(ids, [[1, 2], [3]])
-        self.assertEqual(keys, [SYS_KEY, MSG_KEY])
-        self.assertEqual(sum(len(s) for s in ids), 3)
+        self.assertEqual(self.clip([[1, 2], [3, 4]], 3, "r"), [[1, 2], [3]])
 
     def test_blocks_past_the_cut_are_dropped(self):
-        ids, keys = self.clip([[1, 2], [3, 4]], [SYS_KEY, MSG_KEY], 2, "r")
-        self.assertEqual(ids, [[1, 2]])
-        self.assertEqual(keys, [SYS_KEY])
+        self.assertEqual(self.clip([[1, 2], [3, 4]], 2, "r"), [[1, 2]])
 
     def test_split_is_dropped_when_nothing_is_left(self):
-        ids, keys = self.clip([[1, 2], [3, 4]], [SYS_KEY, MSG_KEY], 0, "r")
-        self.assertIsNone(ids)
-        self.assertIsNone(keys)
+        self.assertIsNone(self.clip([[1, 2], [3, 4]], 0, "r"))
 
     def test_blocks_shorter_than_the_prompt_drop_the_split(self):
-        ids, keys = self.clip([[1, 2]], [SYS_KEY], 5, "r")
-        self.assertIsNone(ids)
-        self.assertIsNone(keys)
-
-
-class TestContentAddressedNamespaces(unittest.TestCase):
-    """Namespaces named by a block's tokens instead of by its role."""
-
-    def setUp(self):
-        self._saved = subctx_config.HASH_SUBCONTEXT_KEYS
-
-    def tearDown(self):
-        subctx_config.HASH_SUBCONTEXT_KEYS = self._saved
-
-    def test_role_names_are_replaced_by_the_block_contents(self):
-        subctx_config.HASH_SUBCONTEXT_KEYS = True
-        blocks = [[1, 2, 3], [7, 8, 9]]
-        req = make_req("r1", blocks, [SYS_KEY, MSG_KEY])
-
-        self.assertNotIn(SYS_KEY, req.sub_context_extra_keys)
-        self.assertNotIn(MSG_KEY, req.sub_context_extra_keys)
-        self.assertEqual(
-            req.sub_context_extra_keys,
-            [sub_context_chunk_id(block, None) for block in blocks],
-        )
-
-        # The same tokens in another request are the same namespace -- that is what
-        # makes a block found at all -- and different tokens never are.
-        same = make_req("r2", [[1, 2, 3], [4, 5, 6]], [SYS_KEY, MSG_KEY])
-        self.assertEqual(same.sub_context_extra_keys[0], req.sub_context_extra_keys[0])
-        self.assertNotEqual(same.sub_context_extra_keys[1], req.sub_context_extra_keys[1])
-
-    def test_the_adapter_reaches_the_block_keys(self):
-        """``extra_key`` (cache_salt + lora_id) is part of every block's namespace."""
-        subctx_config.HASH_SUBCONTEXT_KEYS = True
-        blocks = [[1, 2, 3], [7, 8, 9]]
-        plain = make_req("r1", blocks, [SYS_KEY, MSG_KEY])
-        salted = Req(
-            rid="r2",
-            origin_input_text="",
-            origin_input_ids=[tok for b in blocks for tok in b],
-            sampling_params=SamplingParams(max_new_tokens=8),
-            sub_context_ids=blocks,
-            sub_context_extra_keys=[SYS_KEY, MSG_KEY],
-            lora_id="adapter-a",
-        )
-        self.assertNotEqual(plain.sub_context_extra_keys, salted.sub_context_extra_keys)
-
-    def test_a_block_that_grew_is_no_longer_frozen_out(self):
-        """A tail that grew and moved is a new namespace, so it is inserted rather than
-        refused for the old one's position.
-        """
-        first_blocks = [[1, 2, 3, 4, 5, 6], [50, 51, 52, 53]]
-        grown_blocks = [[1, 2, 3, 4], [50, 51, 52, 53, 54, 55]]
-
-        def run(hashed):
-            subctx_config.HASH_SUBCONTEXT_KEYS = hashed
-            cache, pool, _ = make_cache()
-            first = make_req("r1", first_blocks, [SYS_KEY, MSG_KEY])
-            prefill(cache, pool, first, first_slot=100)
-            decode_and_finish(cache, pool, first, [], first_slot=200)
-            second = make_req("r2", grown_blocks, [SYS_KEY, MSG_KEY], req_pool_idx=1)
-            prefill(cache, pool, second, first_slot=300)
-            return second.sub_context_tree_owned
-
-        self.assertEqual(run(hashed=False)[1], False)
-        self.assertEqual(run(hashed=True)[1], True)
-
-
-
-class TestScanCeiling(unittest.TestCase):
-    """Dry run: what a content scan finds beyond the stitched prefix, with nothing changed."""
-
-    def setUp(self):
-        self._saved = (subctx_config.HASH_SUBCONTEXT_KEYS, subctx_config.INDEX_DRYRUN)
-        subctx_config.HASH_SUBCONTEXT_KEYS = True
-        subctx_config.INDEX_DRYRUN = True
-
-    def tearDown(self):
-        subctx_config.HASH_SUBCONTEXT_KEYS, subctx_config.INDEX_DRYRUN = self._saved
-
-    def test_a_block_behind_a_miss_is_found_but_unreachable(self):
-        head = [1, 2, 3, 4, 5, 6]
-        other_head = [101, 102, 103, 104]
-        block = list(range(500, 540))
-
-        cache, pool, _ = make_cache()
-        cache.sub_context_index = SubContextIndex(min_chunk_tokens=32)
-
-        first = make_req("r1", [head, block], [SYS_KEY, MSG_KEY])
-        prefill(cache, pool, first, first_slot=100)
-        decode_and_finish(cache, pool, first, [], first_slot=300)
-        # The head is below the minimum worth reusing; only the block is indexed.
-        self.assertEqual(len(cache.sub_context_index), 1)
-
-        second = make_req("r2", [other_head, block], [SYS_KEY, MSG_KEY], req_pool_idx=1)
-        second.init_next_round_input(cache)
-        self.addCleanup(second.release_sub_context_match_locks, cache)
-
-        index = cache.sub_context_index
-        # Contiguity broke on the first block, so the stitch reached nothing at all --
-        # and the block behind it is cached, findable, and 2 tokens from where it was
-        # computed.
-        self.assertEqual(len(second.prefix_indices), 0)
-        self.assertEqual(index.found_tokens, len(block))
-        self.assertEqual(index.resident_tokens, len(block))
-        self.assertEqual(index.displaced_tokens, len(block))
-        self.assertEqual(index.beyond_stitch_tokens, len(block))
-
-    def test_an_evicted_block_is_found_but_not_counted(self):
-        """A scan hit whose KV is gone buys nothing, and counting it would overstate
-        the ceiling -- so every hit is looked up for real before it is tallied."""
-        head = [1, 2, 3, 4, 5, 6]
-        block = list(range(500, 540))
-
-        cache, pool, _ = make_cache()
-        cache.sub_context_index = SubContextIndex(min_chunk_tokens=32)
-        first = make_req("r1", [head, block], [SYS_KEY, MSG_KEY])
-        prefill(cache, pool, first, first_slot=100)
-        decode_and_finish(cache, pool, first, [], first_slot=300)
-
-        cache.evict(EvictParams(num_tokens=10**6))
-        # Eviction told the index, so the chunk is not even scanned for any more.
-        self.assertEqual(len(cache.sub_context_index), 0)
-
-        second = make_req("r2", [[101, 102], block], [SYS_KEY, MSG_KEY], req_pool_idx=1)
-        second.init_next_round_input(cache)
-        self.addCleanup(second.release_sub_context_match_locks, cache)
-        self.assertEqual(cache.sub_context_index.resident_tokens, 0)
-        self.assertEqual(cache.sub_context_index.beyond_stitch_tokens, 0)
-
+        self.assertIsNone(self.clip([[1, 2]], 5, "r"))
 
 
 def tree_slot_owners(cache):
-    """Every slot the tree holds, and the namespaces that hold it."""
+    """Every slot the tree holds, and the ``extra_key`` scopes that hold it."""
     owners = {}
     stack = [(child, key[0] if isinstance(key, tuple) else None)
              for key, child in cache.root_node.children.items()]
     while stack:
-        node, namespace = stack.pop()
+        node, scope = stack.pop()
         for slot in node.value.tolist():
-            owners.setdefault(slot, set()).add(namespace)
+            owners.setdefault(slot, set()).add(scope)
         for key, child in node.children.items():
-            stack.append((child, namespace))
+            stack.append((child, scope))
     return owners
 
 
@@ -1215,8 +315,8 @@ def chain_slots(cache, ids, extra_key=None):
 
 
 class TestChainedIndex(unittest.TestCase):
-    """Index arms: a request is matched and stored as one chain like a plain request;
-    the index records where each registered chunk sits in the tree."""
+    """A request is matched and stored as one chain like a plain request; the index
+    records where each registered chunk sits in the tree."""
 
     HEAD_A = list(range(1, 41))
     HEAD_B = list(range(900, 910))
@@ -1225,20 +325,10 @@ class TestChainedIndex(unittest.TestCase):
     MORE = list(range(700, 740))
 
     def setUp(self):
-        self._saved = (
-            subctx_config.HASH_SUBCONTEXT_KEYS,
-            subctx_config.INDEX_SUBCONTEXTS,
-            subctx_config.TOPK_RATIOS,
-        )
-        subctx_config.HASH_SUBCONTEXT_KEYS = True
-        subctx_config.INDEX_SUBCONTEXTS = True
+        self._saved_ratios = subctx_config.TOPK_RATIOS
 
     def tearDown(self):
-        (
-            subctx_config.HASH_SUBCONTEXT_KEYS,
-            subctx_config.INDEX_SUBCONTEXTS,
-            subctx_config.TOPK_RATIOS,
-        ) = self._saved
+        subctx_config.TOPK_RATIOS = self._saved_ratios
 
     def _cache(self):
         cache, pool, allocator = make_cache(rotator=FakeRotator())
@@ -1248,13 +338,13 @@ class TestChainedIndex(unittest.TestCase):
 
     def _seeded(self, first_blocks, output=()):
         cache, pool, allocator = self._cache()
-        first = make_req("r1", first_blocks, [SYS_KEY, MSG_KEY])
+        first = make_req("r1", first_blocks)
         prefill_chained(cache, pool, first, first_slot=100)
         decode_and_finish(cache, pool, first, list(output), first_slot=400)
         return cache, pool, allocator
 
     def _cid(self, ids, extra_key=None):
-        return sub_context_chunk_id(ids, extra_key)
+        return chunk_id(ids, extra_key)
 
     def test_a_request_is_stored_as_one_chain_with_its_blocks_located(self):
         cache, _, _ = self._seeded([self.HEAD_A, self.TAIL])
@@ -1272,7 +362,7 @@ class TestChainedIndex(unittest.TestCase):
 
     def test_a_block_behind_a_miss_is_copied_rotated_and_computed_around(self):
         cache, _, _ = self._seeded([self.HEAD_A, self.TAIL])
-        second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        second = make_req("r2", [self.HEAD_B, self.TAIL], req_pool_idx=1)
         second.init_next_round_input(cache)
         self.addCleanup(second.release_sub_context_rotated_slots, cache)
         self.addCleanup(second.release_sub_context_match_locks, cache)
@@ -1295,7 +385,7 @@ class TestChainedIndex(unittest.TestCase):
         cache, _, _ = self._seeded([self.HEAD_A, self.TAIL])
         subctx_config.TOPK_RATIOS = (0.5,)
         second = make_req(
-            "r2", [self.HEAD_A, self.MORE + self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1
+            "r2", [self.HEAD_A, self.MORE + self.TAIL], req_pool_idx=1
         )
         second.init_next_round_input(cache)
         self.addCleanup(second.release_sub_context_rotated_slots, cache)
@@ -1314,7 +404,7 @@ class TestChainedIndex(unittest.TestCase):
     def test_a_grown_conversation_is_a_plain_prefix_hit(self):
         cache, _, allocator = self._seeded([self.HEAD_A, self.TAIL])
         grown = make_req(
-            "r2", [self.HEAD_A, self.TAIL + self.MORE], [SYS_KEY, MSG_KEY], req_pool_idx=1
+            "r2", [self.HEAD_A, self.TAIL + self.MORE], req_pool_idx=1
         )
         grown.init_next_round_input(cache)
 
@@ -1326,7 +416,7 @@ class TestChainedIndex(unittest.TestCase):
 
     def test_a_run_at_its_own_position_on_another_chain_is_copied(self):
         cache, pool, allocator = self._seeded([self.HEAD_A, self.TAIL])
-        second = make_req("r2", [self.HEAD_C, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        second = make_req("r2", [self.HEAD_C, self.TAIL], req_pool_idx=1)
         prefill_chained(cache, pool, second, first_slot=5000)
         decode_and_finish(cache, pool, second, [], first_slot=6000)
 
@@ -1343,7 +433,7 @@ class TestChainedIndex(unittest.TestCase):
     def test_a_chunk_is_read_at_its_oldest_location_then_the_next(self):
         """Copies keep the first location ahead; once it is evicted the next one serves."""
         cache, pool, _ = self._seeded([self.HEAD_A, self.TAIL])
-        second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        second = make_req("r2", [self.HEAD_B, self.TAIL], req_pool_idx=1)
         prefill_chained(cache, pool, second, first_slot=5000)
         decode_and_finish(cache, pool, second, [], first_slot=6000)
 
@@ -1369,7 +459,7 @@ class TestChainedIndex(unittest.TestCase):
         running, later matches take the prefix only."""
         cache, _, allocator = self._seeded([self.HEAD_A, self.TAIL])
         second = make_req(
-            "r2", [self.HEAD_A, self.MORE + self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1
+            "r2", [self.HEAD_A, self.MORE + self.TAIL], req_pool_idx=1
         )
         second.init_next_round_input(cache)
         copies = second.sub_context_layout[1][2].tolist()
@@ -1400,7 +490,7 @@ class TestChainedIndex(unittest.TestCase):
         self.assertEqual(len(cache.sub_context_index), 0)
         self.assertEqual(cache._chunks_at, {})
 
-        second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        second = make_req("r2", [self.HEAD_B, self.TAIL], req_pool_idx=1)
         second.init_next_round_input(cache)
         self.assertIsNone(second.sub_context_layout)
 
@@ -1430,7 +520,7 @@ class TestChainedIndex(unittest.TestCase):
         self.assertEqual(slots.tolist(), list(range(140, 180)) + list(range(400, 440)))
 
         second = make_req(
-            "r2", [self.HEAD_B, self.TAIL + self.MORE + [7, 7]], [SYS_KEY, MSG_KEY],
+            "r2", [self.HEAD_B, self.TAIL + self.MORE + [7, 7]],
             req_pool_idx=1,
         )
         second.init_next_round_input(cache)
@@ -1443,7 +533,7 @@ class TestChainedIndex(unittest.TestCase):
         """Known before copying: nothing is locked or copied."""
         cache, _, allocator = self._seeded([self.HEAD_A, self.TAIL])
         second = make_req(
-            "r2", [self.HEAD_A, self.MORE + self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1
+            "r2", [self.HEAD_A, self.MORE + self.TAIL], req_pool_idx=1
         )
         second._fits_one_pass = lambda to_compute: False
         second.init_next_round_input(cache)
@@ -1462,7 +552,7 @@ class TestChainedIndex(unittest.TestCase):
         """The check after copying: the copies made go back."""
         cache, _, allocator = self._seeded([self.HEAD_A, self.TAIL])
         second = make_req(
-            "r2", [self.HEAD_A, self.MORE + self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1
+            "r2", [self.HEAD_A, self.MORE + self.TAIL], req_pool_idx=1
         )
         second._sub_context_layout_fits_one_pass = lambda: False
         second.init_next_round_input(cache)
@@ -1479,22 +569,51 @@ class TestChainedIndex(unittest.TestCase):
         cache, pool, allocator = make_cache(rotator=FakeRotator(max_delta=5))
         wide_pool(pool)
         cache.sub_context_index = SubContextIndex(min_chunk_tokens=32)
-        first = make_req("r1", [self.HEAD_A, self.TAIL], [SYS_KEY, MSG_KEY])
+        first = make_req("r1", [self.HEAD_A, self.TAIL])
         prefill_chained(cache, pool, first, first_slot=100)
         decode_and_finish(cache, pool, first, [], first_slot=400)
 
-        second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        second = make_req("r2", [self.HEAD_B, self.TAIL], req_pool_idx=1)
         second.init_next_round_input(cache)
         self.assertIsNone(second.sub_context_layout)
         self.assertEqual(cache.protected_size(), 0)
         self.assertEqual(allocator.allocated, [])
         self.assertEqual((second.sub_context_moved, second.sub_context_discarded), (39, 39))
 
+    def test_a_request_finishing_at_prefill_is_stored_and_registered(self):
+        """No cache_unfinished_req pass: the finish stores the chain and registers every
+        block but the last, which is stored with the reply."""
+        cache, pool, _ = self._cache()
+        gen = [9, 9, 9]
+        first = make_req("r1", [self.HEAD_A, self.TAIL, gen])
+        first.init_next_round_input(cache)
+        cache.inc_lock_ref(first.last_node)
+        n = len(first.fill_ids)
+        pool.req_to_token[0, :n] = torch.arange(100, 100 + n, dtype=torch.int64)
+        first.sub_context_rotated_slots = None
+        first.output_ids = [7]
+        pool.req_to_token[0, n] = 400
+        first.kv_committed_len = n + 1
+        cache.cache_finished_req(first)
+
+        self.assertEqual(
+            chain_slots(cache, self.HEAD_A + self.TAIL + gen + [7]),
+            list(range(100, 183)) + [400],
+        )
+        self.assertIsNotNone(cache.chain_chunk_slots(self._cid(self.TAIL)))
+        self.assertEqual(cache.protected_size(), 0)
+
+        second = make_req("r2", [self.HEAD_B, self.TAIL, gen], req_pool_idx=1)
+        second.init_next_round_input(cache)
+        self.addCleanup(second.release_sub_context_rotated_slots, cache)
+        self.addCleanup(second.release_sub_context_match_locks, cache)
+        self.assertEqual([(s, e) for s, e, _ in second.sub_context_layout], [(10, 50)])
+
     def test_a_request_is_counted_once(self):
         """Matched again after it ran (a retraction): the tallies do not grow."""
         cache, _, _ = self._seeded([self.HEAD_A, self.TAIL])
         index = cache.sub_context_index
-        second = make_req("r2", [self.HEAD_B, self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1)
+        second = make_req("r2", [self.HEAD_B, self.TAIL], req_pool_idx=1)
         second.init_next_round_input(cache)
         self.addCleanup(second.release_sub_context_rotated_slots, cache)
         self.addCleanup(second.release_sub_context_match_locks, cache)
@@ -1517,7 +636,7 @@ class TestChainedIndex(unittest.TestCase):
             rid="r1", origin_input_text="", origin_input_ids=ids,
             sampling_params=SamplingParams(max_new_tokens=8),
             sub_context_ids=[self.HEAD_A, self.TAIL],
-            sub_context_extra_keys=[SYS_KEY, MSG_KEY], extra_key="salt-a",
+            extra_key="salt-a",
         )
         first.req_pool_idx = 0
         prefill_chained(cache, pool, first, first_slot=100)
@@ -1529,7 +648,7 @@ class TestChainedIndex(unittest.TestCase):
             origin_input_ids=self.HEAD_B + self.TAIL,
             sampling_params=SamplingParams(max_new_tokens=8),
             sub_context_ids=[self.HEAD_B, self.TAIL],
-            sub_context_extra_keys=[SYS_KEY, MSG_KEY], extra_key="salt-b",
+            extra_key="salt-b",
         )
         second.req_pool_idx = 1
         second.init_next_round_input(cache)
@@ -1542,7 +661,7 @@ class TestChainedIndex(unittest.TestCase):
 
         cache, pool, allocator = self._seeded([self.HEAD_A, self.TAIL])
         second = make_req(
-            "r2", [self.HEAD_A, self.MORE + self.TAIL], [SYS_KEY, MSG_KEY], req_pool_idx=1
+            "r2", [self.HEAD_A, self.MORE + self.TAIL], req_pool_idx=1
         )
         prefill_chained(cache, pool, second, first_slot=5000)
         self.assertIsNone(second.sub_context_match_nodes)
@@ -1553,68 +672,6 @@ class TestChainedIndex(unittest.TestCase):
         owners = tree_slot_owners(cache)
         self.assertEqual(held - set(owners) - set(allocator.freed), set(), "lost slots")
         self.assertEqual(held & set(owners) & set(allocator.freed), set(), "freed but held")
-
-
-class TestRetractedRequest(unittest.TestCase):
-    """A retracted request re-enters prefill with its generated tokens in fill_ids.
-
-    `init_next_round_input` sets ``fill_ids = origin_input_ids + output_ids``, longer
-    than the prompt the split describes. The read path still stitches per namespace, so
-    the request holds the namespaces' own slots.
-    """
-
-    def _retracted(self, cache, pool):
-        first = make_req("r1", [[1, 2, 3], [40, 41]], [SYS_KEY, MSG_KEY])
-        prefill(cache, pool, first, first_slot=100)
-        decode_and_finish(cache, pool, first, [], first_slot=200)
-
-        second = make_req(
-            "r2", [[1, 2, 3], [40, 41]], [SYS_KEY, MSG_KEY], req_pool_idx=1
-        )
-        second.output_ids = [9]  # retracted after generating one token
-        second.init_next_round_input(cache)
-        n = len(second.origin_input_ids)
-        reused = len(second.prefix_indices)
-        pool.req_to_token[1, :reused] = second.prefix_indices
-        pool.req_to_token[1, reused : n + 1] = torch.arange(
-            300, 300 + n + 1 - reused, dtype=torch.int64
-        )
-        second.sub_context_rotated_slots = None
-        self.assertGreater(len(second.fill_ids), n, "not the retracted shape")
-        self.assertGreater(reused, 0, "the stitch reused nothing; nothing to protect")
-        return second
-
-    def _namespace_slots(self, cache):
-        slots = set()
-        for key, ids in ((SYS_KEY, [1, 2, 3]), (MSG_KEY, [40, 41])):
-            slots.update(
-                cache.match_prefix(
-                    MatchPrefixParams(key=RadixKey(ids, key))
-                ).device_indices.tolist()
-            )
-        return slots
-
-    def test_a_namespace_slot_never_gets_a_second_owner(self):
-        """The write path inserts into the namespaces, never also into the default namespace."""
-        cache, pool, allocator = make_cache()
-        second = self._retracted(cache, pool)
-        cache.cache_unfinished_req(second)
-
-        default = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(list(second.fill_ids), None))
-        ).device_indices.tolist()
-        self.assertEqual(
-            sorted(self._namespace_slots(cache) & set(default)),
-            [],
-            "namespace slots filed under the default namespace as well",
-        )
-
-    def test_it_still_reaches_the_audited_finish_path(self):
-        """...and the per-namespace insert ran, setting `sub_context_last_nodes`."""
-        cache, pool, allocator = make_cache()
-        second = self._retracted(cache, pool)
-        cache.cache_unfinished_req(second)
-        self.assertIsNotNone(second.sub_context_last_nodes)
 
 
 if __name__ == "__main__":

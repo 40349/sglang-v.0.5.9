@@ -603,7 +603,7 @@ async def server_info():
         del _global_state.tokenizer_manager.server_args.model_config
 
     # The sub-context switches (env vars, so not in server_args), for remote clients
-    # to check which arm they reach.
+    # to check which arm they reach: off (split_enabled False) or cdc.
     from sglang.srt.mem_cache import radix_cache
     from sglang.srt.utils import subctx_config
 
@@ -614,16 +614,7 @@ async def server_info():
         "version": __version__,
         "sub_context": {
             "split_enabled": not subctx_config.DISABLE_SUBCONTEXT,
-            "rotate": subctx_config.ROTATE_SUBCONTEXT,
-            "rotate_across_recompute": subctx_config.ROTATE_ACROSS_RECOMPUTE,
-            "cache_output": subctx_config.CACHE_SUBCONTEXT_OUTPUT,
-            "hash_keys": subctx_config.hash_subcontext_keys(),
-            "index": subctx_config.INDEX_SUBCONTEXTS,
-            # Index arms store each request as one chain, with chunk locations.
-            "chain_storage": subctx_config.INDEX_SUBCONTEXTS,
-            "index_dryrun": subctx_config.INDEX_DRYRUN,
             "min_chunk": subctx_config.MIN_CHUNK_TOKENS,
-            "split_mode": subctx_config.SPLIT_MODE,
             "cdc_target": subctx_config.CDC_TARGET_TOKENS,
             "cdc_max": subctx_config.CDC_MAX_TOKENS,
             "topk_ratios": list(subctx_config.TOPK_RATIOS),
@@ -676,7 +667,6 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     # The sub-context split is internal to the OpenAI chat path; /generate is never split.
     obj.sub_context_ids = None
-    obj.sub_context_extra_keys = None
 
     if obj.stream:
 

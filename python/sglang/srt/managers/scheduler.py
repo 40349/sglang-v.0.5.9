@@ -750,7 +750,7 @@ class Scheduler(
     def _check_sub_context_support(self):
         """Refuse to launch when the split is on and the cache cannot serve it.
 
-        Then attach the rotator and the index if they are enabled.
+        Then attach the rotator and the index.
         """
         from sglang.srt.utils.subctx_config import (
             DISABLE_SUBCONTEXT,
@@ -764,21 +764,19 @@ class Scheduler(
             raise ValueError(
                 f"The sub-context split is enabled but cannot be served: {reason}. "
                 "Launch without that option, or set SGLANG_DISABLE_SUBCONTEXT=1 to run "
-                "the single-namespace baseline."
+                "the stock prefix cache."
             )
         self._init_sub_context_rotation()
         self._init_sub_context_index()
 
     def _init_sub_context_index(self):
-        """Attach the sub-context index (empty until blocks are inserted).
+        """Attach the sub-context index (empty until requests are stored).
 
-        Refuses to launch without the sparse prefill, selective-recompute support when
-        a ratio is set, or rotation.
+        Refuses to launch without the sparse prefill, or without selective-recompute
+        support when a ratio is set.
         """
         from sglang.srt.mem_cache.subctx_index import SubContextIndex
         from sglang.srt.utils.subctx_config import (
-            INDEX_DRYRUN,
-            INDEX_SUBCONTEXTS,
             MIN_CHUNK_TOKENS,
             TOPK_RATIOS,
             sparse_prefill_unsupported_reason,
@@ -787,25 +785,22 @@ class Scheduler(
             topk_unsupported_reason,
         )
 
-        if not (INDEX_SUBCONTEXTS or INDEX_DRYRUN):
-            return
-        if INDEX_SUBCONTEXTS and (
+        if (
             self.server_args.dllm_algorithm is not None
             or self.server_args.disaggregation_mode != "null"
         ):
             raise ValueError(
                 "The sub-context index is enabled with a diffusion LLM or with "
                 "prefill/decode disaggregation; neither scheduling path releases what "
-                "a refused request scanned. Unset SGLANG_SUBCTX_INDEX."
+                "a refused request scanned. Set SGLANG_DISABLE_SUBCONTEXT=1."
             )
-        if INDEX_SUBCONTEXTS:
-            reason = sparse_prefill_unsupported_reason(self.tp_worker.model_runner)
-            if reason is not None:
-                raise ValueError(
-                    "The sub-context index is enabled but its prefill cannot be "
-                    f"served: {reason}. Unset SGLANG_SUBCTX_INDEX, or set "
-                    "SGLANG_SUBCTX_INDEX_DRYRUN=1 to measure without it."
-                )
+        reason = sparse_prefill_unsupported_reason(self.tp_worker.model_runner)
+        if reason is not None:
+            raise ValueError(
+                "The sub-context index is enabled but its prefill cannot be "
+                f"served: {reason}. Set SGLANG_DISABLE_SUBCONTEXT=1 to run the stock "
+                "prefix cache."
+            )
         if topk_active():
             reason = topk_unsupported_reason(self.tp_worker.model_runner)
             if reason is not None:
@@ -813,26 +808,15 @@ class Scheduler(
                     "Selective recompute of reused tokens is enabled "
                     f"(SGLANG_SUBCTX_TOPK_RATIO={','.join(map(str, TOPK_RATIOS))}) but "
                     "cannot be served: "
-                    f"{reason}. Set SGLANG_SUBCTX_TOPK_RATIO=0 to reuse blocks whole, "
-                    "as the arm did before."
+                    f"{reason}. Set SGLANG_SUBCTX_TOPK_RATIO=0 to reuse chunks whole."
                 )
-        if self.tree_cache.kv_rotator is None:
-            raise ValueError(
-                "The sub-context index is enabled but KV rotation is not, so every "
-                "block found away from where it was computed would be dropped. Set "
-                "SGLANG_SUBCONTEXT_ROTATE=1, or unset SGLANG_SUBCTX_INDEX."
-            )
         self.tree_cache.sub_context_index = SubContextIndex(
             min_chunk_tokens=MIN_CHUNK_TOKENS
         )
         logger.info(
-            "Sub-context index ENABLED (min chunk %d tokens%s)%s",
+            "Sub-context index ENABLED (min chunk %d tokens, requests stored as prefix "
+            "chains)%s",
             self.tree_cache.sub_context_index.min_chunk_tokens,
-            (
-                ", dry run -- scanning and reporting only"
-                if INDEX_DRYRUN
-                else ", requests stored as prefix chains"
-            ),
             (
                 "; selective recompute of reused tokens: "
                 + ", ".join(
@@ -845,32 +829,28 @@ class Scheduler(
         )
 
     def _init_sub_context_rotation(self):
-        """Attach the KV rotator to the tree cache when rotation is enabled.
+        """Attach the KV rotator to the tree cache.
 
-        Raises if it is enabled but ``rotation_unsupported_reason`` refuses.
+        Raises if ``rotation_unsupported_reason`` refuses.
         """
         from sglang.srt.mem_cache.rotate_kv import KVRotator, find_rotary_embedding
         from sglang.srt.utils.subctx_config import (
-            ROTATE_ACROSS_RECOMPUTE,
             ROTATE_NATIVE,
-            ROTATE_SUBCONTEXT,
             rotation_unsupported_reason,
         )
 
-        if not (ROTATE_SUBCONTEXT or ROTATE_ACROSS_RECOMPUTE):
-            return
         if self.server_args.enable_pdmux:
             raise ValueError(
                 "Sub-context KV rotation is enabled with PD multiplexing, whose "
                 "forwards run on their own streams; the copies would not be ordered "
-                "after them. Unset SGLANG_SUBCONTEXT_ROTATE or --enable-pdmux."
+                "after them. Set SGLANG_DISABLE_SUBCONTEXT=1 or drop --enable-pdmux."
             )
         model_runner = self.tp_worker.model_runner
         reason = rotation_unsupported_reason(model_runner, self.tree_cache)
         if reason is not None:
             raise ValueError(
-                f"Sub-context KV rotation is enabled but cannot be served: {reason}. "
-                "Unset SGLANG_SUBCONTEXT_ROTATE to run the plain split."
+                f"Sub-context KV rotation cannot be served: {reason}. Set "
+                "SGLANG_DISABLE_SUBCONTEXT=1 to run the stock prefix cache."
             )
         rotary, _ = find_rotary_embedding(model_runner.model)
         self.tree_cache.kv_rotator = KVRotator(
@@ -883,9 +863,8 @@ class Scheduler(
             # Under overlap the forward runs on its own stream; copies follow it there.
             self.tree_cache.kv_rotator.launch_stream = self.forward_stream
         logger.info(
-            "Sub-context KV rotation ENABLED (max delta %d, across-recompute=%s%s)",
+            "Sub-context KV rotation ENABLED (max delta %d%s)",
             self.tree_cache.kv_rotator.max_delta,
-            ROTATE_ACROSS_RECOMPUTE,
             ", native torch path" if ROTATE_NATIVE else "",
         )
 
@@ -1675,7 +1654,6 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 extra_key=recv_req.extra_key,
                 sub_context_ids=recv_req.sub_context_ids,
-                sub_context_extra_keys=recv_req.sub_context_extra_keys,
             )
             req.tokenizer = self.tokenizer
 

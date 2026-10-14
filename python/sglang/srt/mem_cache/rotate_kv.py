@@ -8,8 +8,8 @@ V has no position and is copied unchanged. :func:`rope_delta_composable_reason` 
 the identity on the model's RoPE at startup. Rotation fixes the position only, not the
 context the block was computed under.
 
-Tree-owned sources are copied to fresh slots (the read paths); slots the request owns
-are rotated in place (the finish paths).
+The scan copies each found run to fresh slots of the request's own, rotated when it sits
+at another position than it was computed at.
 """
 
 from __future__ import annotations

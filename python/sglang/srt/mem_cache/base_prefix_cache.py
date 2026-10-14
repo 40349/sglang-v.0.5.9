@@ -60,9 +60,6 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
-    # Sub-context: absolute position of key[0] in the prompt. 0 for an ordinary
-    # request; the block's offset when inserting one block of a split prompt.
-    canonical_position: int = 0
 
 
 @dataclasses.dataclass
@@ -226,30 +223,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return False
 
     def supports_sub_contexts(self) -> bool:
-        """Whether this cache implements both per-namespace match and insert."""
+        """Whether this cache can store split requests as chains and locate their
+        chunks for the index."""
         return False
-
-    def serves_sub_contexts(self, req: Any) -> bool:
-        """Whether this request takes the per-namespace paths.
-
-        The single gate read by ``Req.init_next_round_input``, ``cache_unfinished_req``
-        and ``cache_finished_req``; they must agree. False for a chained request.
-        """
-        return (
-            bool(getattr(req, "has_sub_contexts", False))
-            and self.supports_sub_contexts()
-            and not self.chains_sub_contexts(req)
-        )
 
     def chains_sub_contexts(self, req: Any) -> bool:
         """Whether this request is stored as one chain from position 0, like a plain
-        request, with its chunks registered in the index (the index arms).
+        request, with its chunks registered in the index.
         """
         return False
-
-    def matched_canonical_position(self, last_node: Any, hit_len: int) -> Optional[int]:
-        """Where the KV behind a match was computed, or None if not tracked."""
-        return None
 
     def chain_chunk_slots(self, cid: str) -> Optional[Tuple[torch.Tensor, Any, int]]:
         """``(slots, node, start)`` of a registered chunk, or None if not tracked."""
