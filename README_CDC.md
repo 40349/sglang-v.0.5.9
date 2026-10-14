@@ -65,7 +65,7 @@ python -u -m sglang.launch_server \
 
 ## ⚠️ 先確認這件事：只有 chat endpoint 會切分
 
-切分邏輯只存在於 `python/sglang/srt/entrypoints/openai/serving_chat.py`（`_compute_sub_context_ids`）。
+切分邏輯只存在於 `python/sglang/srt/entrypoints/openai/serving_chat.py`（`_compute_sub_context_ends`）。
 
 - **只有 `/v1/chat/completions` 會啟用 CDC。** `/v1/completions` 不切；`/generate` 會在入口把切塊欄位清掉
   （`http_server.py`），一律走原生路徑。

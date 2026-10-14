@@ -405,7 +405,10 @@ class TestCdcSplit(unittest.TestCase):
         chat._message_start_probed = False
         chat._message_start_id = None
         chat._message_cuts = OrderedDict()
-        return ids, chat._compute_sub_context_ids(messages, ids)
+        ends = chat._compute_sub_context_ends(messages, ids)
+        self.assertEqual(ends[-1], len(ids))
+        self.assertTrue(all(a < b for a, b in zip([0] + ends, ends)))
+        return ids, [ids[a:b] for a, b in zip([0] + ends, ends)]
 
     def test_every_message_starts_a_segment(self):
         msgs = [
@@ -431,6 +434,11 @@ class TestCdcSplit(unittest.TestCase):
         others = [{"role": "user", "content": self.text(n)} for n in (20, 550, 610)]
         _, full = self.split([others[0], others[1], passage, others[2]])
         self.assertTrue(set(own) <= {tuple(s) for s in full})
+
+    def test_a_text_prompt_is_not_split(self):
+        chat = object.__new__(self.serving_chat.OpenAIServingChat)
+        msgs = [{"role": "user", "content": self.text(300)}]
+        self.assertIsNone(chat._compute_sub_context_ends(msgs, self.text(300)))
 
     def test_without_a_message_token_it_cuts_on_content_only(self):
         vocab = {}

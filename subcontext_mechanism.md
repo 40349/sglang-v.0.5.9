@@ -132,7 +132,7 @@ KV 在不在還是由 radix tree 決定。樹拆節點、淘汰節點時同步�
 
 | 欄位 | 意思 | 誰寫 |
 |---|---|---|
-| `sub_context_ids` | 每塊的 token；`concat(ids) == origin_input_ids`。存回樹時用它的每塊長度當登記的區塊邊界 | 切塊 |
+| `sub_context_ends` | 每塊在 `origin_input_ids` 裡的結束位置，遞增，最後一個等於 prompt 長度。存回樹時當登記的區塊邊界 | 切塊 |
 | `sub_context_match_nodes` | scan 複製來源所在的節點，上鎖到副本存進樹為止 | scan |
 | `sub_context_rotated_slots` | 自己 alloc 的副本，**還沒交給 `req_to_token`** | scan |
 | `sub_context_layout` / `_layout_ours` | scan 的稀疏配置 `(start, end, slots)`，以及該段是否為自己的副本；第一段可能是從頭比對到的前綴 | scan |
@@ -257,13 +257,13 @@ request 直接到第 8 步。第 8 步因此先做兩道冪等的保險（放掉
 
 ---
 
-## 5. 切塊（`serving_chat._compute_sub_context_ids`）
+## 5. 切塊（`serving_chat._compute_sub_context_ends`）
 
 ### 5-1 哪些請求會切
 
 - **只有 `/v1/chat/completions`**，而且只在 jinja chat template 的路徑；多模態請求不切
   （它會把 prompt decode 成文字再重新 tokenize）。
-- `/generate` 在 handler 入口把 `sub_context_ids` 清成 `None`，永遠不切。
+- `/generate` 在 handler 入口把 `sub_context_ends` 清成 `None`，永遠不切。
 - 設了 `DISABLE` 不切。
 - 切出來少於 2 塊就當作不切。
 
@@ -279,6 +279,9 @@ request 直接到第 8 步。第 8 步因此先做兩道冪等的保險（放掉
 3. **切點快取**：每則訊息的切點依「訊息長度 + 內容雜湊」存在 LRU（最多 65,536 則），
    同一則訊息在後面的 request 再出現時直接取用，只有沒看過的訊息才跑第 2 步。
 
+切完只回傳**每塊的結束位置**（例如 `[120, 640, 897, 900]`，最後一個等於 prompt 長度），不回傳每塊的 token。
+找訊息開頭、算快取的 key 都直接在 `prompt_ids` 這個 Python list 上做，只有沒看過的訊息才轉成 numpy 跑 `cut_points`。
+
 短於 `MIN_CHUNK` 的訊息、prompt 最後的 generation prompt（`<|im_start|>assistant\n`，3 個 token）
 都自成一塊。它們照樣隨整條鏈存進樹、從頭比對拿得到，只是不登記進索引——位置變了就找不回來。
 
@@ -289,10 +292,12 @@ request 直接到第 8 步。第 8 步因此先做兩道冪等的保險（放掉
 
 ### 5-4 往下傳
 
-- `tokenizer_manager`：預先切好的 `sub_context_ids` 只有串接起來等於 `input_ids` 才接受，否則警告並當作不切。
-- `--allow-auto-truncate` 截掉 prompt 尾巴後，`_clip_sub_contexts_to_input` 把 block 清單裁齊：
-  保留放得下的完整 block、裁切跨界的那塊、丟掉其餘。
-- scheduler 建立 `Req` 時傳入 `extra_key`、`sub_context_ids`。
+- `tokenizer_manager`：`sub_context_ends` 要遞增、第一個大於 0、最後一個等於 `len(input_ids)` 才接受
+  （`subctx_index.valid_block_ends`），否則警告並當作不切。只看位置不比對內容：`input_ids` 就是切塊讀的那份 `prompt_ids`。
+- `--allow-auto-truncate` 截掉 prompt 尾巴後，`subctx_index.clip_block_ends` 把結束位置裁齊：
+  保留落在截斷點之前的、最後一塊改成結束在截斷點、其餘丟掉。tokenizer_manager（截到 context length）和
+  scheduler（`validate_input_length` 截到 `max_req_input_len`）截完都各裁一次。
+- scheduler 建立 `Req` 時傳入 `extra_key`、`sub_context_ends`。
   （上游 v0.5.9 的 scheduler 不傳 `extra_key`，所以上游的 `cache_salt` 不會區隔快取；這個 fork 會，`off` 也一樣。）
 
 ---
@@ -375,7 +380,7 @@ cdc 的 request 讀寫都**像原生 request 一樣**：在樹裡存成一條從
 `insert(fill_ids, req_to_token 那一列)`；樹已經有的部分（`prefix_len`）照上游規則把自己的重複格子還掉。
 插入之後（第 9 節）：
 
-- **登記新存上樹的區塊**：區塊邊界用 request 收到時的切法（`sub_context_ids` 每塊的長度）；結束長度
+- **登記新存上樹的區塊**：區塊邊界用 request 收到時的切法（`sub_context_ends`）；結束長度
   `> prefix_len`（含有這次新存的 token）且 ≥ `MIN_CHUNK` 的才登記，位置是這條鏈上持有它最後一個 token 的節點。
   從別處複製進來的段也在其中——同一段內容因此多一筆位置（排在原本的後面）。
 - **結束時**（`cache_finished_req`，`final=True`）：最後一塊延伸到生成的最後一個 token，再用 `cut_points` 重切

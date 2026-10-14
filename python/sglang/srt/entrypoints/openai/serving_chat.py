@@ -10,9 +10,7 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 import jinja2
-import numpy as np
 import orjson
-import xxhash
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
@@ -135,7 +133,7 @@ class OpenAIServingChat(OpenAIServingBase):
         host_timer.init_host_timer("http")
         self._message_start_probed = False
         self._message_start_id: Optional[int] = None
-        # (length, xxh3 of the int32 token ids) -> cut_points of that message.
+        # (length, hash of the token ids) -> cut_points of that message.
         self._message_cuts: OrderedDict[tuple[int, int], List[int]] = OrderedDict()
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
@@ -344,7 +342,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_routed_experts=request.return_routed_experts,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
-            sub_context_ids=processed_messages.sub_context_ids,
+            sub_context_ends=processed_messages.sub_context_ends,
             require_reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
@@ -441,9 +439,9 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         return self._message_start_id
 
-    def _message_cut_points(self, ids: np.ndarray) -> List[int]:
+    def _message_cut_points(self, ids: List[int]) -> List[int]:
         """``cut_points`` of one message's token ids, cached by content."""
-        key = (ids.shape[0], xxhash.xxh3_64_intdigest(ids.tobytes()))
+        key = (len(ids), hash(tuple(ids)))
         cuts = self._message_cuts.get(key)
         if cuts is not None:
             self._message_cuts.move_to_end(key)
@@ -455,27 +453,37 @@ class OpenAIServingChat(OpenAIServingBase):
         return cuts
 
     @host_timer.timed("subctx_split")
-    def _compute_sub_context_ids(
+    def _compute_sub_context_ends(
         self, messages: List[Dict], prompt_ids: List[int]
-    ) -> Optional[List[List[int]]]:
+    ) -> Optional[List[int]]:
         """Split ``prompt_ids`` into blocks: a cut before every message, then
-        ``cut_points`` on each message's token ids. ``concat(blocks) == prompt_ids``.
+        ``cut_points`` on each message's token ids.
 
+        Returns the end offset of each block, increasing, the last ``len(prompt_ids)``.
         None when the split is off or leaves a single block.
         """
         if DISABLE_SUBCONTEXT or not prompt_ids or not messages:
             return None
-        arr = np.asarray(prompt_ids, dtype=np.int32)
+        if isinstance(prompt_ids, str):
+            return None
+        ids = prompt_ids if isinstance(prompt_ids, list) else list(prompt_ids)
         starts = [0]
         marker = self._message_start_token()
         if marker is not None:
-            starts += [i for i in np.flatnonzero(arr == marker).tolist() if i > 0]
-        bounds = [0]
-        for a, b in zip(starts, starts[1:] + [len(prompt_ids)]):
-            bounds += [a + c for c in self._message_cut_points(arr[a:b])] + [b]
-        if len(bounds) < 3:
+            i = 0
+            try:
+                while True:
+                    i = ids.index(marker, i + 1)
+                    starts.append(i)
+            except ValueError:
+                pass
+        ends: List[int] = []
+        for a, b in zip(starts, starts[1:] + [len(ids)]):
+            ends += [a + c for c in self._message_cut_points(ids[a:b])]
+            ends.append(b)
+        if len(ends) < 2:
             return None
-        return [prompt_ids[a:b] for a, b in zip(bounds, bounds[1:])]
+        return ends
 
     @host_timer.timed("tpl_render")
     def _apply_jinja_template(
@@ -487,7 +495,7 @@ class OpenAIServingChat(OpenAIServingBase):
         """Apply Jinja chat template"""
         prompt = ""
         prompt_ids = []
-        sub_context_ids = None
+        sub_context_ends = None
         openai_compatible_messages = []
         image_data = []
         video_data = []
@@ -629,7 +637,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
             else:
                 # Not split on the multimodal path, which re-tokenizes decoded text.
-                sub_context_ids = self._compute_sub_context_ids(
+                sub_context_ends = self._compute_sub_context_ends(
                     openai_compatible_messages, prompt_ids
                 )
 
@@ -646,7 +654,7 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
-            sub_context_ids=sub_context_ids,
+            sub_context_ends=sub_context_ends,
         )
 
     def _apply_conversation_template(

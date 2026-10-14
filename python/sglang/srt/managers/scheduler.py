@@ -178,6 +178,7 @@ from sglang.srt.managers.utils import GenerationBatchResult, validate_input_leng
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.subctx_index import clip_block_ends
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -1653,7 +1654,7 @@ class Scheduler(
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 extra_key=recv_req.extra_key,
-                sub_context_ids=recv_req.sub_context_ids,
+                sub_context_ends=recv_req.sub_context_ends,
             )
             req.tokenizer = self.tokenizer
 
@@ -1738,6 +1739,11 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+        # `validate_input_length` may have truncated origin_input_ids.
+        if req.sub_context_ends:
+            req.sub_context_ends = clip_block_ends(
+                req.sub_context_ends, len(req.origin_input_ids), req.rid
+            )
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored

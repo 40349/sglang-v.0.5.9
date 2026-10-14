@@ -23,6 +23,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=5, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=5, suite="stage-b-test-small-1-gpu-amd")
 
+import itertools
 import unittest
 
 import torch
@@ -129,7 +130,7 @@ def make_req(rid: str, blocks, req_pool_idx: int = 0) -> Req:
         origin_input_text="",
         origin_input_ids=ids,
         sampling_params=SamplingParams(max_new_tokens=8),
-        sub_context_ids=blocks,
+        sub_context_ends=list(itertools.accumulate(len(block) for block in blocks)),
     )
     req.req_pool_idx = req_pool_idx
     return req
@@ -239,27 +240,56 @@ class TestCanonicalPosition(unittest.TestCase):
 
 
 class TestSubContextTruncation(unittest.TestCase):
-    """Auto-truncation must not leave the block list describing a longer prompt."""
+    """Auto-truncation must not leave the block ends describing a longer prompt."""
 
     def setUp(self):
-        from sglang.srt.managers.tokenizer_manager import _clip_sub_contexts_to_input
+        from sglang.srt.mem_cache.subctx_index import clip_block_ends
 
-        self.clip = _clip_sub_contexts_to_input
+        self.clip = clip_block_ends
 
     def test_untouched_prompt_is_passed_through(self):
-        self.assertEqual(self.clip([[1, 2], [3, 4]], 4, "r"), [[1, 2], [3, 4]])
+        self.assertEqual(self.clip([2, 4], 4, "r"), [2, 4])
 
     def test_trailing_block_is_clipped(self):
-        self.assertEqual(self.clip([[1, 2], [3, 4]], 3, "r"), [[1, 2], [3]])
+        self.assertEqual(self.clip([2, 4], 3, "r"), [2, 3])
 
     def test_blocks_past_the_cut_are_dropped(self):
-        self.assertEqual(self.clip([[1, 2], [3, 4]], 2, "r"), [[1, 2]])
+        self.assertEqual(self.clip([2, 4], 2, "r"), [2])
+        self.assertEqual(self.clip([2, 4, 6, 8], 5, "r"), [2, 4, 5])
+
+    def test_a_cut_inside_the_first_block_leaves_one_block(self):
+        self.assertEqual(self.clip([3, 6], 1, "r"), [1])
 
     def test_split_is_dropped_when_nothing_is_left(self):
-        self.assertIsNone(self.clip([[1, 2], [3, 4]], 0, "r"))
+        self.assertIsNone(self.clip([2, 4], 0, "r"))
 
     def test_blocks_shorter_than_the_prompt_drop_the_split(self):
-        self.assertIsNone(self.clip([[1, 2]], 5, "r"))
+        self.assertIsNone(self.clip([2], 5, "r"))
+
+
+class TestSubContextBlockEnds(unittest.TestCase):
+    """The tokenizer manager accepts only block ends that tile the prompt."""
+
+    def setUp(self):
+        from sglang.srt.mem_cache.subctx_index import valid_block_ends
+
+        self.valid = valid_block_ends
+
+    def test_increasing_ends_at_the_prompt_length_are_accepted(self):
+        self.assertTrue(self.valid([2, 4], 4))
+        self.assertTrue(self.valid([4], 4))
+        self.assertTrue(self.valid((2, 4), 4))
+
+    def test_ends_short_or_past_the_prompt_are_rejected(self):
+        self.assertFalse(self.valid([2, 3], 4))
+        self.assertFalse(self.valid([2, 5], 4))
+
+    def test_an_empty_block_is_rejected(self):
+        self.assertFalse(self.valid([2, 2, 4], 4))
+        self.assertFalse(self.valid([0, 4], 4))
+
+    def test_decreasing_ends_are_rejected(self):
+        self.assertFalse(self.valid([3, 2, 4], 4))
 
 
 def tree_slot_owners(cache):
@@ -635,7 +665,7 @@ class TestChainedIndex(unittest.TestCase):
         first = Req(
             rid="r1", origin_input_text="", origin_input_ids=ids,
             sampling_params=SamplingParams(max_new_tokens=8),
-            sub_context_ids=[self.HEAD_A, self.TAIL],
+            sub_context_ends=[len(self.HEAD_A), len(ids)],
             extra_key="salt-a",
         )
         first.req_pool_idx = 0
@@ -647,7 +677,7 @@ class TestChainedIndex(unittest.TestCase):
             rid="r2", origin_input_text="",
             origin_input_ids=self.HEAD_B + self.TAIL,
             sampling_params=SamplingParams(max_new_tokens=8),
-            sub_context_ids=[self.HEAD_B, self.TAIL],
+            sub_context_ends=[len(self.HEAD_B), len(self.HEAD_B + self.TAIL)],
             extra_key="salt-b",
         )
         second.req_pool_idx = 1

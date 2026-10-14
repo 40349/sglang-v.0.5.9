@@ -524,12 +524,10 @@ class RadixCache(BasePrefixCache):
         the split the request arrived with; with ``final``, the last block runs to the
         end of the generated tokens and is cut again by ``cut_points``.
         """
-        if self.sub_context_index is None or not req.sub_context_ids:
+        if self.sub_context_index is None or not req.sub_context_ends:
             return
         covered = len(token_ids)
-        edges = [0]
-        for block in req.sub_context_ids:
-            edges.append(edges[-1] + len(block))
+        edges = [0, *req.sub_context_ends]
         if final and covered > edges[-1]:
             head = edges[-2]
             cuts = cut_points(

@@ -666,7 +666,7 @@ if os.environ.get("SGLANG_DUMPER_SERVER_PORT") == "reuse":
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     # The sub-context split is internal to the OpenAI chat path; /generate is never split.
-    obj.sub_context_ids = None
+    obj.sub_context_ends = None
 
     if obj.stream:
 

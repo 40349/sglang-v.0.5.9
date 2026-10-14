@@ -15,7 +15,7 @@ Usage, from inside the baseline env:
 Every edit is idempotent and backed up to <file>.orig on first touch. Probes go
 above a `def`, never inside a body: upstream's bodies differ, only signatures line up.
 
-`subctx_split` reports as absent on upstream -- there is no _compute_sub_context_ids
+`subctx_split` reports as absent on upstream -- there is no _compute_sub_context_ends
 there, which is the point: its baseline cost is zero.
 """
 
@@ -48,7 +48,7 @@ DECORATORS = [
     ("entrypoints/openai/serving_chat.py", r"^    def _apply_jinja_template\(",
      '    @host_timer.timed("tpl_render")', True),
     # Absent upstream by design; present in the fork.
-    ("entrypoints/openai/serving_chat.py", r"^    def _compute_sub_context_ids\(",
+    ("entrypoints/openai/serving_chat.py", r"^    def _compute_sub_context_ends\(",
      '    @host_timer.timed("subctx_split")', False),
 ]
 

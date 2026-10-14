@@ -563,7 +563,7 @@ class Req(ReqDllmMixin):
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
-        sub_context_ids: Optional[List[List[int]]] = None,
+        sub_context_ends: Optional[List[int]] = None,
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
@@ -628,9 +628,9 @@ class Req(ReqDllmMixin):
 
         self.extra_key = extra_key
 
-        # Sub-context: ordered per-block token ids, cut by content.
-        # concat(sub_context_ids) == origin_input_ids. None for normal requests.
-        self.sub_context_ids = sub_context_ids
+        # Sub-context: end offset of each block in origin_input_ids, cut by content;
+        # increasing, the last len(origin_input_ids). None for normal requests.
+        self.sub_context_ends = sub_context_ends
         # Tokens matched in the tree but not reused. Drained by the forward trace.
         self.sub_context_discarded: int = 0
         # The nodes the scan copied runs from, locked until the copies are in the tree.
@@ -870,16 +870,15 @@ class Req(ReqDllmMixin):
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
 
-        if TRACE_ON and self.sub_context_ids:
+        if TRACE_ON and self.sub_context_ends:
             trace(
-                f"[TRACE-3 Scheduler] rid={self.rid} "
-                f"segment_lens={[len(s) for s in self.sub_context_ids]}"
+                f"[TRACE-3 Scheduler] rid={self.rid} block_ends={self.sub_context_ends}"
             )
 
     @property
     def has_sub_contexts(self) -> bool:
         """Sub-context: whether this request's prompt was split into blocks."""
-        return bool(self.sub_context_ids)
+        return bool(self.sub_context_ends)
 
     @property
     def seqlen(self) -> int:

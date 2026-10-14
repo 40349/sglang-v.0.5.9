@@ -45,6 +45,7 @@ from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
+from sglang.srt.mem_cache.subctx_index import clip_block_ends, valid_block_ends
 from sglang.srt.utils.subctx_trace import TRACE_ON, trace
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
@@ -176,55 +177,6 @@ class ReqState:
     output_top_logprobs: List[Any] = dataclasses.field(default_factory=list)
     input_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
     output_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
-
-
-def _clip_sub_contexts_to_input(
-    sub_context_ids: List[List[int]],
-    input_len: int,
-    rid: str,
-) -> Optional[List[List[int]]]:
-    """Restore ``concat(sub_context_ids) == input_ids`` after auto-truncation.
-
-    Truncation removes a suffix: keep whole blocks while they fit, clip the straddling
-    one, drop the rest. None if nothing is left or the blocks are shorter than the
-    prompt.
-    """
-    total = sum(len(seg) for seg in sub_context_ids)
-    if total == input_len:
-        return sub_context_ids
-
-    if total < input_len:
-        # Not a truncation (e.g. a multimodal processor rewrote input_ids).
-        logger.warning(
-            "Sub-context: dropping the split for rid=%s -- the blocks cover %d tokens "
-            "but the prompt has %d.",
-            rid,
-            total,
-            input_len,
-        )
-        return None
-
-    clipped_ids: List[List[int]] = []
-    remaining = input_len
-    for seg in sub_context_ids:
-        if remaining <= 0:
-            break
-        take = min(len(seg), remaining)
-        clipped_ids.append(seg[:take])
-        remaining -= take
-
-    logger.warning(
-        "Sub-context: the prompt for rid=%s was truncated from %d to %d tokens; "
-        "clipping the block list to match (%d of %d blocks kept).",
-        rid,
-        total,
-        input_len,
-        len(clipped_ids),
-        len(sub_context_ids),
-    )
-    if not clipped_ids:
-        return None
-    return clipped_ids
 
 
 class InputFormat(Enum):
@@ -792,25 +744,26 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         else:
             mm_inputs = None
 
-        # Pre-split ids (OpenAI chat path): accept only if they concatenate to input_ids.
-        sub_context_ids = None
-        if getattr(obj, "sub_context_ids", None):
-            flat = [tok for seg in obj.sub_context_ids for tok in seg]
-            if input_ids is not None and flat == list(input_ids):
-                sub_context_ids = obj.sub_context_ids
+        # Pre-split block ends (OpenAI chat path): accept only if they increase and end
+        # at len(input_ids).
+        sub_context_ends = None
+        if getattr(obj, "sub_context_ends", None):
+            ends = obj.sub_context_ends
+            if input_ids is not None and valid_block_ends(ends, len(input_ids)):
+                sub_context_ends = ends
             else:
                 logger.warning(
-                    "Sub-context: ignoring sub_context_ids that do not concatenate to "
-                    "input_ids (%d vs %d tokens).",
-                    len(flat),
+                    "Sub-context: ignoring sub_context_ends that do not increase to "
+                    "len(input_ids) (last end %d vs %d tokens).",
+                    ends[-1],
                     len(input_ids) if input_ids is not None else 0,
                 )
 
         self._validate_one_request(obj, input_ids)
         # `_validate_one_request` may have truncated input_ids (--allow-auto-truncate).
-        if sub_context_ids is not None:
-            sub_context_ids = _clip_sub_contexts_to_input(
-                sub_context_ids, len(input_ids), obj.rid
+        if sub_context_ends is not None:
+            sub_context_ends = clip_block_ends(
+                sub_context_ends, len(input_ids), obj.rid
             )
         trace_slice_end(RequestStage.TOKENIZE, obj.rid)
         return self._create_tokenized_object(
@@ -820,7 +773,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             input_embeds,
             mm_inputs,
             token_type_ids,
-            sub_context_ids=sub_context_ids,
+            sub_context_ends=sub_context_ends,
         )
 
     def _validate_one_request(
@@ -974,7 +927,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         input_embeds: Optional[Union[List[float], None]] = None,
         mm_inputs: Optional[Dict] = None,
         token_type_ids: Optional[List[int]] = None,
-        sub_context_ids: Optional[List[List[int]]] = None,
+        sub_context_ends: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
         # Parse sampling parameters
@@ -1019,7 +972,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
-                sub_context_ids=sub_context_ids,
+                sub_context_ends=sub_context_ends,
                 routing_key=obj.routing_key,
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
@@ -1039,12 +992,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
 
         if TRACE_ON:
-            _sc_ids = getattr(tokenized_obj, "sub_context_ids", None)
-            if _sc_ids:
-                trace(
-                    f"[TRACE-2 Tokenizer] sub_contexts: "
-                    f"segment_token_lens={[len(seg) for seg in _sc_ids]}"
-                )
+            _sc_ends = getattr(tokenized_obj, "sub_context_ends", None)
+            if _sc_ends:
+                trace(f"[TRACE-2 Tokenizer] sub_contexts: block_ends={_sc_ends}")
 
         return tokenized_obj
 

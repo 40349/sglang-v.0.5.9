@@ -10,11 +10,14 @@ its whole token sequence.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Dict, List, NamedTuple, Optional, Sequence
 
 import numpy as np
 import xxhash
+
+logger = logging.getLogger(__name__)
 
 # Shortest run of tokens worth reusing.
 MIN_CHUNK_TOKENS = int(os.environ.get("SGLANG_SUBCTX_MIN_CHUNK", "64"))
@@ -174,6 +177,51 @@ def cut_points(
         cuts.append(nxt)
         last = nxt
     return cuts
+
+
+def valid_block_ends(ends: Sequence[int], input_len: int) -> bool:
+    """Whether ``ends`` increase from above 0 and the last equals ``input_len``."""
+    return ends[-1] == input_len and all(a < b for a, b in zip([0, *ends], ends))
+
+
+def clip_block_ends(
+    ends: List[int], input_len: int, rid: str
+) -> Optional[List[int]]:
+    """Restore ``ends[-1] == input_len`` after the prompt was truncated to ``input_len``.
+
+    Truncation removes a suffix: keep the ends inside the prompt and end the last
+    block at ``input_len``. None if nothing is left or the blocks are shorter than the
+    prompt.
+    """
+    total = ends[-1]
+    if total == input_len:
+        return ends
+
+    if total < input_len:
+        # Not a truncation (e.g. a multimodal processor rewrote input_ids).
+        logger.warning(
+            "Sub-context: dropping the split for rid=%s -- the blocks cover %d tokens "
+            "but the prompt has %d.",
+            rid,
+            total,
+            input_len,
+        )
+        return None
+
+    clipped: List[int] = []
+    if input_len > 0:
+        clipped = [e for e in ends if e < input_len] + [input_len]
+
+    logger.warning(
+        "Sub-context: the prompt for rid=%s was truncated from %d to %d tokens; "
+        "clipping the block list to match (%d of %d blocks kept).",
+        rid,
+        total,
+        input_len,
+        len(clipped),
+        len(ends),
+    )
+    return clipped or None
 
 
 class _Scope:
