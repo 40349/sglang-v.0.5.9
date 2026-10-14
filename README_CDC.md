@@ -43,10 +43,7 @@ export PYTHONPATH=/path/to/sglang-v.0.5.9/python
 export PYTHONNOUSERSITE=1
 python -c "import sglang, inspect; print(inspect.getfile(sglang))"   # 必須指向上面那個路徑
 
-# 2. 啟動
-SGLANG_SUBCTX_SPLIT=cdc \
-SGLANG_SUBCTX_INDEX=1 \
-SGLANG_SUBCONTEXT_ROTATE=1 \
+# 2. 啟動（沒設 SGLANG_DISABLE_SUBCONTEXT 就是 cdc）
 python -u -m sglang.launch_server \
   --model-path Qwen/Qwen3-Coder-30B-A3B-Instruct \
   --host 0.0.0.0 --port 30000 \
@@ -59,10 +56,10 @@ python -u -m sglang.launch_server \
 
 `sglang_server.sh` 是包好的版本：在 checkout 裡執行 `ARM=cdc bash sglang_server.sh`（Slurm 上用 `sbatch`）。
 要重算一部分重用的 token 就把比例寫進 arm，例如 `ARM=cdc@0.15`；逐層篩選寫成一串比例，例如
-`ARM=cdc@0.3,0.2,0.15`（從 `TOPK_LAYER` 起連續幾層各挑一次，每次只從上一層留下的裡面挑）。arm 和環境變數的對應寫在
-`sglang_server.sh` 第 150–159 行；其他參數寫在檔案開頭的註解。環境裡若已經直接設了 arm 會設定的開關
-（例如 `SGLANG_SUBCTX_INDEX`、`SGLANG_SUBCTX_TOPK_RATIO`，完整清單在第 74–78 行），這支腳本會拒絕啟動，
-開關只能透過 arm 和它的參數設定。
+`ARM=cdc@0.3,0.2,0.15`（從 `TOPK_LAYER` 起連續幾層各挑一次，每次只從上一層留下的裡面挑）。arm 只有 `off` 和
+`cdc` 兩種，對應的環境變數寫在 `sglang_server.sh` 的 `export SGLANG_DISABLE_SUBCONTEXT= ...` 那段；其他參數寫在檔案開頭的註解。
+環境裡若已經直接設了 arm 會設定的開關（例如 `SGLANG_DISABLE_SUBCONTEXT`、`SGLANG_SUBCTX_TOPK_RATIO`，完整清單在
+同檔 `for v in SGLANG_DISABLE_SUBCONTEXT ...` 那段），這支腳本會拒絕啟動，開關只能透過 arm 和它的參數設定。
 
 ---
 
@@ -81,14 +78,13 @@ python -u -m sglang.launch_server \
 
 ## 環境變數
 
-三個缺一不可：
-
 | 變數 | 值 | 作用 |
 |---|---|---|
-| `SGLANG_SUBCTX_SPLIT` | `cdc` | 切點由 token 內容決定。必須搭配內容定址的 namespace（`SGLANG_SUBCTX_INDEX=1`），否則 import 時就報錯 |
-| `SGLANG_SUBCTX_INDEX` | `1` | 前綴比對 + 掃描比對 + sparse prefill，整條存成一條鏈 |
-| `SGLANG_SUBCONTEXT_ROTATE` | `1` | 位移的命中用 RoPE 旋轉搬到正確位置。開了 index 卻沒開旋轉會拒絕啟動 |
-| `SGLANG_DISABLE_SUBCONTEXT` | **不要設** | 設了就整個關掉，退回原生 radix cache（上面三個也一併失效） |
+| `SGLANG_DISABLE_SUBCONTEXT` | **不要設** | 不設就是 cdc：依內容切塊、前綴比對 + 掃描比對 + sparse prefill、位移的命中用 RoPE 旋轉搬到正確位置、整條存成一條鏈。設成 1 就整個關掉，退回原生 radix cache |
+
+2026-10-14 起 on / rot / idx 三種 arm 已移除，`SGLANG_SUBCTX_SPLIT`、`SGLANG_SUBCTX_INDEX`、
+`SGLANG_SUBCONTEXT_ROTATE`、`SGLANG_SUBCONTEXT_ROTATE_ACROSS`、`SGLANG_SUBCTX_HASH_KEYS`、
+`SGLANG_SUBCTX_INDEX_DRYRUN`、`SGLANG_SUBCONTEXT_CACHE_OUTPUT` 設了任何一個都會在 import 時拒絕啟動。舊程式在 git 歷史（`origin/idx` 5ff1e41）。
 
 可調（有預設值，不設也能跑）：
 
@@ -97,13 +93,12 @@ python -u -m sglang.launch_server \
 | `SGLANG_SUBCTX_CDC_TARGET` | 256 | 平均 chunk 長度，會無條件捨去到 2 的冪 |
 | `SGLANG_SUBCTX_CDC_MAX` | 1024 | 強制切點的長度上限，應明顯大於 target |
 | `SGLANG_SUBCTX_MIN_CHUNK` | 64 | 最短 chunk，也是 cdc 切點的最小間距。比它短的區塊照樣隨整條鏈存進快取，但不登記索引（位置變了就找不回來）；索引的下限是 32（指紋視窗就是 32 個 token），設更低時索引仍以 32 計 |
-| `SGLANG_SUBCONTEXT_CACHE_OUTPUT` | 1 | 只用在 `on` / `rot`（逐 namespace）；cdc 的回覆隨整條鏈存，不看這個開關 |
 
 Selective recompute（重算一部分重用的 token，修正「在別的前文下算出來」造成的誤差）：
 
 | 變數 | 預設 | 說明 |
 |---|---|---|
-| `SGLANG_SUBCTX_TOPK_RATIO` | 0 | 每個請求重算重用 token 中 key 偏差最大的比例，範圍 [0, 1]。逗號分隔（不遞增）時每個比例對應一個連續的打分層。> 0 必須開 `SGLANG_SUBCTX_INDEX` |
+| `SGLANG_SUBCTX_TOPK_RATIO` | 0 | 每個請求重算重用 token 中 key 偏差最大的比例，範圍 [0, 1]。逗號分隔（不遞增）時每個比例對應一個連續的打分層。> 0 時不能同時設 `SGLANG_DISABLE_SUBCONTEXT=1` |
 | `SGLANG_SUBCTX_TOPK_LAYER` | 1 | 第一個打分層。0 只允許第一個比例 = 1.0（第 0 層的 key 只取決於 token 與位置，分數全為 0） |
 
 probe 各層（`[0, TOPK_LAYER]`）每一列都把新算的 KV 寫回自己的 slot，attention 讀整段新算的 KV，所以 ratio 1.0
@@ -118,7 +113,7 @@ speculative decoding、torch.compile、回傳 hidden states、LoRA。
 | 變數 | 作用 |
 |---|---|
 | `SGLANG_SUBCTX_TRACE=1` | 逐筆比對的 trace（印到 server log） |
-| `SGLANG_SUBCTX_AUDIT=1` | 寫入與 finish 路徑的 slot 重複擁有 / double-free 偵測，每個 pass 走一次整棵樹 |
+| `SGLANG_SUBCTX_AUDIT=1` | KV pool 的 double-free 偵測，以及重用 chunk 時比對它所在位置的 token |
 | `SGLANG_SUBCTX_ROTATE_GPU=1` | 旋轉 kernel 的 CUDA event 計時 |
 | `SGLANG_DUMP_TREE=1` | 每次 extend 之後印整棵 radix tree |
 
@@ -173,15 +168,7 @@ curl -s http://HOST:30000/server_info \
 ```json
 {
   "split_enabled": true,
-  "rotate": true,
-  "rotate_across_recompute": false,
-  "cache_output": true,
-  "hash_keys": true,
-  "index": true,
-  "chain_storage": true,
-  "index_dryrun": false,
   "min_chunk": 64,
-  "split_mode": "cdc",
   "cdc_target": 256,
   "cdc_max": 1024,
   "topk_ratios": [0.0],
@@ -192,7 +179,7 @@ curl -s http://HOST:30000/server_info \
 ```
 
 `pid` 用來分辨「剛啟動的這個 server」和「還佔著 port 的舊 server」。
-`chain_storage` 沒有這個欄位（或是 false）的 server，跑的是 2026-10-05 以前的舊存法。
+還回報 `split_mode` 等欄位的 server 跑的是 2026-10-14 以前的 build，`check_remote_arm.py` 會拒絕它。
 
 repo 裡有現成的檢查腳本，對不上會 refuse 並說明差在哪：
 
@@ -201,7 +188,7 @@ python scripts/subcontext_sim/check_remote_arm.py http://HOST:30000 --arm cdc
 python scripts/subcontext_sim/check_remote_arm.py http://HOST:30000 --arm cdc@0.15
 ```
 
-也可以逐項指定：`--split true --rotate true --index true --split-mode cdc --topk-ratio 0 --audit false`。
+另外可以加 `--audit true|false` 要求 audit 開或關。
 
 ---
 
