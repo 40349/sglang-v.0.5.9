@@ -12,11 +12,12 @@ Subcommands:
 
 `replay` re-sends one captured request sequence, so every arm sees the same input.
 Each turn is pinned to --gen-tokens with ignore_eos (--full uses each request's own
-max_tokens). Decode GPU time is the control and should not move between arms.
+max_tokens); `--gen-tokens reply` pins each turn to the length of the reply it got
+when captured. Decode GPU time is the control and should not move between arms.
 
 Replay streams by default so TTFT can be measured (--no-stream reports end-to-end
-latency only). --concurrency defaults to 1; above 1, reuse depends on how requests
-interleave.
+latency only). --concurrency defaults to 1; above 1, a turn is sent only after its
+conversation's previous turn finished, and different conversations overlap.
 """
 
 from __future__ import annotations
@@ -29,12 +30,12 @@ import math
 import os
 import statistics
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 
 # --------------------------------------------------------------------------- #
@@ -113,30 +114,274 @@ def _pct(values: List[float], q: float) -> Optional[float]:
     return vals[k]
 
 
-def load_requests(path: str, limit: Optional[int]) -> List[dict]:
-    out = []
+def load_requests(path: str) -> List[dict]:
+    """The captured request bodies; a last line cut short mid-write is skipped."""
+    out: List[dict] = []
+    bad: Optional[json.JSONDecodeError] = None
     with open(path) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            out.append(json.loads(line))
-            if limit and len(out) >= limit:
-                break
+            if bad is not None:
+                raise bad
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                bad = e
+    if bad is not None:
+        print(f"warning: skipping the unparsable last line of {path}", file=sys.stderr)
     return out
 
 
+# Request fields that end or size a generation, besides max_tokens and ignore_eos.
+_LENGTH_FIELDS = (
+    "stop", "stop_token_ids", "stop_regex", "max_completion_tokens", "min_tokens",
+    "response_format", "regex", "ebnf",
+)
+
+
+def pin_length(body: dict, n: int) -> dict:
+    """``body`` set to generate exactly ``n`` tokens: ``max_tokens`` n, ``ignore_eos``,
+    and none of ``_LENGTH_FIELDS``."""
+    out = {k: v for k, v in body.items() if k not in _LENGTH_FIELDS}
+    out["max_tokens"] = n
+    out["ignore_eos"] = True
+    return out
+
+
+def _conversation_key(messages: List[dict]) -> str:
+    """Hash of the messages up to and including the first user message."""
+    head = []
+    for m in messages:
+        head.append(m)
+        if m.get("role") == "user":
+            break
+    return hashlib.sha1(json.dumps(head, sort_keys=True).encode()).hexdigest()
+
+
+def link_turns(reqs: List[dict]) -> Tuple[List[Optional[int]], List[Optional[dict]]]:
+    """Per request: the index of its conversation's previous turn, and the reply the
+    request got, as its next turn records it.
+
+    A conversation is the requests sharing their messages up to the first user
+    message. A turn's previous turn is the latest earlier one of them with fewer
+    messages whose last message sits unchanged at the same position in this turn.
+    ``reply[i]`` is the assistant message at position ``len(messages)`` of request i's
+    next turn; None for a conversation's last turn.
+    """
+    prev: List[Optional[int]] = [None] * len(reqs)
+    reply: List[Optional[dict]] = [None] * len(reqs)
+    turns: Dict[str, List[int]] = defaultdict(list)
+    for j, body in enumerate(reqs):
+        msgs = body.get("messages") or []
+        seen = turns[_conversation_key(msgs)]
+        for i in reversed(seen):
+            earlier = reqs[i].get("messages") or []
+            n = len(earlier)
+            if 0 < n < len(msgs) and msgs[n - 1] == earlier[-1]:
+                prev[j] = i
+                if reply[i] is None and msgs[n].get("role") == "assistant":
+                    reply[i] = msgs[n]
+                break
+        seen.append(j)
+    return prev, reply
+
+
+def _with_parsed_arguments(call: dict) -> dict:
+    """A tool call whose JSON-string ``arguments`` are parsed, as the server templates it."""
+    fn = dict(call.get("function") or {})
+    if isinstance(fn.get("arguments"), str):
+        try:
+            fn["arguments"] = json.loads(fn["arguments"])
+        except json.JSONDecodeError:
+            pass
+    return {**call, "function": fn}
+
+
+def _template_ready(message: dict) -> dict:
+    """The assistant message as the server hands it to the chat template: content
+    None becomes "", list content its text parts joined, tool-call arguments parsed."""
+    m = dict(message)
+    content = m.get("content")
+    if content is None:
+        m["content"] = ""
+    elif isinstance(content, list):
+        m["content"] = "".join(
+            p.get("text") or "" for p in content if isinstance(p, dict)
+        )
+    if m.get("tool_calls"):
+        m["tool_calls"] = [_with_parsed_arguments(c) for c in m["tool_calls"]]
+    return m
+
+
+class RenderedReplyTokens:
+    """Counts an assistant message's tokens as ``tok``'s chat template renders it after
+    one user turn, end-of-turn tokens included. A message the template rejects is
+    counted as plain text and tallied in ``fallbacks``."""
+
+    def __init__(self, tok) -> None:
+        self.tok = tok
+        self.ctx = [{"role": "user", "content": "x"}]
+        self.head = len(self._render(self.ctx, generation_prompt=True))
+        self.fallbacks = 0
+
+    def _render(self, messages: List[dict], generation_prompt: bool) -> List[int]:
+        return self.tok.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=generation_prompt,
+            return_dict=False,
+        )
+
+    def __call__(self, message: dict) -> int:
+        m = _template_ready(message)
+        try:
+            return len(self._render(self.ctx + [m], generation_prompt=False)) - self.head
+        except Exception:
+            self.fallbacks += 1
+            text = m["content"] + (json.dumps(m["tool_calls"]) if m.get("tool_calls") else "")
+            return len(self.tok.encode(text, add_special_tokens=False))
+
+
+def reply_lengths(
+    reply: List[Optional[dict]],
+    count: Callable[[dict], int],
+    max_tokens: List[Optional[int]],
+) -> Tuple[List[int], int, int, int]:
+    """Tokens to generate per turn: ``count`` of its recorded reply, turns without one
+    taking the median of the others; each capped at the request's own ``max_tokens``
+    and at least 2. Returns the lengths, that median, and how many were capped and how
+    many raised to 2.
+    """
+    counts = [None if r is None else count(r) for r in reply]
+    known = sorted(c for c in counts if c is not None)
+    if not known:
+        raise ValueError("no request has a next turn to read its reply from")
+    median = known[len(known) // 2]
+    lengths: List[int] = []
+    capped = raised = 0
+    for c, cap in zip(counts, max_tokens):
+        c = median if c is None else c
+        if cap and c > cap:
+            c = cap
+            capped += 1
+        if c < 2:
+            c = 2
+            raised += 1
+        lengths.append(c)
+    return lengths, median, capped, raised
+
+
+def run_in_turn_order(
+    n_workers: int, prev: List[Optional[int]], send: Callable[[int], dict]
+) -> List[dict]:
+    """``send(i)`` for every request, at most ``n_workers`` at a time; request i starts
+    only after ``prev[i]`` finished. The lowest ready index starts first.
+
+    The first exception stops new sends and is raised once the running ones return.
+    """
+    n = len(prev)
+    if any(p is not None and not 0 <= p < i for i, p in enumerate(prev)):
+        raise ValueError("each prev[i] must be None or an earlier index")
+    rows: List[Optional[dict]] = [None] * n
+    started = [False] * n
+    done = [False] * n
+    errors: List[BaseException] = []
+    cond = threading.Condition()
+    lowest = 0  # every index below it has started
+
+    def take() -> Optional[int]:
+        nonlocal lowest
+        while lowest < n and started[lowest]:
+            lowest += 1
+        for i in range(lowest, n):
+            if not started[i] and (prev[i] is None or done[prev[i]]):
+                return i
+        return None
+
+    def worker() -> None:
+        while True:
+            with cond:
+                while True:
+                    if errors:
+                        return
+                    i = take()
+                    if i is not None:
+                        started[i] = True
+                        break
+                    if lowest >= n:
+                        return
+                    cond.wait()
+            try:
+                row = send(i)
+            except BaseException as e:
+                with cond:
+                    errors.append(e)
+                    cond.notify_all()
+                return
+            with cond:
+                rows[i] = row
+                done[i] = True
+                cond.notify_all()
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(n_workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        raise errors[0]
+    return rows
+
+
 def cmd_replay(args: argparse.Namespace) -> int:
-    reqs = load_requests(args.requests, args.limit)
+    reqs = load_requests(args.requests)
     if not reqs:
         print(f"no requests in {args.requests}", file=sys.stderr)
         return 1
     if args.concurrency < 1:
         print("--concurrency must be at least 1", file=sys.stderr)
         return 1
+    if args.limit is not None and args.limit < 1:
+        print("--limit must be at least 1", file=sys.stderr)
+        return 1
     if args.concurrency > 1 and args.flush_every:
         print("--flush-every needs --concurrency 1 to mean anything", file=sys.stderr)
         return 1
+
+    # Linked over the whole capture; --limit truncates afterwards.
+    prev, reply = link_turns(reqs)
+    if args.limit:
+        reqs, prev, reply = reqs[: args.limit], prev[: args.limit], reply[: args.limit]
+    print(f"{len(reqs)} requests in {sum(p is None for p in prev)} conversations")
+    gen_tokens: List[int] = [args.gen_tokens] * len(reqs) if args.gen_tokens != "reply" else []
+    if args.gen_tokens == "reply" and not args.full:
+        from transformers import AutoTokenizer
+
+        name = args.model or reqs[0].get("model", "")
+        try:
+            tok = AutoTokenizer.from_pretrained(name)
+        except (OSError, ValueError) as e:
+            print(f"--gen-tokens reply: no tokenizer for {name!r}; pass --model ({e})",
+                  file=sys.stderr)
+            return 1
+        count = RenderedReplyTokens(tok)
+        try:
+            gen_tokens, median, capped, raised = reply_lengths(
+                reply,
+                count,
+                [b.get("max_completion_tokens") or b.get("max_tokens") for b in reqs],
+            )
+        except ValueError as e:
+            print(f"--gen-tokens reply: {e}", file=sys.stderr)
+            return 1
+        print(f"generated tokens per turn: the recorded reply as the chat template "
+              f"renders it, median {median}, p95 {_pct(gen_tokens, 0.95)}; "
+              f"{sum(r is None for r in reply)} turns without a recorded reply take the "
+              f"median; {capped} held to their max_tokens (a reply that ran to the limit "
+              f"renders 1-2 tokens over it), {raised} raised to 2, {count.fallbacks} "
+              f"counted as plain text (the template rejected them)")
 
     base = args.url.rstrip("/")
 
@@ -193,10 +438,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
                 time.sleep(0.2)
             except urllib.error.URLError as e:
                 print(f"warning: flush_cache failed ({e})", file=sys.stderr)
-        body = dict(body)
-        if not args.full:
-            body["max_tokens"] = args.gen_tokens
-            body["ignore_eos"] = True
+        body = dict(body) if args.full else pin_length(body, gen_tokens[i])
         if args.model:
             body["model"] = args.model
 
@@ -251,9 +493,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
     t_start = time.perf_counter()
     try:
         if args.concurrency > 1:
-            with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-                futures = [pool.submit(send, i, b) for i, b in enumerate(reqs)]
-                rows = [f.result() for f in futures]
+            rows = run_in_turn_order(args.concurrency, prev, lambda i: send(i, reqs[i]))
         else:
             rows = [send(i, b) for i, b in enumerate(reqs)]
     except RuntimeError as e:
@@ -279,7 +519,10 @@ def cmd_replay(args: argparse.Namespace) -> int:
     ttft = [r["ttft_s"] for r in rows if r["ttft_s"] is not None]
     meta = {
         "requests": len(rows),
+        "conversations": sum(p is None for p in prev),
         "concurrency": args.concurrency,
+        # Requests actually in flight, averaged over the wall time.
+        "mean_in_flight": (sum(lat) / total) if total else None,
         "stream": bool(args.stream),
         "gen_tokens": None if args.full else args.gen_tokens,
         "wall_s": round(total, 4),
@@ -317,7 +560,8 @@ def cmd_replay(args: argparse.Namespace) -> int:
           f"p50 {meta['latency_ms']['p50']:8.1f}  p95 {meta['latency_ms']['p95']:8.1f}")
     print(f"  through  {meta['requests_per_s']:.2f} req/s  "
           f"{meta['output_tokens_per_s']:.1f} output tok/s  "
-          f"{meta['total_tokens_per_s']:.1f} total tok/s")
+          f"{meta['total_tokens_per_s']:.1f} total tok/s  "
+          f"{meta['mean_in_flight']:.1f} in flight on average")
 
     if args.out:
         with open(args.out, "w") as f:
@@ -821,6 +1065,7 @@ _SUMMARY_METRICS = (
     ("WORKLOAD", None, None, None),
     ("requests replayed", "", lambda a, b, n: _client_stat(a, "requests"), None),
     ("concurrency", "", lambda a, b, n: _client_stat(a, "concurrency"), None),
+    ("  mean in flight", "", lambda a, b, n: _client_stat(a, "mean_in_flight"), None),
     ("prompt tokens", "tok", lambda a, b, n: _client_stat(a, "prompt_tokens"), None),
     ("generated tokens", "tok", lambda a, b, n: _client_stat(a, "completion_tokens"), None),
 
@@ -1031,6 +1276,21 @@ def cmd_summary(args: argparse.Namespace) -> int:
     return 0
 
 
+def _gen_tokens_arg(value: str) -> Union[int, str]:
+    """A token count of at least 2, or ``reply``."""
+    if value == "reply":
+        return value
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{value!r}: want a token count or `reply`"
+        ) from None
+    if n < 2:
+        raise argparse.ArgumentTypeError(f"{value}: want at least 2")
+    return n
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1042,9 +1302,10 @@ def main() -> int:
     r.add_argument("--model", default=None, help="override the model field")
     r.add_argument("--limit", type=int, default=None)
     r.add_argument("--timeout", type=float, default=1800.0)
-    r.add_argument("--gen-tokens", type=int, default=64,
-                   help="force exactly this many generated tokens per turn "
-                        "(default 64; keep it >= 2, see module docstring)")
+    r.add_argument("--gen-tokens", type=_gen_tokens_arg, default=64,
+                   help="force exactly this many generated tokens per turn, or "
+                        "`reply`: the length of the reply each turn got when "
+                        "captured, read from its next turn (default 64; at least 2)")
     r.add_argument("--full", action="store_true",
                    help="use each captured request's own max_tokens instead")
     r.add_argument("--warmup", type=int, default=3,
@@ -1062,8 +1323,8 @@ def main() -> int:
                         "--no-stream restores the old single-response behaviour and "
                         "reports no TTFT")
     r.add_argument("--concurrency", type=int, default=1,
-                   help="requests in flight at once (default 1); above 1, reuse "
-                        "depends on how requests interleave")
+                   help="requests in flight at once (default 1); a turn waits for "
+                        "its conversation's previous turn to finish")
     r.add_argument("--flush-every", action="store_true",
                    help="empty the radix tree before every request, so neither "
                         "arm reuses anything (diagnosis only -- destroys timings)")

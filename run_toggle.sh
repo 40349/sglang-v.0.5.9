@@ -32,8 +32,11 @@ REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 [ -d "$REPO/python/sglang" ] || { echo "REFUSING: no checkout found; submit from it"; exit 1; }
 SERVER=$REPO/sglang_server.sh
 OUT=${OUT:-$REPO/ab_out}
-GEN_TOKENS=${GEN_TOKENS:-32}  # fixed generated length per replayed request
-CONC=${CONC:-1}               # requests in flight
+# Generated length per replayed request: a token count, or `reply` for the length of
+# the reply each turn got when captured.
+GEN_TOKENS=${GEN_TOKENS:-32}
+# Requests in flight; a turn waits for its conversation's previous turn.
+CONC=${CONC:-1}
 # Use each request's own max_tokens instead of pinning the length with ignore_eos.
 FULL=${FULL:-}
 # Server audits: double frees in the KV pool, and each reused chunk's tokens against
