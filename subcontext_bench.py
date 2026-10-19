@@ -467,7 +467,8 @@ def cmd_replay(args: argparse.Namespace) -> int:
         text = res["text"]
         usage = res["usage"] or {}
         prompt = usage.get("prompt_tokens", 0) or 0
-        # None when the server gives no prompt_tokens_details (no --enable-cache-report).
+        # None when the server gives no prompt_tokens_details: nothing cached, or no
+        # --enable-cache-report.
         details = usage.get("prompt_tokens_details")
         cached = None if details is None else (details.get("cached_tokens") or 0)
         row = {
@@ -481,7 +482,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
             **({"text": text} if args.save_text else {}),
         }
         if cached is None:
-            shown = f"cached={'n/a':>6}  (server lacks --enable-cache-report)"
+            shown = f"cached={'n/a':>6}  (no cache detail: none cached, or no --enable-cache-report)"
         else:
             shown = (f"cached={cached:6d}  "
                      f"({100.0 * cached / prompt if prompt else 0:5.1f}%)")
@@ -513,7 +514,8 @@ def cmd_replay(args: argparse.Namespace) -> int:
         hit_rate = (100.0 * tot_cached / tot_prompt) if tot_prompt else 0.0
         cache_str = f"cached {tot_cached} tok ({hit_rate:.1f}%)"
         if missing:
-            cache_str += f" [{missing} request(s) reported no cache detail, counted as 0]"
+            cache_str += (f" [{missing} request(s) reported no cache detail, which the server"
+                          " omits when nothing was cached; counted as 0]")
 
     lat = [r["latency_s"] for r in rows]
     ttft = [r["ttft_s"] for r in rows if r["ttft_s"] is not None]
@@ -641,6 +643,10 @@ def summarize(rows: List[dict]) -> Dict[str, float]:
         "rotated_tokens": rotated_tok,
         "sub_reqs": sub_reqs,
         "prefill_passes": len(ext),
+        # Requests summed over prefill passes: a request chunked into k passes counts k times.
+        "prefill_req_passes": (
+            sum(r["bs"] for r in ext) if all("bs" in r for r in ext) else None
+        ),
         "prefill_gpu_ms": ext_ms,
         "prefill_new_tokens": new_tok,
         "prefill_cached_tokens": cached_tok,
@@ -734,12 +740,25 @@ def cmd_report(args: argparse.Namespace) -> int:
             f"\nprefill GPU time saved: {saved:,.1f} ms "
             f"({100.0 * saved / a['prefill_gpu_ms']:+.1f}%)"
         )
-    # Different chunking: cross-check reuse against the prompt total.
-    if a["prefill_passes"] != b["prefill_passes"]:
-        prompt = min(a["prefill_total_tokens"], b["prefill_total_tokens"])
+    ra, rb = a["prefill_req_passes"], b["prefill_req_passes"]
+    if a["prefill_passes"] != b["prefill_passes"] and ra is not None and ra == rb:
         print(
             f"\nNOTE: pass counts differ ({a['prefill_passes']:,} vs "
-            f"{b['prefill_passes']:,}), so the two arms did NOT chunk the same way.\n"
+            f"{b['prefill_passes']:,}), but both arms prefilled {ra:,} requests summed\n"
+            "over passes: the arms put different numbers of requests in one prefill\n"
+            "pass, and chunked alike. The token rows above stay comparable."
+        )
+    # Different chunking: cross-check reuse against the prompt total.
+    elif a["prefill_passes"] != b["prefill_passes"]:
+        prompt = min(a["prefill_total_tokens"], b["prefill_total_tokens"])
+        if ra is None or rb is None:
+            how = "so the two arms batched or chunked\nprefills differently"
+        else:
+            how = (f"and requests summed over passes too ({ra:,} vs {rb:,}),\n"
+                   "so the two arms did NOT chunk the same way")
+        print(
+            f"\nNOTE: pass counts differ ({a['prefill_passes']:,} vs "
+            f"{b['prefill_passes']:,}), {how}.\n"
             "That is expected when the arms chunk a prompt differently; it does\n"
             "not by itself mean the request sequences differed, and the token rows\n"
             "above stay comparable -- each is counted once per request. Cross-check\n"
@@ -889,7 +908,9 @@ def cmd_stages(args: argparse.Namespace) -> int:
             continue
         print(f"\n{child} is nested inside {parent}, so only one enters the total:")
         print(f"  {child:<20} counted  -- measured directly, baseline is the disabled path")
-        print(f"  {parent:<20} EXCLUDED -- its delta is a difference of two ~13ms numbers")
+        means = " vs ".join(f"{arm[parent]['mean_us'] / 1000.0:.1f}" for arm in (a, b) if parent in arm)
+        print(f"  {parent:<20} EXCLUDED -- its delta is a difference of large means "
+              f"({means} ms/call)")
         # Parent minus child is the work both arms share; its delta should be ~0.
         for label, arm in ((label_a, a), (label_b, b)):
             if parent in arm:
