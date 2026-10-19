@@ -31,8 +31,8 @@
 #
 #   MODEL=Qwen/Qwen3-Coder-30B-A3B-Instruct CTXLEN=81920 PORT=8000 MEMFRAC=0.90 BACKEND=triton
 #   CHUNKED_PREFILL        unset keeps the server default; the same for every arm compared
-#   KV_SPLITS              triton decode: most pieces one sequence's KV is split into;
-#                          unset keeps the server default (8); the same for every arm compared
+#   KV_SPLITS=64           triton decode: most pieces one sequence's KV is split into;
+#                          empty keeps the server default (8); the same for every arm compared
 #   TOOL_PARSER=qwen3_coder REASONING_PARSER= QUANT=  empty drops the flag
 #   Qwen3-30B-A3B:  MODEL=Qwen/Qwen3-30B-A3B CTXLEN=40960 TOOL_PARSER=qwen REASONING_PARSER=qwen3
 #   TOPK_LAYER CDC_TARGET CDC_MIN CDC_MAX             unset keeps the server default
@@ -57,8 +57,8 @@ MEMFRAC=${MEMFRAC:-0.90}
 # Same backend for every arm; cdc needs triton (per-position mask).
 BACKEND=${BACKEND:-triton}
 CHUNKED_PREFILL=${CHUNKED_PREFILL:-}
-KV_SPLITS=${KV_SPLITS:-}
 # No colon: an explicitly empty value drops the flag.
+KV_SPLITS=${KV_SPLITS-64}
 TOOL_PARSER=${TOOL_PARSER-qwen3_coder}
 # Only for a model that closes </think>: on one that never does, the parser takes the
 # whole reply, tool calls included, when the request carries no chat_template_kwargs.
