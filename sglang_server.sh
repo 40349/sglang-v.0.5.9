@@ -31,6 +31,8 @@
 #
 #   MODEL=Qwen/Qwen3-Coder-30B-A3B-Instruct CTXLEN=81920 PORT=8000 MEMFRAC=0.90 BACKEND=triton
 #   CHUNKED_PREFILL        unset keeps the server default; the same for every arm compared
+#   KV_SPLITS              triton decode: most pieces one sequence's KV is split into;
+#                          unset keeps the server default (8); the same for every arm compared
 #   TOOL_PARSER=qwen3_coder REASONING_PARSER= QUANT=  empty drops the flag
 #   Qwen3-30B-A3B:  MODEL=Qwen/Qwen3-30B-A3B CTXLEN=40960 TOOL_PARSER=qwen REASONING_PARSER=qwen3
 #   TOPK_LAYER CDC_TARGET CDC_MIN CDC_MAX             unset keeps the server default
@@ -55,6 +57,7 @@ MEMFRAC=${MEMFRAC:-0.90}
 # Same backend for every arm; cdc needs triton (per-position mask).
 BACKEND=${BACKEND:-triton}
 CHUNKED_PREFILL=${CHUNKED_PREFILL:-}
+KV_SPLITS=${KV_SPLITS:-}
 # No colon: an explicitly empty value drops the flag.
 TOOL_PARSER=${TOOL_PARSER-qwen3_coder}
 # Only for a model that closes </think>: on one that never does, the parser takes the
@@ -165,7 +168,7 @@ cat <<EOF
 ==========================================
 sglang server -- arm: $ARM
 model:  $MODEL
-backend:$BACKEND   audit: ${AUDIT:-off}   ctxlen: $CTXLEN   chunked prefill: ${CHUNKED_PREFILL:-default}
+backend:$BACKEND   audit: ${AUDIT:-off}   ctxlen: $CTXLEN   chunked prefill: ${CHUNKED_PREFILL:-default}   kv splits: ${KV_SPLITS:-default}
 node:   $(hostname)  ip: $NODE_IP
 URL:    http://$([ "$HOST" = 0.0.0.0 ] && echo "$NODE_IP" || echo "$HOST"):${PORT}/v1
 log:    $SERVER_LOG
@@ -188,6 +191,7 @@ python -u -m sglang.launch_server \
     --mem-fraction-static "$MEMFRAC" \
     --enable-cache-report \
     --attention-backend "$BACKEND" \
+    ${KV_SPLITS:+--triton-attention-num-kv-splits "$KV_SPLITS"} \
     ${TOOL_PARSER:+--tool-call-parser "$TOOL_PARSER"} \
     ${REASONING_PARSER:+--reasoning-parser "$REASONING_PARSER"} \
     ${QUANT:+--quantization "$QUANT"} \
