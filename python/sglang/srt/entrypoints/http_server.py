@@ -619,6 +619,15 @@ async def server_info():
             "cdc_max": subctx_config.CDC_MAX_TOKENS,
             "topk_ratios": list(subctx_config.TOPK_RATIOS),
             "topk_layer": subctx_config.TOPK_LAYER,
+            "relay_layers": (
+                list(subctx_config.RELAY_LAYERS)
+                if subctx_config.RELAY_LAYERS is not None
+                else None
+            ),
+            "relay_profile": bool(subctx_config.RELAY_PROFILE),
+            "relay_tau_dev": subctx_config.RELAY_TAU_DEV,
+            "relay_tau_inf": subctx_config.RELAY_TAU_INF,
+            "relay_suffix": subctx_config.RELAY_SUFFIX,
             # With `pid`, tells a stale server from the one just started.
             "audit": radix_cache.AUDIT_ON,
             "pid": os.getpid(),

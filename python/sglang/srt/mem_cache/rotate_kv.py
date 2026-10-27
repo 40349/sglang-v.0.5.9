@@ -249,6 +249,7 @@ class KVRotator:
                     HALF_P2=triton.next_power_of_2(self.half),
                     VROW_P2=triton.next_power_of_2(v_row_elems),
                 )
+            self._copy_relay_state(dst_loc, src_loc)
         self.rotated_tokens += n
 
     def _on_launch_stream(self, *index_tensors: torch.Tensor):
@@ -282,7 +283,14 @@ class KVRotator:
                 move_kv_cache_native(
                     self.pool.k_buffer, self.pool.v_buffer, dst_loc, src_loc
                 )
+            self._copy_relay_state(dst_loc, src_loc)
         self.copied_tokens += dst_loc.numel()
+
+    def _copy_relay_state(self, dst_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
+        """Copy RelayCaching's per-slot state with the KV, when the pool has it."""
+        state = getattr(self.pool, "relay_state", None)
+        if state is not None and dst_loc is not src_loc:
+            state.copy(dst_loc, src_loc)
 
 
 def find_rotary_embedding(model) -> Tuple[Optional[object], Optional[str]]:

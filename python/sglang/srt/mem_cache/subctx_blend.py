@@ -130,16 +130,30 @@ class BlendPlan:
         return keep_rows
 
 
-def build_plan(
-    batch,
-    out_cache_loc: torch.Tensor,
-    ratios: List[float],
-    check_layer: int,
-) -> BlendPlan:
-    """Build the plan for one extend batch.
+@dataclass
+class ProbeRows:
+    """The probe's rows of one extend batch: per request, from its probe start to the end
+    of its prompt. Shared by selective recompute and RelayCaching.
+    """
 
-    ``out_cache_loc`` holds the fresh tokens' slots. ``ratios`` gives one scored layer
-    each, from ``check_layer`` on.
+    probe_lens: List[int]
+    probe_starts: List[int]
+    row_offsets: List[int]
+    fresh_counts: List[int]
+    # Per probe row: the slot its K/V is written to.
+    probe_cache_loc: torch.Tensor
+    # Probe rows of the fresh and of the reused positions, ascending; ``reused_ptr``
+    # splits the reused rows per request.
+    fresh_rows: torch.Tensor
+    reused_rows: torch.Tensor
+    reused_ptr: List[int]
+    # Per request, the lengths of its contiguous reused spans in row order.
+    span_lens: List[List[int]]
+
+
+def probe_rows(batch, out_cache_loc: torch.Tensor) -> ProbeRows:
+    """The probe rows of one extend batch; ``out_cache_loc`` holds the fresh tokens'
+    slots.
     """
     device = out_cache_loc.device
 
@@ -147,7 +161,7 @@ def build_plan(
     probe_starts: List[int] = []
     row_offsets: List[int] = []
     fresh_counts: List[int] = []
-    keep_counts: List[List[int]] = [[] for _ in ratios]
+    span_lens: List[List[int]] = []
 
     probe_loc_parts: List[torch.Tensor] = []
     fresh_rows_parts: List[torch.Tensor] = []
@@ -194,21 +208,49 @@ def build_plan(
                 [s.to(device) for s in req.sub_context_reused_slots()]
             ).to(loc.dtype)
         probe_loc_parts.append(loc)
-        for counts, n in zip(keep_counts, req.sub_context_topk_counts(ratios)):
-            counts.append(n)
+        span_lens.append(req.sub_context_reused_span_lens())
         reused_ptr.append(reused_ptr[-1] + len(reused))
         row_cursor += rows
 
     empty = torch.empty(0, dtype=torch.int64, device=device)
-    return BlendPlan(
-        check_layers=list(range(check_layer, check_layer + len(ratios))),
+    return ProbeRows(
         probe_lens=probe_lens,
         probe_starts=probe_starts,
         row_offsets=row_offsets,
         fresh_counts=fresh_counts,
-        keep_counts=keep_counts,
         probe_cache_loc=torch.cat(probe_loc_parts),
         fresh_rows=torch.cat(fresh_rows_parts) if fresh_rows_parts else empty,
         reused_rows=torch.cat(reused_rows_parts) if reused_rows_parts else empty,
         reused_ptr=reused_ptr,
+        span_lens=span_lens,
+    )
+
+
+def build_plan(
+    batch,
+    out_cache_loc: torch.Tensor,
+    ratios: List[float],
+    check_layer: int,
+) -> BlendPlan:
+    """Build the plan for one extend batch.
+
+    ``out_cache_loc`` holds the fresh tokens' slots. ``ratios`` gives one scored layer
+    each, from ``check_layer`` on.
+    """
+    rows = probe_rows(batch, out_cache_loc)
+    keep_counts: List[List[int]] = [[] for _ in ratios]
+    for req in batch.reqs:
+        for counts, n in zip(keep_counts, req.sub_context_topk_counts(ratios)):
+            counts.append(n)
+    return BlendPlan(
+        check_layers=list(range(check_layer, check_layer + len(ratios))),
+        probe_lens=rows.probe_lens,
+        probe_starts=rows.probe_starts,
+        row_offsets=rows.row_offsets,
+        fresh_counts=rows.fresh_counts,
+        keep_counts=keep_counts,
+        probe_cache_loc=rows.probe_cache_loc,
+        fresh_rows=rows.fresh_rows,
+        reused_rows=rows.reused_rows,
+        reused_ptr=rows.reused_ptr,
     )

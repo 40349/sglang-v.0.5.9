@@ -588,6 +588,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init memory pool and attention backends
         self.init_memory_pool(min_per_gpu_memory)
+        self.init_subctx_relay()
 
         # Init max running requests
         self.max_running_requests = min(
@@ -2313,6 +2314,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.extend_seq_lens.device, non_blocking=True
         )
 
+    def init_subctx_relay(self) -> None:
+        """Give the KV pool RelayCaching's per-slot state and hook decode into the model,
+        when RelayCaching is on. Runs before CUDA graph capture.
+        """
+        from sglang.srt.utils import subctx_config
+
+        if not subctx_config.relay_active():
+            return
+        reason = subctx_config.relay_unsupported_reason(self)
+        if reason is not None:
+            raise ValueError(
+                "RelayCaching is enabled (SGLANG_SUBCTX_RELAY_LAYERS / "
+                f"SGLANG_SUBCTX_RELAY_PROFILE) but cannot be served: {reason}."
+            )
+        from sglang.srt.mem_cache.subctx_relay import RelayState, register_relay_hooks
+
+        pool = self.token_to_kv_pool
+        state = RelayState(
+            num_slots=pool.k_buffer[0].shape[0],
+            req_pool_size=self.req_to_token_pool.req_to_token.shape[0],
+            hidden_size=self.model_config.hidden_size,
+            dtype=self.dtype,
+            device=self.device,
+            start_layer=subctx_config.relay_start_layer(),
+        )
+        pool.relay_state = state
+        self.req_to_token_pool.relay_state = state
+        register_relay_hooks(self.model, state)
+
     def forward_subctx_blend(
         self, forward_batch: ForwardBatch, **kwargs
     ) -> LogitsProcessorOutput:
@@ -2381,6 +2411,188 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             **kwargs,
         )
 
+    def forward_subctx_relay(
+        self, forward_batch: ForwardBatch, **kwargs
+    ) -> LogitsProcessorOutput:
+        """RelayCaching prefill (``subctx_relay``), or its profile.
+
+        Each stage runs a subset of the probe rows over a layer range: every row writes
+        its K/V into its own slot, and the hidden states are cut down (or, at
+        ``L_start``, filled in) between stages. The attention metadata is rebuilt for
+        each stage.
+        """
+        from sglang.srt.mem_cache.subctx_relay import (
+            RelayProfile,
+            deviation_select,
+            influence_preselect,
+            value_deviation,
+        )
+        from sglang.srt.utils import subctx_config
+        from sglang.srt.utils.subctx_trace import TRACE_ON, trace
+
+        plan = forward_batch.subctx_blend_plan
+        rows = plan.rows
+        model = self.model
+        pool = forward_batch.token_to_kv_pool
+        state = pool.relay_state
+        num_layers = self.model_config.num_hidden_layers
+        n_req = plan.batch_size
+        input_ids = forward_batch.input_ids
+        positions = forward_batch.positions
+        probe_loc = rows.probe_cache_loc
+        reused_loc = probe_loc[rows.reused_rows]
+        device = probe_loc.device
+        current = {"rows": None}
+        # Per request, the rows from its logprob start to its end: computed tokens only,
+        # the last rows of the request in every stage.
+        logprob_tails = (
+            [
+                n - s
+                for n, s in zip(
+                    forward_batch.extend_seq_lens_cpu,
+                    forward_batch.extend_logprob_start_lens_cpu,
+                )
+            ]
+            if forward_batch.return_logprob
+            else None
+        )
+
+        def lens_with(reused: torch.Tensor) -> List[int]:
+            counts = torch.bincount(plan.req_of_reused[reused], minlength=n_req)
+            return [f + c for f, c in zip(rows.fresh_counts, counts.tolist())]
+
+        def run(reused: torch.Tensor, lens: List[int], interval):
+            """Run the fresh rows and the reused ones at ``reused`` (indices into
+            ``rows.reused_rows``) over ``interval``."""
+            run_rows = torch.sort(torch.cat([rows.fresh_rows, rows.reused_rows[reused]])).values
+            if (
+                current["rows"] is not None
+                and interval[0] > 0
+                and run_rows.numel() != current["rows"].numel()
+            ):
+                keep = torch.searchsorted(current["rows"], run_rows)
+                forward_batch.hidden_states = forward_batch.hidden_states[keep]
+                forward_batch.residual = forward_batch.residual[keep]
+            current["rows"] = run_rows
+            forward_batch.positions = positions[run_rows]
+            forward_batch.out_cache_loc = probe_loc[run_rows]
+            self._set_extend_lens(forward_batch, lens)
+            self.attn_backend.init_forward_metadata(forward_batch)
+            if interval[1] == num_layers and logprob_tails is not None:
+                # The logits processor reads the logprob start against the rows left.
+                forward_batch.extend_logprob_start_lens_cpu = [
+                    n - t for n, t in zip(lens, logprob_tails)
+                ]
+            embed_ids = input_ids[run_rows] if interval[0] == 0 else input_ids
+            return model.forward_split_prefill(
+                embed_ids, forward_batch.positions, forward_batch, interval, **kwargs
+            )
+
+        every = torch.arange(rows.reused_rows.numel(), device=device)
+        state.requests += sum(hi > lo for lo, hi in zip(rows.reused_ptr, rows.reused_ptr[1:]))
+        state.reused_rows += every.numel()
+
+        if plan.layers is None:
+            profile = RelayProfile(plan, state.decoded[reused_loc], num_layers)
+            out = None
+            for layer in range(num_layers):
+                cached = pool.get_value_buffer(layer)[reused_loc]
+                out = run(every, list(rows.probe_lens), (layer, layer + 1))
+                profile.add(cached, pool.get_value_buffer(layer)[reused_loc])
+            profile.write(subctx_config.RELAY_PROFILE)
+            state.selected_rows += every.numel()
+            return out
+
+        start, det, end = plan.layers
+        preselected = influence_preselect(
+            state.influence[reused_loc],
+            plan.span_id,
+            plan.span_off,
+            plan.span_len,
+            subctx_config.RELAY_TAU_INF,
+            subctx_config.RELAY_SUFFIX,
+        )
+
+        first = 0
+        if start > 0 and every.numel() > 0:
+            stored = state.decoded[reused_loc]
+            cold = every[~stored]
+            state.warm_rows += every.numel() - cold.numel()
+            if cold.numel() < every.numel():
+                run(cold, lens_with(cold), (0, start))
+                n_rows = int(rows.probe_cache_loc.numel())
+                hidden = forward_batch.hidden_states.new_empty(
+                    (n_rows, forward_batch.hidden_states.shape[1])
+                )
+                residual = torch.zeros_like(hidden)
+                hidden[current["rows"]] = forward_batch.hidden_states
+                residual[current["rows"]] = forward_batch.residual
+                warm = every[stored]
+                hidden[rows.reused_rows[warm]] = state.hidden[reused_loc[warm]]
+                forward_batch.hidden_states = hidden
+                forward_batch.residual = residual
+                current["rows"] = torch.arange(n_rows, device=device)
+                first = start
+
+        def finish(out, selected: torch.Tensor, layer: int, n_deferred: int, deviation):
+            """Record the tallies and return ``out``; ``selected`` ran past ``layer``."""
+            state.selected_rows += selected.numel()
+            state.deferred += n_deferred
+            if TRACE_ON:
+                trace(
+                    f"[TRACE-RELAY] rids={plan.rids} reused={every.numel()} "
+                    f"spans={plan.span_len.numel()} preselected={int(preselected.sum())} "
+                    f"selected={selected.numel()} deferred={n_deferred} "
+                    f"selection_layer={layer} mean_deviation_at_det={deviation}"
+                )
+            return out
+
+        cached = pool.get_value_buffer(det)[reused_loc]
+        out = run(every, list(rows.probe_lens), (first, det + 1))
+        if det + 1 == num_layers:
+            return finish(out, every, det, 0, None)
+        fresh = pool.get_value_buffer(det)[reused_loc]
+        keep, pending = deviation_select(
+            cached,
+            fresh,
+            plan.req_of_reused,
+            n_req,
+            subctx_config.RELAY_TAU_DEV,
+            preselected,
+        )
+        det_deviation = (
+            f"{float(value_deviation(cached.float(), fresh.float()).mean()):.5f}"
+            if TRACE_ON
+            else None
+        )
+        selected = every[keep]
+        n_deferred = int(pending.sum())
+        layer = det
+        # A request whose cached V matches its fresh V selects again one layer later.
+        while layer < end and bool(pending.any()):
+            layer += 1
+            cached = pool.get_value_buffer(layer)[reused_loc[selected]]
+            out = run(selected, lens_with(selected), (layer, layer + 1))
+            if layer + 1 == num_layers:
+                return finish(out, selected, layer, n_deferred, det_deviation)
+            again, still = deviation_select(
+                cached,
+                pool.get_value_buffer(layer)[reused_loc[selected]],
+                plan.req_of_reused[selected],
+                n_req,
+                subctx_config.RELAY_TAU_DEV,
+                preselected[selected],
+            )
+            redo = pending[plan.req_of_reused[selected]]
+            selected = selected[torch.where(redo, again, True)]
+            pending &= still
+
+        if layer < end:
+            out = run(selected, lens_with(selected), (layer + 1, end + 1))
+        if end + 1 < num_layers:
+            out = run(every[:0], list(rows.fresh_counts), (end + 1, num_layers))
+        return finish(out, selected, layer, n_deferred, det_deviation)
+
     def forward_extend(
         self,
         forward_batch: ForwardBatch,
@@ -2396,6 +2608,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             kwargs["input_embeds"] = forward_batch.input_embeds.bfloat16()
         if not self.is_generation:
             kwargs["get_embedding"] = True
+
+        relay_state = getattr(forward_batch.token_to_kv_pool, "relay_state", None)
+        if relay_state is not None:
+            relay_state.mark_prefilled(forward_batch.out_cache_loc)
+
+        if relay_state is not None and forward_batch.subctx_blend_plan is not None:
+            return (
+                self.forward_subctx_relay(
+                    forward_batch,
+                    input_embeds=kwargs.get("input_embeds"),
+                ),
+                False,
+            )
 
         if forward_batch.subctx_blend_plan is not None:
             # No graph: piecewise CUDA graphs and torch.compile are refused at launch.

@@ -111,6 +111,18 @@ class ModelRunnerKVCacheMixin:
                 cell_size = (cell_size // 2) + (
                     (n * k * num_layers * 2 * kv_size) // scale_block_size
                 )
+
+        from sglang.srt.utils import subctx_config
+
+        if subctx_config.relay_active():
+            from sglang.srt.mem_cache.subctx_relay import RelayState
+
+            # RelayCaching's per-slot state (subctx_relay.RelayState).
+            cell_size += RelayState.bytes_per_token(
+                self.model_config.hidden_size,
+                torch._utils._element_size(self.dtype),
+                subctx_config.relay_start_layer(),
+            )
         return cell_size
 
     def profile_max_num_token(self: ModelRunner, total_gpu_memory: int):

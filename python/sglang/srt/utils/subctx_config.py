@@ -74,6 +74,55 @@ def topk_check_layers() -> range:
     return range(TOPK_LAYER, TOPK_LAYER + len(TOPK_RATIOS))
 
 
+# RelayCaching (arXiv 2603.13289, ported from github.com/YingshengGeng/RelayCaching):
+# "L_start,L_det,L_end". Decode stores each output token's hidden state at the input of
+# L_start and the attention it receives from later output tokens. A reused token skips
+# layers [0, L_start) when it has a stored hidden state, runs [L_start, L_det], and runs
+# (L_det, L_end] when selected at L_det; layers after L_end run the fresh tokens only.
+_RELAY_LAYERS_ENV = os.environ.get("SGLANG_SUBCTX_RELAY_LAYERS", "")
+try:
+    RELAY_LAYERS = (
+        tuple(int(x) for x in _RELAY_LAYERS_ENV.split(",")) if _RELAY_LAYERS_ENV else None
+    )
+except ValueError:
+    raise ValueError(
+        f"SGLANG_SUBCTX_RELAY_LAYERS={_RELAY_LAYERS_ENV!r}; want L_start,L_det,L_end, "
+        "e.g. 1,3,18"
+    ) from None
+
+# Selected at L_det: reused tokens whose value moved more than RELAY_TAU_DEV times the
+# request's mean deviation. Selected before the forward, per contiguous reused span: the
+# span's last RELAY_SUFFIX tokens and its most attended-to tokens, RELAY_TAU_INF setting
+# their share.
+RELAY_TAU_DEV = float(os.environ.get("SGLANG_SUBCTX_RELAY_TAU_DEV", "1.5"))
+RELAY_TAU_INF = float(os.environ.get("SGLANG_SUBCTX_RELAY_TAU_INF", "1.45"))
+RELAY_SUFFIX = int(os.environ.get("SGLANG_SUBCTX_RELAY_SUFFIX", "10"))
+
+# Profile mode: a path. Every reused token is recomputed on every layer and the per-layer
+# deviation of its cached KV is appended to this file, one JSON line per request;
+# scripts/subcontext_sim/relay_layers.py picks RELAY_LAYERS from it.
+RELAY_PROFILE = os.environ.get("SGLANG_SUBCTX_RELAY_PROFILE", "")
+
+
+def relay_active() -> bool:
+    """Whether reused tokens are rectified the RelayCaching way, or profiled for it."""
+    return (RELAY_LAYERS is not None or bool(RELAY_PROFILE)) and not DISABLE_SUBCONTEXT
+
+
+def relay_start_layer() -> int:
+    """The layer whose input hidden state decode stores; 0 stores none."""
+    if RELAY_LAYERS is None:
+        return 0
+    return RELAY_LAYERS[0]
+
+
+def probe_active() -> bool:
+    """Whether the prefill runs each prompt from its probe start on and cuts the reused
+    rows down between layers (selective recompute, RelayCaching or its profile).
+    """
+    return topk_active() or relay_active()
+
+
 if not all(0.0 <= r <= 1.0 for r in TOPK_RATIOS):
     raise ValueError(
         f"SGLANG_SUBCTX_TOPK_RATIO={TOPK_RATIOS}; want fractions in [0, 1]"
@@ -100,6 +149,42 @@ if TOPK_LAYER == 0 and 0.0 < TOPK_RATIOS[0] < 1.0:
         "key depends only on the token and its position, so every deviation is zero. "
         "Use layer 1 or later. (Layer 0 is allowed at ratio 1.0, where the score "
         "decides nothing.)"
+    )
+
+if RELAY_LAYERS is not None or RELAY_PROFILE:
+    if DISABLE_SUBCONTEXT:
+        raise ValueError(
+            "SGLANG_SUBCTX_RELAY_LAYERS / SGLANG_SUBCTX_RELAY_PROFILE rectify reused "
+            "chunks, and SGLANG_DISABLE_SUBCONTEXT=1 reuses none"
+        )
+    if TOPK_RATIOS[0] > 0.0:
+        raise ValueError(
+            "RelayCaching and selective recompute (SGLANG_SUBCTX_TOPK_RATIO) both choose "
+            "which reused tokens to recompute; set one of them"
+        )
+    if RELAY_LAYERS is not None and RELAY_PROFILE:
+        raise ValueError(
+            "SGLANG_SUBCTX_RELAY_PROFILE recomputes every reused token on every layer to "
+            "measure them; it takes no SGLANG_SUBCTX_RELAY_LAYERS"
+        )
+
+if RELAY_LAYERS is not None:
+    if len(RELAY_LAYERS) != 3:
+        raise ValueError(
+            f"SGLANG_SUBCTX_RELAY_LAYERS={RELAY_LAYERS}; want three layers, "
+            "L_start,L_det,L_end"
+        )
+    _start, _det, _end = RELAY_LAYERS
+    if not 0 <= _start < _det <= _end:
+        raise ValueError(
+            f"SGLANG_SUBCTX_RELAY_LAYERS={RELAY_LAYERS}; want 0 <= L_start < L_det <= L_end "
+            "(detection runs on a layer after the one the hidden state is loaded at)"
+        )
+
+if RELAY_TAU_DEV < 0 or RELAY_TAU_INF < 0 or RELAY_SUFFIX < 0:
+    raise ValueError(
+        f"SGLANG_SUBCTX_RELAY_TAU_DEV={RELAY_TAU_DEV}, SGLANG_SUBCTX_RELAY_TAU_INF="
+        f"{RELAY_TAU_INF}, SGLANG_SUBCTX_RELAY_SUFFIX={RELAY_SUFFIX}; want each >= 0"
     )
 
 
@@ -234,6 +319,52 @@ def topk_unsupported_reason(model_runner) -> Optional[str]:
     case below either cannot run a layer range, splits the tokens across ranks, or reads
     a token count the cut changes.
     """
+    num_layers = model_runner.model_config.num_hidden_layers
+    last = topk_check_layers()[-1]
+    if last >= num_layers - 1:
+        return (
+            f"SGLANG_SUBCTX_TOPK_LAYER={TOPK_LAYER} with {len(TOPK_RATIOS)} ratios "
+            f"scores up to layer {last}, which leaves no layer after it to recompute "
+            f"({num_layers} layers)"
+        )
+    return _cut_unsupported_reason(model_runner)
+
+
+def relay_unsupported_reason(model_runner) -> Optional[str]:
+    """Return why reused tokens cannot be rectified the RelayCaching way, or None.
+
+    Besides what selective recompute needs, decode stores per-slot state through hooks
+    on the model's decoder layers and attention modules.
+    """
+    from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    num_layers = model_runner.model_config.num_hidden_layers
+    if RELAY_LAYERS is not None and RELAY_LAYERS[2] >= num_layers:
+        return (
+            f"SGLANG_SUBCTX_RELAY_LAYERS={RELAY_LAYERS} ends at layer {RELAY_LAYERS[2]}, "
+            f"past the model's last layer {num_layers - 1}"
+        )
+    layers = getattr(getattr(model_runner.model, "model", None), "layers", None)
+    if layers is None or len(layers) != num_layers:
+        return (
+            f"{type(model_runner.model).__name__} has no model.layers list of "
+            f"{num_layers} decoder layers to store the hidden state at"
+        )
+    for i, layer in enumerate(layers):
+        attns = [m for m in layer.modules() if isinstance(m, RadixAttention)]
+        if len(attns) != 1:
+            return f"decoder layer {i} holds {len(attns)} RadixAttention modules, not one"
+    pool = model_runner.token_to_kv_pool
+    if not isinstance(pool, MHATokenToKVPool):
+        return f"the {type(pool).__name__} KV pool has no plain per-layer K buffer"
+    if model_runner.server_args.enable_pdmux:
+        return "PD multiplexing decodes on its own stream and attention backend"
+    return _cut_unsupported_reason(model_runner)
+
+
+def _cut_unsupported_reason(model_runner) -> Optional[str]:
+    """Why the prefill's token set cannot be cut down between layers, or None."""
     from sglang.srt.layers.dp_attention import get_attention_tp_size
 
     args = model_runner.server_args
@@ -243,15 +374,6 @@ def topk_unsupported_reason(model_runner) -> Optional[str]:
             f"{type(model_runner.model).__name__} does not implement "
             "forward_split_prefill, which is where the token set is cut down between "
             "the scored layers and the rest"
-        )
-
-    num_layers = model_runner.model_config.num_hidden_layers
-    last = topk_check_layers()[-1]
-    if last >= num_layers - 1:
-        return (
-            f"SGLANG_SUBCTX_TOPK_LAYER={TOPK_LAYER} with {len(TOPK_RATIOS)} ratios "
-            f"scores up to layer {last}, which leaves no layer after it to recompute "
-            f"({num_layers} layers)"
         )
 
     if args.pp_size > 1:

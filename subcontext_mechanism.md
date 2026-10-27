@@ -20,6 +20,7 @@
 | `mem_cache/rotate_kv.py` | Triton 旋轉 kernel、KV 複製、啟動時的 RoPE 性質自測 |
 | `mem_cache/subctx_index.py` | 內容索引（依 token 內容找已快取的區塊、記錄它們在樹上的位置）、CDC 切點 |
 | `mem_cache/subctx_blend.py` | selective recompute：打分、挑選、寫回 |
+| `mem_cache/subctx_relay.py` | RelayCaching：每個 slot 的 decode 狀態、decode 掛鉤、被注意程度的 kernel、挑選規則、profile |
 | `mem_cache/common.py` | sparse prefill 的 `req_to_token` 寫入、重算 token 的額外 slot |
 | `layers/attention/triton_backend.py`、`triton_ops/extend_attention.py` | 依 query 絕對位置的 causal 遮罩 |
 | `model_executor/forward_batch_info.py`、`model_executor/model_runner.py` | 給定位置的 prefill、selective recompute 的兩段 layer forward |
@@ -78,6 +79,8 @@ R(p_new) · f(k_raw) == R(p_new − p) · k_cached[loc]
 |---|---|---|
 | `off` | `SGLANG_DISABLE_SUBCONTEXT=1` | 不切塊，原生 radix cache |
 | `cdc[@r]` | `SGLANG_SUBCTX_TOPK_RATIO=r`（不寫比例就是 0） | 依內容切塊；前綴比對 + scan + sparse prefill；整條存成一條鏈 |
+| `relay@S,D,E` | `SGLANG_SUBCTX_RELAY_LAYERS=S,D,E` | 同 cdc，重用的 token 照 RelayCaching 修正（第 8R 節） |
+| `relay@profile` | `SGLANG_SUBCTX_RELAY_PROFILE=<檔案>` | 同 cdc，重用的 token 全部重算，並記錄每層的偏差 |
 
 ### 全部環境變數
 
@@ -90,6 +93,11 @@ R(p_new) · f(k_raw) == R(p_new − p) · k_cached[loc]
 | `SGLANG_SUBCTX_CDC_MAX` | 1024 | cdc 強制切斷長度 |
 | `SGLANG_SUBCTX_TOPK_RATIO` | 0 | selective recompute 重算的比例；逗號分隔時每個比例對應一個連續的打分層（逐層篩選） |
 | `SGLANG_SUBCTX_TOPK_LAYER` | 1 | 第一個打分層 |
+| `SGLANG_SUBCTX_RELAY_LAYERS` | 空 | RelayCaching 的 `L_start,L_det,L_end`（第 8R 節） |
+| `SGLANG_SUBCTX_RELAY_TAU_DEV` | 1.5 | `L_det` 的 value 偏差門檻（倍數 × 平均） |
+| `SGLANG_SUBCTX_RELAY_TAU_INF` | 1.45 | 被注意程度的門檻（倍數 × 候選平均） |
+| `SGLANG_SUBCTX_RELAY_SUFFIX` | 10 | 每段重用內容一定重算的尾端 token 數 |
+| `SGLANG_SUBCTX_RELAY_PROFILE` | 空 | profile 模式的輸出檔 |
 | `SGLANG_SUBCTX_ROTATE_GPU` | 空 | 旋轉 kernel 的 CUDA event 計時（`rotate_kv.py`） |
 | `SGLANG_SUBCTX_AUDIT` | 空 | 重用 chunk 時逐 token 比對位置上的內容（`radix_cache.py`）、slot 級 double-free 偵測（`allocator.py`） |
 | `SGLANG_SUBCTX_TRACE` | 空 | 印 TRACE 除錯行 |
@@ -109,6 +117,8 @@ R(p_new) · f(k_raw) == R(p_new − p) · k_cached[loc]
   `SGLANG_SUBCONTEXT_ROTATE_ACROSS`、`SGLANG_SUBCTX_HASH_KEYS`、`SGLANG_SUBCTX_INDEX_DRYRUN`、`SGLANG_SUBCONTEXT_CACHE_OUTPUT`）。
 - `TOPK_RATIO` 的每個比例都必須在 [0, 1] 且不遞增；第一個 > 0 時不能同時設 `DISABLE`。
 - `TOPK_LAYER` 不可為負；`TOPK_LAYER = 0` 只允許第一個比例 = 1.0（第 0 層的 key 只取決於 token 與位置，分數全為 0）。
+- `RELAY_LAYERS` 或 `RELAY_PROFILE` 設了：不能同時設 `DISABLE`、不能同時有 `TOPK_RATIO > 0`、兩者不能同時設；
+  `RELAY_LAYERS` 要三個整數且 `0 <= L_start < L_det <= L_end`（超過模型層數在啟動時拒絕）；三個門檻不可為負。
 
 ---
 
@@ -475,6 +485,85 @@ req.sub_context_rotated_slots = None     # 責任移轉
 別的 request 從索引找到這段時讀的是原始那份。
 
 ---
+
+## 8R. RelayCaching（`relay@L_start,L_det,L_end`）
+
+論文 arXiv 2603.13289（ICML 2026），照官方程式 github.com/YingshengGeng/RelayCaching（MIT）移植：
+`RelayCaching/utils/relay_utils.py` 的 `RelayCache`、`utils/fixed_qwen3_hijack.py` 的掛鉤、`llm/gpt_chat.py`
+的候選交接、`experiments/observation/layer_selection.py` 的挑層規則。論文的情境是「上一個 agent 的回覆被放進下一個
+agent 的 prompt」；在這裡，scan 找到的重用段（其中由 decode 算出的就是上一輪的回覆）扮演那份 decoding KV，
+每段**連續**的重用內容（相鄰的 scan run 合併）是一個 relay chunk。儲存、scan、旋轉、整條存回都和 cdc 一樣，
+只有「怎麼修正重用的 KV」不同。程式在 `mem_cache/subctx_relay.py` 與 `ModelRunner.forward_subctx_relay`。
+
+### decode 時記下的東西（`RelayState`，每個 KV slot 一份）
+
+掛鉤在 `ModelRunner.init_subctx_relay` 註冊，在 CUDA graph capture 之前，所以會錄進 decode 的 graph：
+
+| 掛在哪 | 做什麼 |
+|---|---|
+| 第 0 層的 forward pre-hook | 這一步 decode 寫的 slot 標成「由 decode 算出」，被注意程度歸零 |
+| 第 `L_start` 層的 forward pre-hook（`L_start > 0`） | 存下該層輸入的 residual stream（`hidden_states + residual`） |
+| 每一層 `RadixAttention` 的 forward hook | Triton kernel：這一步的 query 對「這個請求自己的輸出 key」（位置 `[out_start, seq_len)`，含這一步的）做 softmax，各 head 相加，加到每個 key 的被注意程度上 |
+
+`out_start`（每個請求第一個輸出 token 的位置）在 `alloc_for_extend` 寫入；prefill 寫的 slot 在
+`forward_extend` 開頭清成「非 decode、分數 0」；scan 複製或旋轉 KV 時（`KVRotator`）這三樣跟著複製。
+CUDA graph 補齊的列 `seq_lens = 1`，範圍是空的，不會累加。
+
+### prefill（每個請求）
+
+1. **預選**（forward 開始時，`influence_preselect`）：每段取被注意程度前 256 名當候選，`p` = 候選中超過
+   「`TAU_INF` × 候選平均」的比例，預算 `ceil(段長 × p)`；段尾 `SUFFIX` 個一定選，**算在預算裡**，剩下的名額依排名給候選。
+2. **`[0, L_start)`**：跑新 token 與「沒有存 hidden state」的重用 token（例如 prefill 算出的生成標頭）；
+   有存的不跑，這幾層保留快取的 KV。
+3. **`L_start`**：有存的列以存下的 hidden state 接回（residual 為 0）。
+4. **`[L_start, L_det]`**：所有列都跑，每列把新算的 K/V 寫進自己的 slot。
+5. **`L_det`**（`deviation_select`）：每個重用 token 的分數 = 各 head 的 `1 - cos(新算的 V, 快取的 V)` 平均；
+   選「超過 `TAU_DEV` × 這個請求平均」的，再聯集第 1 步的預選。請求整體的 `1 - 平均 cos` < 1e-6 就全部保留、
+   下一層再選一次（**延後挑選**）。照官方程式，這些都用 KV 的 dtype 計算：bf16 下平均 cos 高於約 0.998
+   就會捨入成 1.0，所以實際上平均偏差低於約 0.002 就會延後；每個 token 的分數也只剩少數幾種值。
+6. **`(L_det, L_end]`**：新 token + 選中的重用 token。
+7. **`L_end` 之後**：只有新 token。最後一列一定是新 token（prompt 最後一個位置），logits 照常。
+
+每一段之間依「還在跑的列」重排 hidden states 與 attention metadata；`L_det` 和 `L_end` 各需要一次 host 同步
+（取得各請求的列數），`L_start > 0` 時再一次。`relay@0,1,<最後一層>` 加 `RELAY_TAU_DEV=0` 等於整段重算
+（4090 smoke：與 `cdc@1.0 TOPK_LAYER=0` 的回覆 9/9 相同）。
+
+### 與官方程式不同的地方
+
+- **relay chunk 的範圍**：官方是整個上游回覆；這裡是一段連續的重用內容，候選取「這一段內」的前 256 名
+  （官方取整個回覆的前 256 名，再套到該 chunk）。
+- **沒有 hidden state 的 token**：官方以請求為單位（整個請求沒有就全部從第 0 層算）；這裡逐 token 判斷。
+- **overlap 排程多跑的一步**：請求結束後 overlap 排程還會多 decode 一步（結果丟掉），那一步的注意力也會加進
+  被注意程度（官方 HF 流程沒有這一步）。4090 實測（Qwen2.5-7B，3 個 384 token 的回覆）：總量多約 0.24%，
+  逐 token 與 HF 重算的誤差中位數不變（2–3%）。關掉 overlap（`--disable-overlap-schedule`）就沒有這一步。
+- **request pool 位置被重用**：overlap 下一個請求的 pool 位置可能在它最後那一步還在跑時就分給新請求；kernel 只在
+  `req_to_token[rpi, seq_len-1]` 等於這一步寫的 slot 時才累加，換了主人的列跳過。
+- **保留了官方的行為**：沒有任何 token 超過偏差門檻時，連預選的也全部不重算；分數 NaN/inf/負值當 0；
+  門檻是嚴格大於；`TAU <= 1e-6` 全選；一組分數總和 < 1e-8 全不選。
+- `prefix_tokens`（官方預設 0）沒有移植。
+
+### profile 模式（`relay@profile`）
+
+每個重用 token 每一層都重算（結果等於整段重算），並對每個請求記錄每一層：`s_tok`（論文式 1-2：逐 token、各 head
+cosine 的平均）、`s_code`（官方 profiler 實際算的：在 `[head, token, dim]` 上沿 token 軸取 cosine 再平均，和 rho 一樣以 KV dtype 計算）、
+相鄰兩層的 Spearman rho（逐 token 的 `1 - cos`，heads × dim 攤平）。分成「所有重用 token」與「由 decode 算出的」兩組。
+`scripts/subcontext_sim/relay_layers.py` 對各請求取平均後套官方規則（預設照官方 profiler CLI：`tau_low` 0.99、
+λ 0.5（論文表 4 寫 2.0）、`C` 2、`N_min` 3、`T` 5），印出 `ARM=relay@S,D,E`。這支腳本的挑層結果在 3000 組隨機輸入上
+與官方 `layer_selection.py` 完全一致。
+
+### 量測
+
+profile 檔在每次 server 啟動時清空，只含這次的請求。`sglang_server.sh` 的檔名標籤會帶上改過的門檻
+（例如 `relay_L3-4-22_dev1.2`）。
+
+`sub-context index:` 那行之後多一行 `RelayCaching: N requests, R reused rows, W loaded with a stored hidden state,
+S (x%) run past L_det, D deferred selections`。`SGLANG_SUBCTX_TRACE=1` 時每次 prefill 印一行 `[TRACE-RELAY]`
+（段數、預選數、選中數、實際挑選的層、`L_det` 的平均偏差，最後一項以 fp32 計算）。
+要 logprob 的請求照常 scan（重用段一定在 logprob 起點之前結束，logprob 的位置都是新算的 token）；最後一段依剩下的列重新設定每個請求的 logprob 起點，跟 selective recompute 的做法相同。
+
+直接核對（2026-10-27，4090，Qwen2.5-7B，見 `progress/2026-10-27_relay_smoke.md`）：decode 存下的 hidden state 與
+sglang 自己 prefill 同一段 context 在 `L_start` 的輸入相比，cos 平均 0.99998、最低 0.99995；被注意程度與 HF 依
+注意力機率重算的值相關 0.990–0.997。
 
 ## 9. cache_unfinished_req 與 cache_finished_req
 

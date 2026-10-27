@@ -1158,6 +1158,18 @@ class Req(ReqDllmMixin):
         """The cache rows behind ``sub_context_reused_positions``, in the same order."""
         return [slots for _start, _end, slots, _ours in self._scored_runs()]
 
+    def sub_context_reused_span_lens(self) -> List[int]:
+        """The lengths of the maximal contiguous spans of scored runs, in order."""
+        spans: List[int] = []
+        end = None
+        for start, stop, _slots, _ours in self._scored_runs():
+            if start == end:
+                spans[-1] += stop - start
+            else:
+                spans.append(stop - start)
+            end = stop
+        return spans
+
     def sub_context_reused_ours(self) -> List[bool]:
         """Per scored position: whether its row is this request's rotated copy."""
         return [
@@ -1175,9 +1187,10 @@ class Req(ReqDllmMixin):
 
     def sub_context_forward_rows(self) -> int:
         """Rows the prefill forward runs: from ``sub_context_probe_start`` on when
-        selective recompute probes the prompt, otherwise the tokens to compute.
+        selective recompute or RelayCaching probes the prompt; the tokens to compute
+        when neither does.
         """
-        if self.sub_context_layout is not None and subctx_config.topk_active():
+        if self.sub_context_layout is not None and subctx_config.probe_active():
             return len(self.fill_ids) - self.sub_context_probe_start()
         return self.extend_input_len
 
@@ -1899,7 +1912,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if any(r.sub_context_layout is not None for r in reqs):
             # Sparse reuse: gather the computed tokens by position.
             self.subctx_fresh_positions = [r.sub_context_fresh_positions() for r in reqs]
-            if subctx_config.topk_active():
+            if subctx_config.probe_active():
                 # The scored layers run each prompt from its probe start on.
                 starts = [r.sub_context_probe_start() for r in reqs]
                 self.subctx_probe_positions = [

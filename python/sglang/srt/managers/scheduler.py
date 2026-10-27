@@ -779,7 +779,13 @@ class Scheduler(
         from sglang.srt.mem_cache.subctx_index import SubContextIndex
         from sglang.srt.utils.subctx_config import (
             MIN_CHUNK_TOKENS,
+            RELAY_LAYERS,
+            RELAY_PROFILE,
+            RELAY_SUFFIX,
+            RELAY_TAU_DEV,
+            RELAY_TAU_INF,
             TOPK_RATIOS,
+            relay_active,
             sparse_prefill_unsupported_reason,
             topk_active,
             topk_check_layers,
@@ -828,6 +834,22 @@ class Scheduler(
                 else ""
             ),
         )
+        if relay_active():
+            if RELAY_PROFILE:
+                logger.info(
+                    "RelayCaching PROFILE: every reused token recomputed on every layer, "
+                    "per-layer deviations appended to %s",
+                    RELAY_PROFILE,
+                )
+            else:
+                logger.info(
+                    "RelayCaching ENABLED: L_start %d, L_det %d, L_end %d, tau_dev %g, "
+                    "tau_inf %g, suffix %d",
+                    *RELAY_LAYERS,
+                    RELAY_TAU_DEV,
+                    RELAY_TAU_INF,
+                    RELAY_SUFFIX,
+                )
 
     def _init_sub_context_rotation(self):
         """Attach the KV rotator to the tree cache.

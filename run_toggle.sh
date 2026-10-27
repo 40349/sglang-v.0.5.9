@@ -114,14 +114,15 @@ stop() {
 }
 
 # Starts ARM $1 through sglang_server.sh and waits for it. Callers set LOG, and
-# optionally CAPTURE, FWD_TRACE, STAGE.
+# optionally CAPTURE, FWD_TRACE, STAGE, RELAY_PROF.
 launch() {
   stop
   if [ -n "${FWD_TRACE:-}" ]; then rm -f "$FWD_TRACE"; fi
   if [ -n "${STAGE:-}" ]; then rm -f "$STAGE".*; fi
+  if [ -n "${RELAY_PROF:-}" ]; then rm -f "$RELAY_PROF"; fi
   rm -f "$LOG"
   ARM=$1 SERVER_LOG=$LOG CAPTURE=${CAPTURE:-} FWD_TRACE=${FWD_TRACE:-} STAGE=${STAGE:-} \
-    nohup bash "$SERVER" > "$LOG.start" 2>&1 &
+    RELAY_PROF=${RELAY_PROF:-} nohup bash "$SERVER" > "$LOG.start" 2>&1 &
   local pid=$!
   echo $pid > "$PIDFILE"
   echo -n "  waiting"
@@ -186,13 +187,14 @@ TXT
       stem=$(arm_stem "$arm")
       echo; echo "======== ARM: $arm ========"
       log=$OUT/server_$(ARM=$arm bash "$SERVER" check).log
-      LOG=$log FWD_TRACE=$OUT/trace_$stem.jsonl STAGE=$OUT/stage_$stem launch "$arm"
+      LOG=$log FWD_TRACE=$OUT/trace_$stem.jsonl STAGE=$OUT/stage_$stem \
+        RELAY_PROF=$OUT/relay_profile_$stem.jsonl launch "$arm"
       verify_arm "$arm"
       FWD_TRACE=$OUT/trace_$stem.jsonl STAGE=$OUT/stage_$stem \
         CLIENT=$OUT/client_$stem.json replay
       # The index's own counters.
       case "${arm%%@*}" in
-        cdc) grep "sub-context index:" "$log" | tail -1 || true ;;
+        cdc|relay) grep "sub-context index:" "$log" | tail -1 || true ;;
       esac
     done
 
@@ -235,7 +237,7 @@ TXT
     echo
     echo "  ARM=cdc@0.15          the arm 'record' runs (required for record)"
     echo "  ARMS='off cdc@0.15'   which arms 'toggle' replays, in order; the first is the"
-    echo "                        baseline. off|cdc|cdc@ratio (sglang_server.sh)"
+    echo "                        baseline. off|cdc|cdc@ratio|relay@S,D,E|relay@profile (sglang_server.sh)"
     echo "  AUDIT=1               turn on the double-free and chunk-token audits (timings unusable)"
     echo "  FULL=1                let requests stop naturally, so one can stop during"
     echo "                        prefill -- the path a pinned replay never reaches"

@@ -108,6 +108,22 @@ ratio > 0 時，啟動還會檢查（不符就拒絕）：模型要有 `forward_
 `--tp-size 1`、不能用 pipeline parallel、DP attention、`--moe-dense-tp-size 1`、two-batch overlap、
 speculative decoding、torch.compile、回傳 hidden states、LoRA。
 
+RelayCaching（arXiv 2603.13289，照官方程式 github.com/YingshengGeng/RelayCaching 移植；`sglang_server.sh` 的
+arm 寫成 `ARM=relay@L_start,L_det,L_end` 或 `ARM=relay@profile`，機制見 `subcontext_mechanism.md` 第 8R 節）：
+
+| 變數 | 預設 | 說明 |
+|---|---|---|
+| `SGLANG_SUBCTX_RELAY_LAYERS` | 不設 | `L_start,L_det,L_end`，要 `0 <= L_start < L_det <= L_end < 層數`。decode 存下每個輸出 token 在 `L_start` 輸入的 hidden state，以及它被後面輸出 token 注意的程度；prefill 時重用的 token 從 `L_start` 接回、在 `L_det` 挑選、選中的跑到 `L_end` |
+| `SGLANG_SUBCTX_RELAY_TAU_DEV` | 1.5 | `L_det` 的 value 偏差超過「這個請求平均的 1.5 倍」的 token 被選中；照官方以 KV dtype（bf16）計算，請求的平均偏差低於約 0.002 時延到下一層再挑 |
+| `SGLANG_SUBCTX_RELAY_TAU_INF` | 1.45 | 每段重用內容依「被注意程度」預先選 token 的門檻倍數 |
+| `SGLANG_SUBCTX_RELAY_SUFFIX` | 10 | 每段重用內容最後幾個 token 一定重算（算在上面那個預算裡） |
+| `SGLANG_SUBCTX_RELAY_PROFILE` | 不設 | 一個檔案路徑（每次啟動清空）：每個重用 token 每一層都重算，並把每層的偏差寫進去（一個請求一行）；`scripts/subcontext_sim/relay_layers.py` 依官方規則從它挑出三個層。不能和 `RELAY_LAYERS` 同時設 |
+
+relay 不能和 `SGLANG_SUBCTX_TOPK_RATIO > 0` 同時開；啟動檢查與 ratio > 0 相同，另外要求模型有 `model.layers`、
+每層恰好一個 `RadixAttention`、KV pool 是 `MHATokenToKVPool`、不能用 `--enable-pdmux`。
+`L_start > 0` 時每個 KV slot 多存一份 hidden state（Qwen2.5-7B 每個 token 多 7 KB，KV pool 少約 11% 的 token），
+每個 slot 另外多 5 bytes（被注意程度與「是否由 decode 算出」）。
+
 診斷用（**會讓效能數字失真，量測時不要開**）：
 
 | 變數 | 作用 |
@@ -163,7 +179,8 @@ curl -s http://HOST:30000/server_info \
   | python -c "import json,sys; print(json.dumps(json.load(sys.stdin)['sub_context'], indent=2))"
 ```
 
-`ARM=cdc` 應該看到（`cdc@0.15` 只差 `topk_ratios`）：
+`ARM=cdc` 應該看到（`cdc@0.15` 只差 `topk_ratios`；`relay@3,4,22` 是 `"relay_layers": [3, 4, 22]`，
+`relay@profile` 是 `"relay_profile": true`）：
 
 ```json
 {
@@ -173,6 +190,11 @@ curl -s http://HOST:30000/server_info \
   "cdc_max": 1024,
   "topk_ratios": [0.0],
   "topk_layer": 1,
+  "relay_layers": null,
+  "relay_profile": false,
+  "relay_tau_dev": 1.5,
+  "relay_tau_inf": 1.45,
+  "relay_suffix": 10,
   "audit": false,
   "pid": 12345
 }
@@ -186,6 +208,7 @@ repo 裡有現成的檢查腳本，對不上會 refuse 並說明差在哪：
 ```bash
 python scripts/subcontext_sim/check_remote_arm.py http://HOST:30000 --arm cdc
 python scripts/subcontext_sim/check_remote_arm.py http://HOST:30000 --arm cdc@0.15
+python scripts/subcontext_sim/check_remote_arm.py http://HOST:30000 --arm relay@3,4,22
 ```
 
 另外可以加 `--audit true|false` 要求 audit 開或關。
