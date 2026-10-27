@@ -244,7 +244,9 @@ class Scenario:
     from layer 1 on; fresh slots start as NaN.
     """
 
-    def __init__(self, reqs, ratios, check_layer, deviation=stale, seed=0):
+    def __init__(
+        self, reqs, ratios, check_layer, deviation=stale, seed=0, logprob_starts=None
+    ):
         self.model = ToyModel(seed)
         self.reqs = reqs
         self.batch, out_cache_loc = lay_out(reqs)
@@ -279,13 +281,14 @@ class Scenario:
             token_to_kv_pool=self.kv,
             req_to_token_pool=self.batch.req_to_token_pool,
             extend_seq_lens=torch.zeros(len(reqs), dtype=torch.int32),
-            extend_seq_lens_cpu=None,
+            extend_seq_lens_cpu=[len(r.sub_context_fresh_positions()) for r in reqs],
             seq_lens_cpu=[len(r.fill_ids) for r in reqs],
             req_pool_indices_cpu=[r.req_pool_idx for r in reqs],
             hidden_states=None,
             residual=None,
             subctx_blend_plan=self.plan,
-            return_logprob=False,
+            return_logprob=logprob_starts is not None,
+            extend_logprob_start_lens_cpu=logprob_starts,
         )
 
         # Which reused positions ran each layer, recorded as the plan advances.
@@ -490,6 +493,24 @@ class TestForward(unittest.TestCase):
                     rtol=0,
                     atol=1e-10,
                 )
+
+    def test_logprob_starts_follow_the_rows_left_after_the_cuts(self):
+        # The plain request returns logprobs for its last 3 computed tokens, the sparse
+        # one for none (start = its computed-token count).
+        chained = make_req(40, [(0, 6, 100), (10, 24, 500)], exact=6)
+        plain = make_plain_req(30, 300, 25, req_pool_idx=1, ids=range(101, 131))
+        computed = [len(chained.sub_context_fresh_positions()), 5]
+        with_lp = Scenario([chained, plain], [0.5, 0.2], 1, logprob_starts=[computed[0], 2])
+        without = Scenario([chained, plain], [0.5, 0.2], 1)
+        lens = with_lp.plan.lens()
+        # The sparse request keeps reused rows, so its rows outnumber its computed tokens.
+        self.assertGreater(lens[0], computed[0])
+        self.assertEqual(with_lp.fb.extend_logprob_start_lens_cpu, [lens[0], lens[1] - 3])
+        # The plain request's last 3 rows are its last 3 positions.
+        end = lens[0] + lens[1]
+        self.assertEqual(with_lp.fb.positions[end - 3 : end].tolist(), [27, 28, 29])
+        # Asking for logprobs changes nothing the layers compute.
+        self.assertTrue(torch.equal(with_lp.out, without.out))
 
     def test_the_last_row_of_each_request_is_its_last_position(self):
         chained = make_req(40, [(0, 6, 100), (10, 24, 500)], exact=6)
