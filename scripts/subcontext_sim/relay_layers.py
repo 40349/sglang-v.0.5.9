@@ -1,7 +1,8 @@
 """Pick RelayCaching's L_start, L_det, L_end from a relay@profile run.
 
-Reads the JSON lines ``RelayProfile`` writes (one per request with reused tokens),
-averages the per-layer similarity and the adjacent-layer Spearman rho over requests, and
+Reads the JSON lines ``RelayProfile`` writes (one per contiguous reused span, the
+counterpart of one calibration context), averages the per-layer similarity and the
+adjacent-layer Spearman rho over spans, and
 applies the official layer-range profiler's rules
 (github.com/YingshengGeng/RelayCaching, experiments/observation/layer_selection.py,
 MIT License, Copyright (c) 2025 Yingsheng Geng, Yuchong Gao, Weihong Wu, Guyue Liu,
@@ -147,7 +148,7 @@ def main() -> int:
     ap.add_argument("--min-rise-samples", type=int, default=3)
     ap.add_argument("--right-tail-layers", type=int, default=5)
     ap.add_argument(
-        "--min-reused", type=int, default=2, help="skip requests with fewer rows in the group"
+        "--min-reused", type=int, default=2, help="skip spans with fewer rows in the group"
     )
     args = ap.parse_args()
 
@@ -167,7 +168,7 @@ def main() -> int:
             sims.append(group["s_code" if args.metric == "code" else "s_tok"])
             rhos.append(group["rho"])
     if not sims:
-        print(f"no request in {args.profile} has {args.min_reused}+ rows in group "
+        print(f"no span in {args.profile} has {args.min_reused}+ rows in group "
               f"{args.group!r} ({seen} lines read)", file=sys.stderr)
         return 1
 
@@ -183,7 +184,7 @@ def main() -> int:
     )
     det, alpha = select_detection_layer(corr, start, end, num_layers)
 
-    print(f"{len(sims)} of {seen} requests, group {args.group}, metric {args.metric}, "
+    print(f"{len(sims)} of {seen} spans, group {args.group}, metric {args.metric}, "
           f"{num_layers} layers")
     print(f"{'layer':>5} {'sim':>8} {'rho(l,l+1)':>11} {'alpha':>8}")
     for l in range(num_layers):

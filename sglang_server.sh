@@ -126,7 +126,7 @@ if awk -v rs="$RATIO" 'BEGIN { split(rs, r, ","); exit !(r[1] > 0) }'; then
 fi
 if [ "$NAME" = relay ]; then
   TAG=relay_$([ -n "$RELAY_LAYERS" ] && echo "L${RELAY_LAYERS//,/-}" || echo profile)
-  # Thresholds set away from the defaults show in the tag.
+  # Thresholds set in the environment show in the tag.
   TAG=$TAG${RELAY_TAU_DEV:+_dev$RELAY_TAU_DEV}${RELAY_TAU_INF:+_inf$RELAY_TAU_INF}
   TAG=$TAG${RELAY_SUFFIX:+_suf$RELAY_SUFFIX}
 fi
@@ -159,7 +159,7 @@ CAPTURE=${CAPTURE-$WORK_DIR/traces/requests_${SUF}.jsonl}
 FWD_TRACE=${FWD_TRACE-$WORK_DIR/traces/trace_${SUF}.jsonl}
 STAGE=${STAGE-$WORK_DIR/traces/stage_${SUF}}
 RELAY_PROF=${RELAY_PROF:-$WORK_DIR/traces/relay_profile_${SUF}.jsonl}
-[ "$TAG" = relay_profile ] || RELAY_PROF=
+{ [ "$NAME" = relay ] && [ -z "$RELAY_LAYERS" ]; } || RELAY_PROF=
 for p in "$SERVER_LOG" "$CAPTURE" "$FWD_TRACE" "$STAGE" "$RELAY_PROF"; do
   [ -z "$p" ] || mkdir -p "$(dirname "$p")"
 done

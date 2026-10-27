@@ -471,10 +471,10 @@ class TestForward(unittest.TestCase):
             with open(path) as fh:
                 lines = [json.loads(line) for line in fh]
         self.assert_full_prefill(sc)
-        self.assertEqual(len(lines), 1)
+        # One line per span: [10, 24) with 10 decoded rows, [28, 36) with none.
+        self.assertEqual([(r["span"], r["n_reused"], r["n_decoded"]) for r in lines], [(0, 14, 10), (1, 8, 0)])
+        self.assertIsNone(lines[1]["dec"])
         rec = lines[0]
-        self.assertEqual(rec["n_reused"], 22)
-        self.assertEqual(rec["n_decoded"], 10)
         for group in ("all", "dec"):
             self.assertEqual(len(rec[group]["s_tok"]), NUM_LAYERS)
             self.assertEqual(len(rec[group]["s_code"]), NUM_LAYERS)
@@ -482,6 +482,14 @@ class TestForward(unittest.TestCase):
         # Layer 0's cached V carries no deviation (blend.stale).
         self.assertAlmostEqual(rec["all"]["s_tok"][0], 1.0, places=9)
         self.assertLess(rec["all"]["s_tok"][1], 1.0)
+        # Each span is measured on its own rows: span 0's s_code from its rows only.
+        keys, values, _out = sc.refs[0]
+        layer = 2
+        rows = list(range(10, 24))
+        fresh = torch.stack([values[layer, p] for p in rows])
+        cached = torch.stack([sc.cached[(req.rid, p, layer)][1] for p in rows])
+        want = float(torch.nn.functional.cosine_similarity(fresh, cached, dim=0, eps=1e-8).mean())
+        self.assertAlmostEqual(rec["all"]["s_code"][layer], want, places=9)
 
     def test_spearman_matches_a_hand_count(self):
         a = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])

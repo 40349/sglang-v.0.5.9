@@ -92,7 +92,7 @@ class RelayState:
             f"RelayCaching: {self.requests} requests, {self.reused_rows} reused rows, "
             f"{self.warm_rows} loaded with a stored hidden state, {self.selected_rows} "
             f"({100.0 * self.selected_rows / self.reused_rows:.1f}%) run past L_det, "
-            f"{self.deferred} deferred selections"
+            f"{self.deferred} requests deferred their selection"
         )
 
     @staticmethod
@@ -353,7 +353,9 @@ def mean_threshold_mask(
     s = _sanitize(scores)
     total = _group_sum(s, group, n_groups).to(s.dtype)
     count = _group_sum(torch.ones_like(s), group, n_groups)
-    cutoff = ((total.float() / count.clamp(min=1.0)).to(s.dtype).float() * tau).to(s.dtype)
+    cutoff = ((total.float() * (1.0 / count.clamp(min=1.0))).to(s.dtype).float() * tau).to(
+        s.dtype
+    )
     return (s > cutoff[group]) & (total >= 1e-8)[group]
 
 
@@ -542,8 +544,10 @@ def _spearman(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 class RelayProfile:
-    """Per request, per layer: how far the cached V of its reused rows sits from the
-    recomputed one. Two row groups: every reused row, and the decoded ones only.
+    """Per contiguous reused span, per layer: how far the cached V of its rows sits from
+    the recomputed one. A span is one sample, as one upstream reply is one calibration
+    context in the official profiler. Two row groups: every row of the span, and its
+    decoded rows only.
 
     Per layer and group: ``s_tok``, the mean over rows of the mean over heads of
     ``cos(cached, fresh)`` (the paper's Eq. 1-2); ``s_code``, the cosine along the row
@@ -556,15 +560,17 @@ class RelayProfile:
         self.plan = plan
         self.num_layers = num_layers
         rows = plan.rows
-        self.groups = []
+        # Per span: (request, span index in the request, its row groups).
+        self.spans = []
         for i in range(plan.batch_size):
-            lo, hi = rows.reused_ptr[i], rows.reused_ptr[i + 1]
-            idx = torch.arange(lo, hi, device=decoded.device)
-            dec = idx[decoded[lo:hi]]
-            self.groups.append({"all": idx, "dec": dec})
+            lo = rows.reused_ptr[i]
+            for j, n in enumerate(rows.span_lens[i]):
+                idx = torch.arange(lo, lo + n, device=decoded.device)
+                self.spans.append((i, j, {"all": idx, "dec": idx[decoded[lo : lo + n]]}))
+                lo += n
         self.out = [
             {g: {"s_tok": [], "s_code": [], "rho": []} for g in ("all", "dec")}
-            for _ in range(plan.batch_size)
+            for _ in self.spans
         ]
         self.prev_dev = None
 
@@ -575,9 +581,9 @@ class RelayProfile:
         """
         cos_tok = F.cosine_similarity(fresh.float(), cached.float(), dim=-1).mean(dim=1)
         dev = (1.0 - F.cosine_similarity(fresh.flatten(1), cached.flatten(1), dim=-1)).float()
-        for i, groups in enumerate(self.groups):
+        for k, (_i, _j, groups) in enumerate(self.spans):
             for name, idx in groups.items():
-                rec = self.out[i][name]
+                rec = self.out[k][name]
                 if idx.numel() == 0:
                     continue
                 rec["s_tok"].append(float(cos_tok[idx].mean()))
@@ -588,18 +594,17 @@ class RelayProfile:
         self.prev_dev = dev
 
     def write(self, path: str) -> None:
-        """Append one JSON line per request with reused rows."""
+        """Append one JSON line per reused span."""
         with open(path, "a") as fh:
-            for i, groups in enumerate(self.groups):
-                if groups["all"].numel() == 0:
-                    continue
+            for k, (i, j, groups) in enumerate(self.spans):
                 line = {
                     "rid": self.plan.rids[i],
+                    "span": j,
                     "prompt_len": self.plan.prompt_lens[i],
                     "n_reused": int(groups["all"].numel()),
                     "n_decoded": int(groups["dec"].numel()),
                     "num_layers": self.num_layers,
-                    "all": self.out[i]["all"],
-                    "dec": self.out[i]["dec"] if groups["dec"].numel() else None,
+                    "all": self.out[k]["all"],
+                    "dec": self.out[k]["dec"] if groups["dec"].numel() else None,
                 }
                 fh.write(json.dumps(line) + "\n")

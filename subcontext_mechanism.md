@@ -537,17 +537,19 @@ CUDA graph 補齊的列 `seq_lens = 1`，範圍是空的，不會累加。
   被注意程度（官方 HF 流程沒有這一步）。4090 實測（Qwen2.5-7B，3 個 384 token 的回覆）：總量多約 0.24%，
   逐 token 與 HF 重算的誤差中位數不變（2–3%）。關掉 overlap（`--disable-overlap-schedule`）就沒有這一步。
 - **request pool 位置被重用**：overlap 下一個請求的 pool 位置可能在它最後那一步還在跑時就分給新請求；kernel 只在
-  `req_to_token[rpi, seq_len-1]` 等於這一步寫的 slot 時才累加，換了主人的列跳過。
+  `req_to_token[rpi, seq_len-1]` 等於這一步寫的 slot 時才累加，換了主人的列跳過。新請求的 prompt 比舊序列短時，
+  那一格還沒被覆寫、檢查會通過，舊請求可能多收到一步的注意力（包含 prompt 的 token）；要完全擋掉得讓每個 decode
+  列帶一個 pool 位置的世代號，沒有做。
 - **保留了官方的行為**：沒有任何 token 超過偏差門檻時，連預選的也全部不重算；分數 NaN/inf/負值當 0；
   門檻是嚴格大於；`TAU <= 1e-6` 全選；一組分數總和 < 1e-8 全不選。
 - `prefix_tokens`（官方預設 0）沒有移植。
 
 ### profile 模式（`relay@profile`）
 
-每個重用 token 每一層都重算（結果等於整段重算），並對每個請求記錄每一層：`s_tok`（論文式 1-2：逐 token、各 head
+每個重用 token 每一層都重算（結果等於整段重算），並對**每段連續重用內容**記錄每一層（一段算一筆樣本，對應官方 profiler 的一個校準 context）：`s_tok`（論文式 1-2：逐 token、各 head
 cosine 的平均）、`s_code`（官方 profiler 實際算的：在 `[head, token, dim]` 上沿 token 軸取 cosine 再平均，和 rho 一樣以 KV dtype 計算）、
-相鄰兩層的 Spearman rho（逐 token 的 `1 - cos`，heads × dim 攤平）。分成「所有重用 token」與「由 decode 算出的」兩組。
-`scripts/subcontext_sim/relay_layers.py` 對各請求取平均後套官方規則（預設照官方 profiler CLI：`tau_low` 0.99、
+相鄰兩層的 Spearman rho（逐 token 的 `1 - cos`，heads × dim 攤平）。分成「這段的所有 token」與「其中由 decode 算出的」兩組。
+`scripts/subcontext_sim/relay_layers.py` 對各段取平均後套官方規則（預設照官方 profiler CLI：`tau_low` 0.99、
 λ 0.5（論文表 4 寫 2.0）、`C` 2、`N_min` 3、`T` 5），印出 `ARM=relay@S,D,E`。這支腳本的挑層結果在 3000 組隨機輸入上
 與官方 `layer_selection.py` 完全一致。
 
@@ -557,7 +559,7 @@ profile 檔在每次 server 啟動時清空，只含這次的請求。`sglang_se
 （例如 `relay_L3-4-22_dev1.2`）。
 
 `sub-context index:` 那行之後多一行 `RelayCaching: N requests, R reused rows, W loaded with a stored hidden state,
-S (x%) run past L_det, D deferred selections`。`SGLANG_SUBCTX_TRACE=1` 時每次 prefill 印一行 `[TRACE-RELAY]`
+S (x%) run past L_det, D requests deferred their selection`。`SGLANG_SUBCTX_TRACE=1` 時每次 prefill 印一行 `[TRACE-RELAY]`
 （段數、預選數、選中數、實際挑選的層、`L_det` 的平均偏差，最後一項以 fp32 計算）。
 要 logprob 的請求照常 scan（重用段一定在 logprob 起點之前結束，logprob 的位置都是新算的 token）；最後一段依剩下的列重新設定每個請求的 logprob 起點，跟 selective recompute 的做法相同。
 

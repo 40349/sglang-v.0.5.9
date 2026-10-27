@@ -117,7 +117,7 @@ arm 寫成 `ARM=relay@L_start,L_det,L_end` 或 `ARM=relay@profile`，機制見 `
 | `SGLANG_SUBCTX_RELAY_TAU_DEV` | 1.5 | `L_det` 的 value 偏差超過「這個請求平均的 1.5 倍」的 token 被選中；照官方以 KV dtype（bf16）計算，請求的平均偏差低於約 0.002 時延到下一層再挑 |
 | `SGLANG_SUBCTX_RELAY_TAU_INF` | 1.45 | 每段重用內容依「被注意程度」預先選 token 的門檻倍數 |
 | `SGLANG_SUBCTX_RELAY_SUFFIX` | 10 | 每段重用內容最後幾個 token 一定重算（算在上面那個預算裡） |
-| `SGLANG_SUBCTX_RELAY_PROFILE` | 不設 | 一個檔案路徑（每次啟動清空）：每個重用 token 每一層都重算，並把每層的偏差寫進去（一個請求一行）；`scripts/subcontext_sim/relay_layers.py` 依官方規則從它挑出三個層。不能和 `RELAY_LAYERS` 同時設 |
+| `SGLANG_SUBCTX_RELAY_PROFILE` | 不設 | 一個檔案路徑（每次啟動清空）：每個重用 token 每一層都重算，並把每層的偏差寫進去（每段連續重用內容一行）；`scripts/subcontext_sim/relay_layers.py` 依官方規則從它挑出三個層。不能和 `RELAY_LAYERS` 同時設 |
 
 relay 不能和 `SGLANG_SUBCTX_TOPK_RATIO > 0` 同時開；啟動檢查與 ratio > 0 相同，另外要求模型有 `model.layers`、
 每層恰好一個 `RadixAttention`、KV pool 是 `MHATokenToKVPool`、不能用 `--enable-pdmux`。
