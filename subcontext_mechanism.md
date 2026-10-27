@@ -86,7 +86,7 @@ R(p_new) · f(k_raw) == R(p_new − p) · k_cached[loc]
 | `SGLANG_DISABLE_SUBCONTEXT` | 空 | 非 0：chat 不切塊、不做啟動檢查、不掛旋轉器與索引。空：cdc，旋轉器與索引一定掛上 |
 | `SGLANG_SUBCONTEXT_ROTATE_NATIVE` | 空 | 用純 torch 旋轉取代 Triton kernel（除錯） |
 | `SGLANG_SUBCTX_MIN_CHUNK` | 64 | 索引登記與重用的最短長度；也是 cdc 切點的最小間距 |
-| `SGLANG_SUBCTX_CDC_TARGET` | 256 | cdc 平均 chunk 長度（捨去到 2 的冪） |
+| `SGLANG_SUBCTX_CDC_TARGET` | 256 | cdc 候選切點的平均間距（捨去到 2 的冪）；長訊息內 chunk 平均約 `MIN_CHUNK` + target |
 | `SGLANG_SUBCTX_CDC_MAX` | 1024 | cdc 強制切斷長度 |
 | `SGLANG_SUBCTX_TOPK_RATIO` | 0 | selective recompute 重算的比例；逗號分隔時每個比例對應一個連續的打分層（逐層篩選） |
 | `SGLANG_SUBCTX_TOPK_LAYER` | 1 | 第一個打分層 |
@@ -276,6 +276,9 @@ request 直接到第 8 步。第 8 步因此先做兩道冪等的保險（放掉
    指紋低 `log2(CDC_TARGET)` 個位元全為 0 的位置是候選切點。距上一個切點不足 `MIN_CHUNK` 的忽略、
    超過 `CDC_MAX` 強制切、尾段短於 `MIN_CHUNK` 就併入前一塊；訊息短於 `2 × MIN_CHUNK` 不細切。
    同樣的內容不論出現在哪裡都切在同樣的地方。
+   因為距上一個切點不足 `MIN_CHUNK` 的候選被忽略，之後平均還要再等 `CDC_TARGET` 個位置才遇到候選，
+   長訊息內的 chunk 平均約 `MIN_CHUNK + CDC_TARGET`（預設約 320），不是 `CDC_TARGET`；
+   短訊息則整則一塊（2026-10-22 實測：TB 長訊息內部 target 64/128/256 的平均是 134/187/296）。
 3. **切點快取**：每則訊息的切點依「訊息長度 + 內容雜湊」存在 LRU（最多 65,536 則），
    同一則訊息在後面的 request 再出現時直接取用，只有沒看過的訊息才跑第 2 步。
 

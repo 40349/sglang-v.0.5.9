@@ -90,7 +90,7 @@ python -u -m sglang.launch_server \
 
 | 變數 | 預設 | 說明 |
 |---|---|---|
-| `SGLANG_SUBCTX_CDC_TARGET` | 256 | 平均 chunk 長度，會無條件捨去到 2 的冪 |
+| `SGLANG_SUBCTX_CDC_TARGET` | 256 | 候選切點的平均間距，會無條件捨去到 2 的冪。不是 chunk 平均長度：長訊息內的 chunk 平均約 `MIN_CHUNK` + target（預設約 320），短訊息整則一塊 |
 | `SGLANG_SUBCTX_CDC_MAX` | 1024 | 強制切點的長度上限，應明顯大於 target |
 | `SGLANG_SUBCTX_MIN_CHUNK` | 64 | 最短 chunk，也是 cdc 切點的最小間距。比它短的區塊照樣隨整條鏈存進快取，但不登記索引（位置變了就找不回來）；索引的下限是 32（指紋視窗就是 32 個 token），設更低時索引仍以 32 計 |
 

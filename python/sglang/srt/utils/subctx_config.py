@@ -40,8 +40,10 @@ ROTATE_NATIVE = os.environ.get("SGLANG_SUBCONTEXT_ROTATE_NATIVE", "") not in (""
 MIN_CHUNK_TOKENS = int(os.environ.get("SGLANG_SUBCTX_MIN_CHUNK", "64"))
 
 # Block boundaries: a cut before every message, then cuts where the fingerprint of the
-# next tokens is 0 mod CDC_TARGET_TOKENS, i.e. by content. CDC_TARGET_TOKENS is the
-# average chunk length (rounded down to a power of two), CDC_MAX_TOKENS the forced cut.
+# next tokens is 0 mod CDC_TARGET_TOKENS, i.e. by content. CDC_TARGET_TOKENS (rounded
+# down to a power of two) is the mean gap between candidate cuts; candidates closer than
+# MIN_CHUNK_TOKENS to the previous cut are skipped. Blocks inside a long message average
+# about MIN_CHUNK_TOKENS + CDC_TARGET_TOKENS. CDC_MAX_TOKENS is the forced cut.
 CDC_TARGET_TOKENS = int(os.environ.get("SGLANG_SUBCTX_CDC_TARGET", "256"))
 CDC_MAX_TOKENS = int(os.environ.get("SGLANG_SUBCTX_CDC_MAX", "1024"))
 
