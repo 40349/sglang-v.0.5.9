@@ -251,9 +251,10 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
-    # End offset of each pre-split block in input_ids. Set only by the OpenAI chat
-    # path; `/generate` drops them from the request body. Dropped with a warning
-    # unless they increase and the last equals ``len(input_ids)``.
+    # End offset of each pre-split block in input_ids. Set by the OpenAI chat path, or
+    # by a `/generate` caller when the split is on (`/generate` drops them under
+    # SGLANG_DISABLE_SUBCONTEXT=1). Dropped with a warning unless they increase and the
+    # last equals ``len(input_ids)``.
     sub_context_ends: Optional[List[int]] = None
 
     # Routing key for routing-key schedule policy

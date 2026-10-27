@@ -2330,6 +2330,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         num_layers = self.model_config.num_hidden_layers
 
         plan.start()
+        # Per request, the rows from its logprob start to its end: computed tokens only,
+        # the last rows of the request at every cut.
+        logprob_tails = (
+            [
+                n - s
+                for n, s in zip(
+                    forward_batch.extend_seq_lens_cpu,
+                    forward_batch.extend_logprob_start_lens_cpu,
+                )
+            ]
+            if forward_batch.return_logprob
+            else None
+        )
         # One slot per probe row, for whatever writes the KV (the attention backend, or
         # a model's fused RoPE + KV write).
         forward_batch.out_cache_loc = plan.probe_cache_loc
@@ -2355,6 +2368,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.attn_backend.init_forward_metadata(forward_batch)
             start = layer + 1
 
+        # The logits processor reads the logprob start against the rows left.
+        if logprob_tails is not None:
+            forward_batch.extend_logprob_start_lens_cpu = [
+                n - t for n, t in zip(plan.lens(), logprob_tails)
+            ]
         return model.forward_split_prefill(
             forward_batch.input_ids,
             forward_batch.positions,

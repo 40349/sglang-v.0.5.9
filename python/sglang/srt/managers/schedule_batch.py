@@ -1252,12 +1252,11 @@ class Req(ReqDllmMixin):
         # Trimmed run -> tokens trimmed off the chunk's head.
         head = {}
         candidates = []
-        # Requests returning logprobs take the prefix only under selective recompute.
+        # Runs end before a logprob request's logprob start (`token_ids` stops there).
         with host_timer.record("scan_index"):
             found_runs = (
                 []
                 if self.sub_context_index_declined
-                or (self.return_logprob and subctx_config.topk_active())
                 else index.scan(
                     self.fill_ids, self.extra_key, min_end=exact + index.min_chunk_tokens
                 )
