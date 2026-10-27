@@ -285,6 +285,7 @@ class Scenario:
             hidden_states=None,
             residual=None,
             subctx_blend_plan=self.plan,
+            return_logprob=False,
         )
 
         # Which reused positions ran each layer, recorded as the plan advances.
