@@ -41,6 +41,13 @@
 #                     every arm compared
 #   AUDIT TRACE ROTATE_GPU DUMP_TREE                  diagnostics; timings then unusable
 #   SERVER_LOG CAPTURE FWD_TRACE STAGE                output paths; empty turns one off
+#   TEACHER_FORCE=1   accepts custom logit processors (code a client sends, run in the
+#                     server) and turns overlap scheduling off; for tf_kl.py's runs
+#   API_KEY           every endpoint but /health and /metrics then wants the header
+#                     "Authorization: Bearer $API_KEY"; required with TEACHER_FORCE=1. Letters,
+#                     digits, _ and -. It reaches sglang through a private config file, and the
+#                     files the run creates are readable by their owner only (the server log
+#                     prints the server args, the key included)
 #
 # By default every request is recorded to $WORK_DIR/traces/requests_<tag>_<job>.jsonl.
 
@@ -69,11 +76,25 @@ REASONING_PARSER=${REASONING_PARSER-}
 QUANT=${QUANT:-}
 AUDIT=${AUDIT:-}
 TRACE=${TRACE:-}
+TEACHER_FORCE=${TEACHER_FORCE:-}
 METRICS=${METRICS:-}
+API_KEY=${API_KEY:-}
+case "$TEACHER_FORCE" in
+  ""|1) ;;
+  *) echo "REFUSING: TEACHER_FORCE='$TEACHER_FORCE'; want 1 or unset"; exit 1 ;;
+esac
 case "$METRICS" in
   ""|1) ;;
   *) echo "REFUSING: METRICS='$METRICS'; want 1 or unset"; exit 1 ;;
 esac
+if [ -n "$TEACHER_FORCE" ] && [ -z "$API_KEY" ]; then
+  echo "REFUSING: TEACHER_FORCE=1 runs code clients send; set API_KEY, e.g. API_KEY=\$(openssl rand -hex 16)"
+  exit 1
+fi
+case "$API_KEY" in
+  *[!A-Za-z0-9_-]*) echo "REFUSING: API_KEY may hold letters, digits, _ and - only"; exit 1 ;;
+esac
+[ -z "$API_KEY" ] || umask 077
 
 for v in "TOPK_RATIO|write the ratio into the arm, e.g. ARM=cdc@0.15" \
          "MODEL_PATH|use MODEL" "SUBCTX_AUDIT|use AUDIT" "SUBCTX_TRACE|use TRACE"; do
@@ -181,9 +202,20 @@ node:   $(hostname)  ip: $NODE_IP
 URL:    http://$([ "$HOST" = 0.0.0.0 ] && echo "$NODE_IP" || echo "$HOST"):${PORT}/v1
 log:    $SERVER_LOG
 capture:${CAPTURE:- off}${METRICS:+
-metrics: on (/metrics)}
+metrics: on (/metrics)}${TEACHER_FORCE:+
+teacher-forced requests: on (custom logit processors, no overlap scheduling)}${API_KEY:+
+api key: set}
 ==========================================
 EOF
+
+API_CONFIG=
+if [ -n "$API_KEY" ]; then
+  API_CONFIG=$(mktemp --suffix=.yaml)
+  trap 'rm -f "$API_CONFIG"' EXIT
+  printf 'api-key: "%s"\n' "$API_KEY" > "$API_CONFIG"
+  : > "$SERVER_LOG"
+  chmod 600 "$SERVER_LOG"
+fi
 
 # --enable-cache-report puts cached_tokens in the usage payload.
 PYTHONUNBUFFERED=${TRACE:+1} \
@@ -205,4 +237,6 @@ python -u -m sglang.launch_server \
     ${REASONING_PARSER:+--reasoning-parser "$REASONING_PARSER"} \
     ${QUANT:+--quantization "$QUANT"} \
     ${METRICS:+--enable-metrics} \
+    ${TEACHER_FORCE:+--enable-custom-logit-processor --disable-overlap-schedule} \
+    ${API_CONFIG:+--config "$API_CONFIG"} \
     > "$SERVER_LOG" 2>&1

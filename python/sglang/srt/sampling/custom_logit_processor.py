@@ -200,3 +200,40 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
             logits[batch_idx, indices] = -float("inf")
 
         return logits
+
+
+class TeacherForcedLogitProcessor(CustomLogitProcessor):
+    """Emit ``custom_params["force_ids"]`` one token per step.
+
+    Before forcing step ``s`` it records, from the logits it was given,
+    ``[logprob of force_ids[s], [[logprob, token_id], ...]]`` with the top
+    ``custom_params["top_k"]`` tokens, at ``req.customized_info["teacher_forced"][s]``,
+    which the response returns in ``meta_info``. ``s`` is ``len(req.output_ids)``: the
+    server runs with ``--disable-overlap-schedule``. A prefill split into chunks
+    samples once per chunk, and the last chunk's record replaces the earlier ones.
+    """
+
+    def __call__(self, logits, custom_param_list: list[dict[str, Any]]):
+        for i, params in enumerate(custom_param_list):
+            req: Req = params["__req__"]
+            force = params["force_ids"]
+            step = len(req.output_ids)
+            if step >= len(force):
+                continue
+            logprobs = torch.log_softmax(logits[i].float(), dim=-1)
+            top = torch.topk(logprobs, params.get("top_k", 20))
+            entry = [
+                logprobs[force[step]].item(),
+                [list(x) for x in zip(top.values.tolist(), top.indices.tolist())],
+            ]
+            if req.customized_info is None:
+                req.customized_info = {}
+            records = req.customized_info.setdefault("teacher_forced", [])
+            assert step <= len(records), (req.rid, step, len(records))
+            if step < len(records):
+                records[step] = entry
+            else:
+                records.append(entry)
+            logits[i] = -float("inf")
+            logits[i, force[step]] = 0.0
+        return logits
