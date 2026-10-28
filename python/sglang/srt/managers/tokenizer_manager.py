@@ -169,6 +169,8 @@ class ReqState:
     input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
+    # Per key, the customized_info entries of every output so far.
+    customized_info: Dict[str, List[Any]] = dataclasses.field(default_factory=dict)
 
     # For detokenized logprobs
     input_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
@@ -1579,8 +1581,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if getattr(recv_obj, "routed_experts", None):
                 meta_info["routed_experts"] = recv_obj.routed_experts[i]
             if getattr(recv_obj, "customized_info", None):
+                # Each output carries the entries added since the previous one; meta_info
+                # carries all of them unless output_ids is incremental (--stream-output).
+                incremental = self.server_args.stream_output and getattr(
+                    state.obj, "stream", False
+                )
                 for k, v in recv_obj.customized_info.items():
-                    meta_info[k] = v[i]
+                    if incremental:
+                        meta_info[k] = v[i]
+                    else:
+                        state.customized_info.setdefault(k, []).extend(v[i])
+                        meta_info[k] = list(state.customized_info[k])
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
