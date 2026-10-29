@@ -196,6 +196,9 @@ TXT
       case "${arm%%@*}" in
         cdc|relay) grep "sub-context index:" "$log" | tail -1 || true ;;
       esac
+      case "${arm%%@*}" in
+        relay) grep "RelayCaching:" "$log" | tail -1 || true ;;
+      esac
     done
 
     stop
