@@ -1818,8 +1818,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                 "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
             }
             res = requests.post(
-                url + "/generate",
-                # url + request_name,
+                url + request_name,
                 json=json_data,
                 headers=headers,
                 timeout=(

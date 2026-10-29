@@ -1205,19 +1205,19 @@ if __name__ == "__main__":
     tree = RadixCache.create_simulated()
 
     # Example token id sequences (as lists of ints)
-    tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 3], extra_key='tool_def')))
-    # tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 3], extra_key=None)))
-    # tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 4, 5], extra_key=None)))
+    tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 3], extra_key=None)))
+    tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 3], extra_key=None)))
+    tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 4, 5], extra_key=None)))
     tree.insert(
-        InsertParams(key=RadixKey(token_ids=[1, 2, 4, 5, 6, 7], extra_key='tool_def'))
+        InsertParams(key=RadixKey(token_ids=[1, 2, 4, 5, 6, 7], extra_key=None))
     )
     tree.insert(
-        InsertParams(key=RadixKey(token_ids=[8, 9, 10, 11, 12], extra_key='system_prompt'))
+        InsertParams(key=RadixKey(token_ids=[8, 9, 10, 11, 12], extra_key=None))
     )
     tree.pretty_print()
 
     print(
         tree.match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids=[1, 2, 3, 13, 14], extra_key='tool_def'))
+            MatchPrefixParams(key=RadixKey(token_ids=[1, 2, 3, 13, 14], extra_key=None))
         )
     )
