@@ -24,6 +24,7 @@ Every row writes the K/V it computes into its own slot.
 
 from __future__ import annotations
 
+import functools
 import json
 import math
 from dataclasses import dataclass
@@ -127,8 +128,78 @@ class RelayState:
 # ---------------------------------------------------------------------------------------
 
 
+# Most programs that share one (request, KV head)'s output keys, and keys per loop step.
+INFLUENCE_MAX_SPLITS = 32
+INFLUENCE_BLOCK_N = 64
+# Influence programs per SM a decode step aims for.
+INFLUENCE_PROGRAMS_PER_SM = 4
+
+
+@functools.lru_cache(maxsize=None)
+def _sm_count(device_index: int) -> int:
+    """SMs of CUDA device ``device_index``."""
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _influence_splits(bs: int, num_kv_heads: int, device: torch.device) -> int:
+    """Programs per (request, KV head): the largest power of two that keeps the grid
+    within ``INFLUENCE_PROGRAMS_PER_SM`` per SM, from 1 to ``INFLUENCE_MAX_SPLITS``.
+    """
+    budget = INFLUENCE_PROGRAMS_PER_SM * _sm_count(device.index or 0)
+    per_row = max(1, budget // (bs * num_kv_heads))
+    return min(INFLUENCE_MAX_SPLITS, 1 << (per_row.bit_length() - 1))
+
+
 @triton.jit
-def _influence_kernel(
+def _influence_split(
+    req_to_token_ptr,
+    req_pool_indices_ptr,
+    seq_lens_ptr,
+    out_cache_loc_ptr,
+    out_start_ptr,
+    stride_r2t,
+    b,
+    split,
+    SPLITS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """``(row, start, end)``: row ``b``'s ``req_to_token`` row and the positions
+    ``[start, end)`` of its output keys that split ``split`` covers. Empty for a row whose
+    request pool entry no longer ends at the slot this step writes.
+    """
+    rpi = tl.load(req_pool_indices_ptr + b).to(tl.int64)
+    hi = tl.load(seq_lens_ptr + b).to(tl.int64)
+    lo = tl.load(out_start_ptr + rpi)
+    row = req_to_token_ptr + rpi * stride_r2t
+    last = tl.load(row + hi - 1).to(tl.int64)
+    cur = tl.load(out_cache_loc_ptr + b).to(tl.int64)
+    n = tl.where((lo < hi) & (last == cur), hi - lo, 0)
+    chunk = tl.cdiv(tl.cdiv(n, SPLITS), BLOCK_N) * BLOCK_N
+    start = lo + split * chunk
+    end = tl.minimum(start + chunk, lo + n)
+    return row, start, end
+
+
+@triton.jit
+def _influence_logits(q, k_ptr, row, start, end, kv_head, stride_kt, stride_kh, scale,
+                      offs_d, mask_d, BLOCK_N: tl.constexpr):
+    """``(logits, slots, mask_n)`` of the group's queries over the keys at positions
+    ``[start, start + BLOCK_N)``; logits past ``end`` are -inf.
+    """
+    offs_n = start + tl.arange(0, BLOCK_N)
+    mask_n = offs_n < end
+    slots = tl.load(row + offs_n, mask=mask_n, other=0).to(tl.int64)
+    k = tl.load(
+        k_ptr + slots[:, None] * stride_kt + kv_head * stride_kh + offs_d[None, :],
+        mask=mask_n[:, None] & mask_d[None, :],
+        other=0.0,
+    )
+    logits = tl.dot(q, tl.trans(k)) * scale
+    return tl.where(mask_n[None, :], logits, float("-inf")), slots, mask_n
+
+
+@triton.jit
+def _influence_stats_kernel(
     q_ptr,
     k_ptr,
     req_to_token_ptr,
@@ -136,72 +207,116 @@ def _influence_kernel(
     seq_lens_ptr,
     out_cache_loc_ptr,
     out_start_ptr,
-    influence_ptr,
+    max_ptr,
+    sum_ptr,
     stride_qb,
     stride_qh,
     stride_kt,
     stride_kh,
     stride_r2t,
+    stride_sb,
     scale,
     GROUP: tl.constexpr,
     GROUP_P2: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    SPLITS: tl.constexpr,
 ):
-    """One (request, KV head): softmax of the group's queries over the request's output
-    keys, summed over the group, added to each key's influence. A row whose request pool
-    entry no longer ends at the slot this step writes adds nothing.
+    """One (request, KV head, split): max and sum of exp of each group query's logits over
+    the split's output keys, -inf and 0 for an empty split.
     """
     b = tl.program_id(0)
     kv_head = tl.program_id(1)
-    rpi = tl.load(req_pool_indices_ptr + b).to(tl.int64)
-    hi = tl.load(seq_lens_ptr + b).to(tl.int64)
-    lo = tl.load(out_start_ptr + rpi)
-    row = req_to_token_ptr + rpi * stride_r2t
-    last = tl.load(row + hi - 1).to(tl.int64)
-    cur = tl.load(out_cache_loc_ptr + b).to(tl.int64)
-    if (lo < hi) & (last == cur):
+    split = tl.program_id(2)
+    row, start, end = _influence_split(
+        req_to_token_ptr, req_pool_indices_ptr, seq_lens_ptr, out_cache_loc_ptr,
+        out_start_ptr, stride_r2t, b, split, SPLITS, BLOCK_N,
+    )
+    offs_g = tl.arange(0, GROUP_P2)
+    offs_d = tl.arange(0, BLOCK_D)
+    mask_g = offs_g < GROUP
+    mask_d = offs_d < HEAD_DIM
+    heads = kv_head * GROUP + offs_g
+    q = tl.load(
+        q_ptr + b * stride_qb + heads[:, None] * stride_qh + offs_d[None, :],
+        mask=mask_g[:, None] & mask_d[None, :],
+        other=0.0,
+    )
+    m = tl.full([GROUP_P2], float("-inf"), dtype=tl.float32)
+    s = tl.zeros([GROUP_P2], dtype=tl.float32)
+    for n0 in range(start, end, BLOCK_N):
+        logits, _slots, _mask_n = _influence_logits(
+            q, k_ptr, row, n0, end, kv_head, stride_kt, stride_kh, scale, offs_d, mask_d,
+            BLOCK_N,
+        )
+        m_new = tl.maximum(m, tl.max(logits, 1))
+        s = s * tl.exp(m - m_new) + tl.sum(tl.exp(logits - m_new[:, None]), 1)
+        m = m_new
+    stats = b * stride_sb + heads * SPLITS + split
+    tl.store(max_ptr + stats, m, mask=mask_g)
+    tl.store(sum_ptr + stats, s, mask=mask_g)
+
+
+@triton.jit
+def _influence_add_kernel(
+    q_ptr,
+    k_ptr,
+    req_to_token_ptr,
+    req_pool_indices_ptr,
+    seq_lens_ptr,
+    out_cache_loc_ptr,
+    out_start_ptr,
+    max_ptr,
+    sum_ptr,
+    influence_ptr,
+    stride_qb,
+    stride_qh,
+    stride_kt,
+    stride_kh,
+    stride_r2t,
+    stride_sb,
+    scale,
+    GROUP: tl.constexpr,
+    GROUP_P2: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SPLITS: tl.constexpr,
+):
+    """One (request, KV head, split): softmax of the group's queries over all the
+    request's output keys, from the splits' max and sum, summed over the group and added
+    to the influence of each key in this split.
+    """
+    b = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    split = tl.program_id(2)
+    row, start, end = _influence_split(
+        req_to_token_ptr, req_pool_indices_ptr, seq_lens_ptr, out_cache_loc_ptr,
+        out_start_ptr, stride_r2t, b, split, SPLITS, BLOCK_N,
+    )
+    if start < end:
         offs_g = tl.arange(0, GROUP_P2)
         offs_d = tl.arange(0, BLOCK_D)
+        offs_s = tl.arange(0, SPLITS)
         mask_g = offs_g < GROUP
         mask_d = offs_d < HEAD_DIM
+        heads = kv_head * GROUP + offs_g
+        stats = b * stride_sb + heads[:, None] * SPLITS + offs_s[None, :]
+        m_all = tl.load(max_ptr + stats, mask=mask_g[:, None], other=0.0)
+        s_all = tl.load(sum_ptr + stats, mask=mask_g[:, None], other=1.0)
+        m = tl.max(m_all, 1)
+        s = tl.sum(s_all * tl.exp(m_all - m[:, None]), 1)
         q = tl.load(
-            q_ptr
-            + b * stride_qb
-            + (kv_head * GROUP + offs_g)[:, None] * stride_qh
-            + offs_d[None, :],
+            q_ptr + b * stride_qb + heads[:, None] * stride_qh + offs_d[None, :],
             mask=mask_g[:, None] & mask_d[None, :],
             other=0.0,
         )
-
-        m = tl.full([GROUP_P2], float("-inf"), dtype=tl.float32)
-        s = tl.zeros([GROUP_P2], dtype=tl.float32)
-        for start in range(lo, hi, BLOCK_N):
-            offs_n = start + tl.arange(0, BLOCK_N)
-            mask_n = offs_n < hi
-            slots = tl.load(row + offs_n, mask=mask_n, other=0).to(tl.int64)
-            k = tl.load(
-                k_ptr + slots[:, None] * stride_kt + kv_head * stride_kh + offs_d[None, :],
-                mask=mask_n[:, None] & mask_d[None, :],
-                other=0.0,
+        for n0 in range(start, end, BLOCK_N):
+            logits, slots, mask_n = _influence_logits(
+                q, k_ptr, row, n0, end, kv_head, stride_kt, stride_kh, scale, offs_d,
+                mask_d, BLOCK_N,
             )
-            logits = tl.dot(q, tl.trans(k)) * scale
-            logits = tl.where(mask_n[None, :], logits, float("-inf"))
-            m_new = tl.maximum(m, tl.max(logits, 1))
-            s = s * tl.exp(m - m_new) + tl.sum(tl.exp(logits - m_new[:, None]), 1)
-            m = m_new
-
-        for start in range(lo, hi, BLOCK_N):
-            offs_n = start + tl.arange(0, BLOCK_N)
-            mask_n = offs_n < hi
-            slots = tl.load(row + offs_n, mask=mask_n, other=0).to(tl.int64)
-            k = tl.load(
-                k_ptr + slots[:, None] * stride_kt + kv_head * stride_kh + offs_d[None, :],
-                mask=mask_n[:, None] & mask_d[None, :],
-                other=0.0,
-            )
-            logits = tl.dot(q, tl.trans(k)) * scale
             p = tl.exp(logits - m[:, None]) / s[:, None]
             p = tl.where(mask_g[:, None] & mask_n[None, :], p, 0.0)
             tl.atomic_add(influence_ptr + slots, tl.sum(p, 0), mask=mask_n)
@@ -225,26 +340,31 @@ def accumulate_influence(
     bs, num_q_heads, head_dim = q.shape
     num_kv_heads = k_buffer.shape[1]
     group = num_q_heads // num_kv_heads
-    _influence_kernel[(bs, num_kv_heads)](
-        q,
-        k_buffer,
-        req_to_token,
-        req_pool_indices,
-        seq_lens,
-        out_cache_loc,
-        out_start,
-        influence,
+    splits = _influence_splits(bs, num_kv_heads, q.device)
+    split_max = torch.empty((bs, num_q_heads, splits), dtype=torch.float32, device=q.device)
+    split_sum = torch.empty_like(split_max)
+    grid = (bs, num_kv_heads, splits)
+    tables = (req_to_token, req_pool_indices, seq_lens, out_cache_loc, out_start)
+    strides = (
         q.stride(0),
         q.stride(1),
         k_buffer.stride(0),
         k_buffer.stride(1),
         req_to_token.stride(0),
+        split_max.stride(0),
         scale,
+    )
+    sizes = dict(
         GROUP=group,
         GROUP_P2=max(16, triton.next_power_of_2(group)),
         HEAD_DIM=head_dim,
         BLOCK_D=max(16, triton.next_power_of_2(head_dim)),
-        BLOCK_N=64,
+        BLOCK_N=INFLUENCE_BLOCK_N,
+        SPLITS=splits,
+    )
+    _influence_stats_kernel[grid](q, k_buffer, *tables, split_max, split_sum, *strides, **sizes)
+    _influence_add_kernel[grid](
+        q, k_buffer, *tables, split_max, split_sum, influence, *strides, **sizes
     )
 
 

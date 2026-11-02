@@ -19,7 +19,10 @@ Checked through ``ModelRunner.forward_subctx_relay`` on the small attention mode
 - a request whose cached V matches at L_det selects one layer later,
 - the profile records every layer and rewrites every reused row.
 
-Checked on a GPU: the influence kernel against its torch reference.
+Checked on a GPU: the influence kernel against its torch reference, with outputs split
+across 1 to 32 programs and after CUDA graph replay with new inputs; each live request adds
+one per query head, padded rows and entries holding no request nothing; the split count
+fills four programs per SM up to the cap.
 
 Usage:
     python test_subctx_relay.py
@@ -38,6 +41,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -513,22 +517,96 @@ class TestInfluenceKernel(unittest.TestCase):
             slots, pool_size, ctx = 4096, 6, 2048
             k_buffer = torch.randn(slots, kv_heads, head_dim, generator=g, device="cuda").bfloat16()
             req_to_token = torch.randint(1, slots, (pool_size, ctx), generator=g, device="cuda", dtype=torch.int32)
-            # Rows: output keys; none (padding); none; output keys; a reused pool entry.
-            req_pool_indices = torch.tensor([3, 0, 5, 1, 2], device="cuda")
-            seq_lens = torch.tensor([700, 1, 33, 1500, 600], device="cuda")
+            # Rows: output keys; none (padding); none; output keys; a reused pool entry; an
+            # entry that holds no request, ending at this step's slot.
+            req_pool_indices = torch.tensor([3, 0, 5, 1, 2, 4], device="cuda")
+            seq_lens = torch.tensor([700, 1, 33, 1500, 600, 50], device="cuda")
             out_start = torch.full((pool_size,), 1 << 62, dtype=torch.int64, device="cuda")
             out_start[3], out_start[0], out_start[5], out_start[1], out_start[2] = 500, 5, 33, 10, 100
             out_cache_loc = req_to_token[req_pool_indices, seq_lens - 1].long()
             out_cache_loc[4] += 1
-            q = torch.randn(5, q_heads, head_dim, generator=g, device="cuda").bfloat16()
+            q = torch.randn(6, q_heads, head_dim, generator=g, device="cuda").bfloat16()
             args = (k_buffer, req_to_token, req_pool_indices, seq_lens, out_cache_loc, out_start)
             got = torch.zeros(slots, device="cuda")
             want = torch.zeros(slots, device="cuda")
             accumulate_influence(q, *args, got, head_dim**-0.5)
             influence_reference(q, *args, want, head_dim**-0.5)
             torch.testing.assert_close(got, want, rtol=2e-3, atol=2e-4)
-            # Each of the two live requests adds q_heads in total; the reused entry nothing.
+            # Each of the two live requests adds q_heads in total; the other rows nothing.
             self.assertAlmostEqual(float(got.sum()), 2 * q_heads, delta=1e-2)
+
+    def test_long_outputs_split_across_programs_match_the_reference(self):
+        g = torch.Generator(device="cuda").manual_seed(1)
+        q_heads, kv_heads, head_dim = 32, 4, 128
+        # Output lengths: one key, a second split of one key, every split full, one key
+        # past that, several keys per split.
+        out_lens = [1, 65, 2048, 2049, 5000]
+        prompt, ctx = 300, 5400
+        bs = len(out_lens)
+        slots = 1 + torch.randperm(bs * ctx, generator=g, device="cuda").int()
+        req_to_token = slots.view(bs, ctx).contiguous()
+        k_buffer = torch.randn(bs * ctx + 1, kv_heads, head_dim, generator=g, device="cuda").bfloat16()
+        req_pool_indices = torch.arange(bs, device="cuda")
+        seq_lens = torch.tensor([prompt + n for n in out_lens], device="cuda")
+        out_start = torch.full((bs,), prompt, dtype=torch.int64, device="cuda")
+        out_cache_loc = req_to_token[req_pool_indices, seq_lens - 1].long()
+        q = torch.randn(bs, q_heads, head_dim, generator=g, device="cuda").bfloat16()
+        args = (k_buffer, req_to_token, req_pool_indices, seq_lens, out_cache_loc, out_start)
+        want = torch.zeros(k_buffer.shape[0], device="cuda")
+        influence_reference(q, *args, want, head_dim**-0.5)
+        for splits in (1, 4, subctx_relay.INFLUENCE_MAX_SPLITS):
+            got = torch.zeros_like(want)
+            with mock.patch.object(subctx_relay, "_influence_splits", return_value=splits):
+                accumulate_influence(q, *args, got, head_dim**-0.5)
+            torch.testing.assert_close(got, want, rtol=2e-3, atol=2e-5)
+            for b, n in enumerate(out_lens):
+                out = req_to_token[b, prompt : prompt + n].long()
+                self.assertAlmostEqual(float(got[out].sum()), q_heads, delta=1e-3)
+                self.assertEqual(float(got[req_to_token[b, :prompt].long()].abs().sum()), 0.0)
+
+    def test_a_captured_graph_follows_new_inputs_on_replay(self):
+        g = torch.Generator(device="cuda").manual_seed(2)
+        q_heads, kv_heads, head_dim, bs, pool_size, prompt, ctx = 32, 4, 128, 8, 8, 100, 2700
+        slots = 1 + torch.randperm(pool_size * ctx, generator=g, device="cuda").int()
+        req_to_token = slots.view(pool_size, ctx).contiguous()
+        k_buffer = torch.randn(pool_size * ctx + 1, kv_heads, head_dim, generator=g, device="cuda").bfloat16()
+        q = torch.zeros(bs, q_heads, head_dim, device="cuda").bfloat16()
+        req_pool_indices = torch.zeros(bs, dtype=torch.int64, device="cuda")
+        seq_lens = torch.ones(bs, dtype=torch.int64, device="cuda")
+        out_cache_loc = torch.zeros(bs, dtype=torch.int64, device="cuda")
+        out_start = torch.full((pool_size,), 1 << 62, dtype=torch.int64, device="cuda")
+        influence = torch.zeros(k_buffer.shape[0], device="cuda")
+        args = (k_buffer, req_to_token, req_pool_indices, seq_lens, out_cache_loc, out_start)
+        accumulate_influence(q, *args, influence, head_dim**-0.5)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            accumulate_influence(q, *args, influence, head_dim**-0.5)
+
+        # Five live rows, outputs of 1 to 2500 keys; three padded rows on stale entries.
+        out_lens = [1, 64, 300, 1999, 2500]
+        live = torch.tensor([6, 2, 0, 5, 3], device="cuda")
+        req_pool_indices.copy_(torch.tensor([6, 2, 0, 5, 3, 6, 2, 1], device="cuda"))
+        seq_lens[:5] = torch.tensor([prompt + n for n in out_lens], device="cuda")
+        out_start[live] = prompt
+        out_start[1] = 5
+        out_cache_loc[:5] = req_to_token[live, seq_lens[:5] - 1].long()
+        q.copy_(torch.randn(bs, q_heads, head_dim, generator=g, device="cuda"))
+        influence.zero_()
+        graph.replay()
+        want = torch.zeros_like(influence)
+        influence_reference(q, *args, want, head_dim**-0.5)
+        torch.testing.assert_close(influence, want, rtol=2e-3, atol=2e-5)
+        self.assertAlmostEqual(float(influence.sum()), len(out_lens) * q_heads, delta=1e-2)
+
+    def test_splits_fill_the_sms_up_to_the_cap(self):
+        with mock.patch.object(subctx_relay, "_sm_count", return_value=132):
+            dev = torch.device("cuda", 0)
+            # 4 * 132 = 528 programs: bs 1 caps at 32, bs 8 x 4 heads -> 16, bs 16 x 8
+            # heads -> 4, bs 200 -> 1.
+            self.assertEqual(subctx_relay._influence_splits(1, 4, dev), 32)
+            self.assertEqual(subctx_relay._influence_splits(8, 4, dev), 16)
+            self.assertEqual(subctx_relay._influence_splits(16, 8, dev), 4)
+            self.assertEqual(subctx_relay._influence_splits(200, 4, dev), 1)
 
 
 if __name__ == "__main__":
