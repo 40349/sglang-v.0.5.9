@@ -194,10 +194,10 @@ TXT
         CLIENT=$OUT/client_$stem.json replay
       # The index's own counters.
       case "${arm%%@*}" in
-        cdc|relay) grep "sub-context index:" "$log" | tail -1 || true ;;
+        cdc|relay|relay+) grep "sub-context index:" "$log" | tail -1 || true ;;
       esac
       case "${arm%%@*}" in
-        relay) grep "RelayCaching:" "$log" | tail -1 || true ;;
+        relay|relay+) grep "RelayCaching:" "$log" | tail -1 || true ;;
       esac
     done
 
@@ -240,7 +240,7 @@ TXT
     echo
     echo "  ARM=cdc@0.15          the arm 'record' runs (required for record)"
     echo "  ARMS='off cdc@0.15'   which arms 'toggle' replays, in order; the first is the"
-    echo "                        baseline. off|cdc|cdc@ratio|relay@S,D,E|relay@profile (sglang_server.sh)"
+    echo "                        baseline. off|cdc|cdc@ratio|relay@S,D,E|relay@profile|relay+@S,D,E (sglang_server.sh)"
     echo "  AUDIT=1               turn on the double-free and chunk-token audits (timings unusable)"
     echo "  FULL=1                let requests stop naturally, so one can stop during"
     echo "                        prefill -- the path a pinned replay never reaches"

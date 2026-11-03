@@ -122,6 +122,7 @@ class ModelRunnerKVCacheMixin:
                 self.model_config.hidden_size,
                 torch._utils._element_size(self.dtype),
                 subctx_config.relay_start_layer(),
+                subctx_config.RELAY_PREFILL_HIDDEN,
             )
         return cell_size
 

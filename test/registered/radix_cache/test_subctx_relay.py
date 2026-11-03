@@ -16,8 +16,14 @@ Checked through ``ModelRunner.forward_subctx_relay`` on the small attention mode
   with exact stored hidden states loaded at L_start,
 - a reused row with a stored hidden state keeps its cached KV below L_start, an unselected
   one above L_det, a selected one above L_end,
+- a reused row with a hidden state prefill stored skips [0, L_start) like a decoded one,
+  and the tallies tell the two apart,
 - a request whose cached V matches at L_det selects one layer later,
 - the profile records every layer and rewrites every reused row.
+
+Checked on toy decoder layers: decode always stores the input of L_start, prefill only
+with RELAY_PREFILL_HIDDEN; a prefill clears the flags, a copy carries them; the switch
+needs L_start > 0.
 
 Checked on a GPU: the influence kernel against its torch reference, with outputs split
 across 1 to 32 programs and after CUDA graph replay with new inputs; each live request adds
@@ -37,6 +43,7 @@ register_amd_ci(est_time=10, suite="stage-b-test-small-1-gpu-amd")
 import json
 import math
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -220,7 +227,9 @@ class RelayScenario:
     """One batch through ``forward_subctx_relay`` against each request's full prefill.
 
     Exact prefixes hold the full prefill's KV; reused rows hold it plus ``deviation``;
-    ``decoded(position)`` marks the reused rows with a stored hidden state, stored exact.
+    ``decoded(position)`` marks the reused rows decode computed, ``prefilled(position)``
+    others with a stored hidden state (``prefill_hidden`` on); both get it stored exact.
+    ``store_at_start`` stores each row's input of L_start as the prefill hook would.
     """
 
     def __init__(
@@ -232,9 +241,12 @@ class RelayScenario:
         suffix=0,
         deviation=blend.stale,
         decoded=lambda p: False,
+        prefilled=lambda p: False,
         influence=lambda p: 0.0,
         profile_path=None,
         logprob_starts=None,
+        prefill_hidden=False,
+        store_at_start=False,
     ):
         self.model = blend.ToyModel(0)
         self.reqs = reqs
@@ -242,7 +254,7 @@ class RelayScenario:
         self.batch, out_cache_loc = blend.lay_out(reqs)
         start = layers[0] if layers is not None else 0
         self.state = RelayState(
-            blend.NUM_SLOTS, 4, blend.HIDDEN, DTYPE, "cpu", start_layer=start
+            blend.NUM_SLOTS, 4, blend.HIDDEN, DTYPE, "cpu", start, prefill_hidden
         )
         self.kv = RelayKVPool(self.state)
         self.refs = [blend.reference(self.model, r.fill_ids) for r in reqs]
@@ -267,6 +279,7 @@ class RelayScenario:
                     )
                 if p >= exact:
                     self.state.decoded[slot] = bool(decoded(p))
+                    self.state.has_hidden[slot] = bool(decoded(p) or prefilled(p))
                     self.state.influence[slot] = float(influence(p))
                     if self.state.hidden is not None:
                         self.state.hidden[slot] = streams[start][p]
@@ -309,6 +322,8 @@ class RelayScenario:
         def recording_layer(i, positions, hidden, fb, residual):
             for p in positions.tolist():
                 self.ran[i].add(p)
+            if store_at_start and i == start:
+                self.state.store_hidden(fb.out_cache_loc, hidden + residual)
             return model_layer(i, positions, hidden, fb, residual)
 
         self.model.layer = recording_layer
@@ -369,6 +384,44 @@ class TestForward(unittest.TestCase):
             self.assertFalse(warm & sc.ran[layer], layer)
         for layer in range(2, NUM_LAYERS):
             self.assertTrue(warm <= sc.ran[layer], layer)
+
+    def test_hidden_states_prefill_stored_load_like_decoded_ones(self):
+        req = blend.make_req(40, [(0, 6, 100), (10, 24, 500), (28, 36, 530)], exact=6)
+        sc = RelayScenario(
+            [req],
+            (2, 3, NUM_LAYERS - 1),
+            tau_dev=0.0,
+            deviation=lambda p, layer: 0.0 if layer < 2 else blend.stale(p, layer),
+            decoded=lambda p: p % 3 == 1,
+            prefilled=lambda p: p % 3 == 2,
+            prefill_hidden=True,
+        )
+        self.assert_full_prefill(sc)
+        reused = reused_positions(req)
+        warm = {p for p in reused if p % 3 != 0}
+        for layer in (0, 1):
+            self.assertFalse(warm & sc.ran[layer], layer)
+            self.assertTrue({p for p in reused if p % 3 == 0} <= sc.ran[layer], layer)
+        self.assertEqual(sc.state.warm_rows, len(warm))
+        self.assertEqual(sc.state.warm_prefilled_rows, len([p for p in reused if p % 3 == 2]))
+
+    def test_a_relay_prefill_stores_every_row_s_exact_input_of_l_start(self):
+        req = blend.make_req(40, [(0, 6, 100), (10, 24, 500), (28, 36, 530)], exact=6)
+        streams = reference_streams(blend.ToyModel(0), req.fill_ids)
+        for decoded in (lambda p: False, lambda p: p % 3 != 0):
+            sc = RelayScenario(
+                [req],
+                (2, 3, NUM_LAYERS - 1),
+                tau_dev=0.0,
+                deviation=lambda p, layer: 0.0 if layer < 2 else blend.stale(p, layer),
+                decoded=decoded,
+                prefill_hidden=True,
+                store_at_start=True,
+            )
+            for p in range(req.sub_context_probe_start(), len(req.fill_ids)):
+                slot = sc.slot(req, p)
+                self.assertTrue(bool(sc.state.has_hidden[slot]), p)
+                torch.testing.assert_close(sc.state.hidden[slot], streams[2][p], rtol=0, atol=1e-10)
 
     def test_each_reused_row_keeps_its_cached_kv_where_it_did_not_run(self):
         req = blend.make_req(48, [(0, 4, 100), (8, 24, 500), (30, 44, 530)], exact=4)
@@ -507,6 +560,98 @@ class TestForward(unittest.TestCase):
         ties_a = torch.tensor([1.0, 1.0, 2.0, 3.0])
         ties_b = torch.tensor([1.0, 2.0, 2.0, 3.0])
         self.assertAlmostEqual(subctx_relay._spearman(ties_a, ties_b), 3.75 / 4.5)
+
+
+class ShiftLayer(torch.nn.Module):
+    """A decoder layer ``layer(positions, hidden_states, forward_batch, residual)`` that
+    adds its index to the hidden state and keeps the residual."""
+
+    def __init__(self, index):
+        super().__init__()
+        self.index = index
+
+    def forward(self, positions, hidden_states, forward_batch, residual):
+        return hidden_states + self.index, residual
+
+
+def hooked_layers(state, num_layers=4):
+    """Decoder layers with the relay hooks registered on them."""
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=torch.nn.ModuleList(ShiftLayer(i) for i in range(num_layers)))
+    )
+    subctx_relay.register_relay_hooks(model, state)
+    return model.model.layers
+
+
+def run_layers(layers, mode, loc, hidden, residual):
+    fb = SimpleNamespace(forward_mode=mode, out_cache_loc=torch.tensor(loc))
+    for layer in layers:
+        hidden, residual = layer(None, hidden, fb, residual)
+
+
+class TestStateAndHooks(unittest.TestCase):
+    def setUp(self):
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        self.mode = ForwardMode
+
+    def state(self, prefill_hidden, start_layer=2):
+        return RelayState(16, 4, 3, torch.float32, "cpu", start_layer, prefill_hidden)
+
+    def test_prefill_clears_the_flags_and_copy_carries_them(self):
+        for prefill_hidden in (False, True):
+            st = self.state(prefill_hidden)
+            st.decoded[[1, 2]] = True
+            st.store_hidden(torch.tensor([1, 2]), torch.ones(2, 3))
+            st.copy(torch.tensor([5]), torch.tensor([1]))
+            self.assertTrue(bool(st.has_hidden[5]) and bool(st.decoded[5]))
+            torch.testing.assert_close(st.hidden[5], torch.ones(3))
+            st.mark_prefilled(torch.tensor([1, 5]))
+            self.assertEqual(st.has_hidden.nonzero().flatten().tolist(), [2])
+            self.assertEqual(st.decoded.nonzero().flatten().tolist(), [2])
+
+    def test_without_the_switch_the_flag_is_decoded_and_costs_nothing(self):
+        off, on = self.state(False), self.state(True)
+        self.assertIs(off.has_hidden, off.decoded)
+        self.assertIsNot(on.has_hidden, on.decoded)
+        self.assertEqual(
+            RelayState.bytes_per_token(8, 2, 2, True), RelayState.bytes_per_token(8, 2, 2) + 1
+        )
+
+    def test_decode_stores_the_input_of_l_start_with_or_without_the_switch(self):
+        for prefill_hidden in (False, True):
+            st = self.state(prefill_hidden)
+            layers = hooked_layers(st)
+            hidden, residual = torch.full((2, 3), 1.0), torch.full((2, 3), 10.0)
+            run_layers(layers, self.mode.DECODE, [3, 7], hidden, residual)
+            # Input of layer 2: hidden + 0 + 1, plus the residual.
+            torch.testing.assert_close(st.hidden[[3, 7]], torch.full((2, 3), 12.0))
+            self.assertEqual(st.has_hidden.nonzero().flatten().tolist(), [3, 7])
+            self.assertEqual(st.has_hidden.tolist(), st.decoded.tolist())
+
+    def test_prefill_stores_the_input_of_l_start_only_with_the_switch(self):
+        for prefill_hidden in (False, True):
+            st = self.state(prefill_hidden)
+            layers = hooked_layers(st)
+            hidden, residual = torch.arange(9.0).view(3, 3), torch.full((3, 3), 0.5)
+            run_layers(layers, self.mode.EXTEND, [4, 9, 11], hidden, residual)
+            self.assertFalse(bool(st.decoded.any()))
+            if prefill_hidden:
+                self.assertEqual(st.has_hidden.nonzero().flatten().tolist(), [4, 9, 11])
+                torch.testing.assert_close(st.hidden[[4, 9, 11]], hidden + 1 + residual)
+            else:
+                self.assertFalse(bool(st.has_hidden.any()))
+                self.assertEqual(float(st.hidden.abs().sum()), 0.0)
+
+    def test_the_switch_needs_an_l_start_above_zero(self):
+        env = dict(os.environ, SGLANG_SUBCTX_RELAY_PREFILL_HIDDEN="1")
+        code = "import sglang.srt.utils.subctx_config"
+        for layers, ok in (("2,3,4", True), ("0,3,4", False), ("", False)):
+            env["SGLANG_SUBCTX_RELAY_LAYERS"] = layers
+            run = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+            self.assertEqual(run.returncode == 0, ok, (layers, run.stderr[-300:]))
+            if not ok:
+                self.assertIn("SGLANG_SUBCTX_RELAY_PREFILL_HIDDEN", run.stderr)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")

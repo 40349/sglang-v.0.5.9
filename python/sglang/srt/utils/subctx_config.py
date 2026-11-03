@@ -103,6 +103,14 @@ RELAY_SUFFIX = int(os.environ.get("SGLANG_SUBCTX_RELAY_SUFFIX", "10"))
 # scripts/subcontext_sim/relay_layers.py picks RELAY_LAYERS from it.
 RELAY_PROFILE = os.environ.get("SGLANG_SUBCTX_RELAY_PROFILE", "")
 
+# With RELAY_LAYERS (sglang_server.sh's relay+ arm): prefill also stores each computed
+# token's hidden state at the input of L_start, so a reused token the model read, not only
+# one it decoded, skips [0, L_start). Influence stays decode-only.
+RELAY_PREFILL_HIDDEN = os.environ.get("SGLANG_SUBCTX_RELAY_PREFILL_HIDDEN", "") not in (
+    "",
+    "0",
+)
+
 
 def relay_active() -> bool:
     """Whether reused tokens are rectified the RelayCaching way, or profiled for it."""
@@ -180,6 +188,12 @@ if RELAY_LAYERS is not None:
             f"SGLANG_SUBCTX_RELAY_LAYERS={RELAY_LAYERS}; want 0 <= L_start < L_det <= L_end "
             "(detection runs on a layer after the one the hidden state is loaded at)"
         )
+
+if RELAY_PREFILL_HIDDEN and (RELAY_LAYERS is None or RELAY_LAYERS[0] == 0):
+    raise ValueError(
+        "SGLANG_SUBCTX_RELAY_PREFILL_HIDDEN stores the input of L_start; it needs "
+        "SGLANG_SUBCTX_RELAY_LAYERS with L_start > 0"
+    )
 
 if RELAY_TAU_DEV < 0 or RELAY_TAU_INF < 0 or RELAY_SUFFIX < 0:
     raise ValueError(

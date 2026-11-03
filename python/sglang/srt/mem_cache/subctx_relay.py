@@ -11,6 +11,9 @@ Decode, per output token (hooks registered before CUDA graph capture):
   current one included, summed over heads, is added to each of those keys' influence;
 - input of ``L_start`` (> 0): the residual stream is stored.
 
+With ``RELAY_PREFILL_HIDDEN``, every prefill stores the residual stream at the input of
+``L_start`` for the rows it computes there as well; influence stays decode-only.
+
 Prefill (``ModelRunner.forward_subctx_relay``), per request:
 - before the forward, each span picks its last ``RELAY_SUFFIX`` tokens and its most
   attended-to tokens (``influence_preselect``);
@@ -56,27 +59,39 @@ class RelayState:
         dtype: torch.dtype,
         device,
         start_layer: int,
+        prefill_hidden: bool = False,
     ):
         self.start_layer = start_layer
+        # Whether prefill stores hidden states too, not only decode.
+        self.prefill_hidden = prefill_hidden
         # Whether decode computed the slot's KV.
         self.decoded = torch.zeros(num_slots, dtype=torch.bool, device=device)
         # Attention the slot received from later output tokens of its request.
         self.influence = torch.zeros(num_slots, dtype=torch.float32, device=device)
-        # Residual stream at the input of ``start_layer``, valid where ``decoded``.
+        # Residual stream at the input of ``start_layer``, valid where ``has_hidden``.
         self.hidden = (
             torch.zeros((num_slots, hidden_size), dtype=dtype, device=device)
             if start_layer > 0
             else None
+        )
+        # Whether the slot holds a stored hidden state; decode-only storage makes it
+        # ``decoded`` itself.
+        self.has_hidden = (
+            torch.zeros(num_slots, dtype=torch.bool, device=device)
+            if prefill_hidden
+            else self.decoded
         )
         # Per request pool entry: the position of its first output token.
         self.out_start = torch.full(
             (req_pool_size,), _NO_OUTPUT, dtype=torch.int64, device=device
         )
         # Live tallies: requests prefilled with reused rows, their reused rows, those
-        # loaded with a stored hidden state, those run past L_det, deferred selections.
+        # loaded with a stored hidden state (and of those, the ones prefill stored), those
+        # run past L_det, deferred selections.
         self.requests = 0
         self.reused_rows = 0
         self.warm_rows = 0
+        self.warm_prefilled_rows = 0
         self.selected_rows = 0
         self.deferred = 0
         # The profile file holds this server's requests only.
@@ -91,28 +106,45 @@ class RelayState:
             return "RelayCaching: no reused rows yet"
         return (
             f"RelayCaching: {self.requests} requests, {self.reused_rows} reused rows, "
-            f"{self.warm_rows} loaded with a stored hidden state, {self.selected_rows} "
+            f"{self.warm_rows} loaded with a stored hidden state ("
+            f"{self.warm_prefilled_rows} stored by prefill), {self.selected_rows} "
             f"({100.0 * self.selected_rows / self.reused_rows:.1f}%) run past L_det, "
             f"{self.deferred} requests deferred their selection"
         )
 
     @staticmethod
-    def bytes_per_token(hidden_size: int, dtype_size: int, start_layer: int) -> int:
+    def bytes_per_token(
+        hidden_size: int, dtype_size: int, start_layer: int, prefill_hidden: bool = False
+    ) -> int:
         """Bytes one KV slot adds."""
-        return 1 + 4 + (hidden_size * dtype_size if start_layer > 0 else 0)
+        flags = 2 if prefill_hidden else 1
+        return flags + 4 + (hidden_size * dtype_size if start_layer > 0 else 0)
 
     def mark_prefilled(self, loc: torch.Tensor) -> None:
-        """Slots a prefill writes: no stored hidden state, no influence."""
+        """Slots a prefill writes: not decoded, no influence, no stored hidden state
+        until the prefill stores one (``store_hidden``)."""
         if loc.numel() == 0:
             return
         loc = loc.long()
         self.decoded.index_fill_(0, loc, False)
         self.influence.index_fill_(0, loc, 0.0)
+        if self.prefill_hidden:
+            self.has_hidden.index_fill_(0, loc, False)
+
+    def store_hidden(self, loc: torch.Tensor, stream: torch.Tensor) -> None:
+        """Store ``stream`` (the residual stream at the input of ``start_layer``) for the
+        slots ``loc``."""
+        loc = loc.long()
+        self.hidden.index_copy_(0, loc, stream)
+        if self.prefill_hidden:
+            self.has_hidden.index_fill_(0, loc, True)
 
     def copy(self, dst: torch.Tensor, src: torch.Tensor) -> None:
         """Copy the state at ``src`` to ``dst`` along with their KV."""
         self.decoded[dst] = self.decoded[src]
         self.influence[dst] = self.influence[src]
+        if self.prefill_hidden:
+            self.has_hidden[dst] = self.has_hidden[src]
         if self.hidden is not None:
             self.hidden[dst] = self.hidden[src]
 
@@ -402,7 +434,8 @@ def _layer_args(args, kwargs):
 
 
 def register_relay_hooks(model, state: RelayState) -> None:
-    """Hook decode into ``model``'s decoder layers and attention modules."""
+    """Hook decode, and with ``state.prefill_hidden`` prefill's hidden-state store, into
+    ``model``'s decoder layers and attention modules."""
     from sglang.srt.layers.radix_attention import RadixAttention
 
     layers = model.model.layers
@@ -416,8 +449,9 @@ def register_relay_hooks(model, state: RelayState) -> None:
 
     def store_hidden(_module, args, kwargs):
         hidden, fb, residual = _layer_args(args, kwargs)
-        if fb.forward_mode.is_decode():
-            state.hidden.index_copy_(0, fb.out_cache_loc.long(), hidden + residual)
+        mode = fb.forward_mode
+        if mode.is_decode() or (state.prefill_hidden and mode.is_extend()):
+            state.store_hidden(fb.out_cache_loc, hidden + residual)
 
     def add_influence(module, args, kwargs, _output):
         q = args[0]

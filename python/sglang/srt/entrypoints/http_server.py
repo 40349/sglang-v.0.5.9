@@ -628,6 +628,7 @@ async def server_info():
             "relay_tau_dev": subctx_config.RELAY_TAU_DEV,
             "relay_tau_inf": subctx_config.RELAY_TAU_INF,
             "relay_suffix": subctx_config.RELAY_SUFFIX,
+            "relay_prefill_hidden": subctx_config.RELAY_PREFILL_HIDDEN,
             # With `pid`, tells a stale server from the one just started.
             "audit": radix_cache.AUDIT_ON,
             "pid": os.getpid(),

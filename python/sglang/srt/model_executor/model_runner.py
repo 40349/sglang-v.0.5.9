@@ -2338,6 +2338,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             dtype=self.dtype,
             device=self.device,
             start_layer=subctx_config.relay_start_layer(),
+            prefill_hidden=subctx_config.RELAY_PREFILL_HIDDEN,
         )
         pool.relay_state = state
         self.req_to_token_pool.relay_state = state
@@ -2515,9 +2516,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         first = 0
         if start > 0 and every.numel() > 0:
-            stored = state.decoded[reused_loc]
+            stored = state.has_hidden[reused_loc]
             cold = every[~stored]
             state.warm_rows += every.numel() - cold.numel()
+            if state.prefill_hidden:
+                state.warm_prefilled_rows += int((stored & ~state.decoded[reused_loc]).sum())
             if cold.numel() < every.numel():
                 run(cold, lens_with(cold), (0, start))
                 n_rows = int(rows.probe_cache_loc.numel())

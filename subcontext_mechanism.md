@@ -81,6 +81,7 @@ R(p_new) · f(k_raw) == R(p_new − p) · k_cached[loc]
 | `cdc[@r]` | `SGLANG_SUBCTX_TOPK_RATIO=r`（不寫比例就是 0） | 依內容切塊；前綴比對 + scan + sparse prefill；整條存成一條鏈 |
 | `relay@S,D,E` | `SGLANG_SUBCTX_RELAY_LAYERS=S,D,E` | 同 cdc，重用的 token 照 RelayCaching 修正（第 8R 節） |
 | `relay@profile` | `SGLANG_SUBCTX_RELAY_PROFILE=<檔案>` | 同 cdc，重用的 token 全部重算，並記錄每層的偏差 |
+| `relay+@S,D,E`（`S > 0`） | `SGLANG_SUBCTX_RELAY_LAYERS=S,D,E`、`SGLANG_SUBCTX_RELAY_PREFILL_HIDDEN=1` | 同 relay，prefill 也存 `L_start` 的輸入；標籤 `relay_LS-D-E_ph` |
 
 ### 全部環境變數
 
@@ -98,6 +99,7 @@ R(p_new) · f(k_raw) == R(p_new − p) · k_cached[loc]
 | `SGLANG_SUBCTX_RELAY_TAU_INF` | 1.45 | 被注意程度的門檻（倍數 × 候選平均） |
 | `SGLANG_SUBCTX_RELAY_SUFFIX` | 10 | 每段重用內容一定重算的尾端 token 數 |
 | `SGLANG_SUBCTX_RELAY_PROFILE` | 空 | profile 模式的輸出檔 |
+| `SGLANG_SUBCTX_RELAY_PREFILL_HIDDEN` | 空 | 非 0：prefill 也存 `L_start` 的輸入，讀進來的重用 token 也能跳過 `[0, L_start)`；需要 `L_start > 0`（launcher 的 `ARM=relay+@L_start,L_det,L_end`，標籤 `_ph`） |
 | `SGLANG_SUBCTX_ROTATE_GPU` | 空 | 旋轉 kernel 的 CUDA event 計時（`rotate_kv.py`） |
 | `SGLANG_SUBCTX_AUDIT` | 空 | 重用 chunk 時逐 token 比對位置上的內容（`radix_cache.py`）、slot 級 double-free 偵測（`allocator.py`） |
 | `SGLANG_SUBCTX_TRACE` | 空 | 印 TRACE 除錯行 |
@@ -502,11 +504,13 @@ agent 的 prompt」；在這裡，scan 找到的重用段（其中由 decode 算
 | 掛在哪 | 做什麼 |
 |---|---|
 | 第 0 層的 forward pre-hook | 這一步 decode 寫的 slot 標成「由 decode 算出」，被注意程度歸零 |
-| 第 `L_start` 層的 forward pre-hook（`L_start > 0`） | 存下該層輸入的 residual stream（`hidden_states + residual`） |
+| 第 `L_start` 層的 forward pre-hook（`L_start > 0`） | 存下該層輸入的 residual stream（`hidden_states + residual`）；開了 `SGLANG_SUBCTX_RELAY_PREFILL_HIDDEN` 時 prefill（含 relay 分段 prefill 中涵蓋 `L_start` 的那一段）也存，並標記 `has_hidden` |
 | 每一層 `RadixAttention` 的 forward hook | Triton kernel：這一步的 query 對「這個請求自己的輸出 key」（位置 `[out_start, seq_len)`，含這一步的）做 softmax，各 head 相加，加到每個 key 的被注意程度上 |
 
 `out_start`（每個請求第一個輸出 token 的位置）在 `alloc_for_extend` 寫入；prefill 寫的 slot 在
-`forward_extend` 開頭清成「非 decode、分數 0」；scan 複製或旋轉 KV 時（`KVRotator`）這三樣跟著複製。
+`forward_extend` 開頭清成「非 decode、分數 0、沒有 hidden」；scan 複製或旋轉 KV 時（`KVRotator`）這些跟著複製。
+「有沒有存 hidden」（`has_hidden`）決定重用列能不能跳過 `[0, L_start)`；沒開 prefill 儲存時它就是 `decoded`
+本身（同一個 tensor），開了才是獨立的旗標，「由 decode 算出」（`decoded`，profile 的 `dec` 組）意思不變。
 CUDA graph 補齊的列 `seq_lens = 1`，範圍是空的，不會累加。
 
 ### prefill（每個請求）
@@ -558,8 +562,8 @@ cosine 的平均）、`s_code`（官方 profiler 實際算的：在 `[head, toke
 profile 檔在每次 server 啟動時清空，只含這次的請求。`sglang_server.sh` 的檔名標籤會帶上改過的門檻
 （例如 `relay_L3-4-22_dev1.2`）。
 
-`sub-context index:` 那行之後多一行 `RelayCaching: N requests, R reused rows, W loaded with a stored hidden state,
-S (x%) run past L_det, D requests deferred their selection`。`SGLANG_SUBCTX_TRACE=1` 時每次 prefill 印一行 `[TRACE-RELAY]`
+`sub-context index:` 那行之後多一行 `RelayCaching: N requests, R reused rows, W loaded with a stored hidden state
+(P stored by prefill), S (x%) run past L_det, D requests deferred their selection`（P 只在開了 prefill 儲存時計算，否則為 0）。`SGLANG_SUBCTX_TRACE=1` 時每次 prefill 印一行 `[TRACE-RELAY]`
 （段數、預選數、選中數、實際挑選的層、`L_det` 的平均偏差，最後一項以 fp32 計算）。
 要 logprob 的請求照常 scan（重用段一定在 logprob 起點之前結束，logprob 的位置都是新算的 token）；最後一段依剩下的列重新設定每個請求的 logprob 起點，跟 selective recompute 的做法相同。
 
