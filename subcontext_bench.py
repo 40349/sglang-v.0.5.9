@@ -55,9 +55,10 @@ def _post(url: str, payload: dict, timeout: float) -> dict:
 def _post_stream(url: str, payload: dict, timeout: float) -> dict:
     """Send one request with SSE streaming and time the first token.
 
-    TTFT is the time to the first chunk carrying generated text (``content`` or
-    ``reasoning_content``); the role-only opening chunk is skipped. ``text`` holds
-    ``content`` only.
+    TTFT is the time to the first chunk with a choice: the server sends the role-only
+    opening chunk when the first generated token arrives, whether the reply opens with
+    text or a tool call. ``first_text_s`` is the time to the first chunk carrying
+    ``content`` or ``reasoning_content``. ``text`` holds ``content`` only.
     """
     payload = dict(payload)
     payload["stream"] = True
@@ -70,6 +71,7 @@ def _post_stream(url: str, payload: dict, timeout: float) -> dict:
     parts: List[str] = []
     usage: dict = {}
     ttft = None
+    first_text = None
     finish = None
     t0 = time.perf_counter()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -88,21 +90,44 @@ def _post_stream(url: str, payload: dict, timeout: float) -> dict:
             if chunk.get("usage"):
                 usage = chunk["usage"]
             for choice in chunk.get("choices") or []:
+                if ttft is None:
+                    ttft = time.perf_counter() - t0
                 delta = choice.get("delta") or {}
                 piece = delta.get("content") or ""
                 if piece or delta.get("reasoning_content"):
-                    if ttft is None:
-                        ttft = time.perf_counter() - t0
+                    if first_text is None:
+                        first_text = time.perf_counter() - t0
                 parts.append(piece)
                 if choice.get("finish_reason"):
                     finish = choice["finish_reason"]
     return {
         "latency_s": time.perf_counter() - t0,
         "ttft_s": ttft,
+        "first_text_s": first_text,
         "text": "".join(parts),
         "usage": usage,
         "finish_reason": finish,
     }
+
+
+def _server_ttft(base: str) -> Optional[Tuple[float, float]]:
+    """(sum in s, count) of the server's TTFT histogram from ``/metrics``, over all
+    label sets; (0, 0) before the server has timed any request; None when the server
+    runs without --enable-metrics or the read fails."""
+    try:
+        with urllib.request.urlopen(f"{base}/metrics", timeout=30) as resp:
+            body = resp.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+    total = {"sum": 0.0, "count": 0.0}
+    for line in body.splitlines():
+        for key in total:
+            if line.startswith(f"sglang:time_to_first_token_seconds_{key}"):
+                try:
+                    total[key] += float(line.rsplit(None, 1)[1])
+                except (IndexError, ValueError):
+                    return None
+    return total["sum"], total["count"]
 
 
 def _pct(values: List[float], q: float) -> Optional[float]:
@@ -457,6 +482,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
                 res = {
                     "latency_s": dt,
                     "ttft_s": None,
+                    "first_text_s": None,
                     "text": text,
                     "usage": resp.get("usage") or {},
                     "finish_reason": None,
@@ -475,9 +501,12 @@ def cmd_replay(args: argparse.Namespace) -> int:
             "i": i,
             "latency_s": round(res["latency_s"], 4),
             "ttft_s": None if res["ttft_s"] is None else round(res["ttft_s"], 4),
+            "first_text_s": (None if res["first_text_s"] is None
+                             else round(res["first_text_s"], 4)),
             "prompt_tokens": prompt,
             "cached_tokens": cached,
             "completion_tokens": usage.get("completion_tokens", 0) or 0,
+            "finish_reason": res["finish_reason"],
             "text_sha1": hashlib.sha1(text.encode()).hexdigest()[:16],
             **({"text": text} if args.save_text else {}),
         }
@@ -491,6 +520,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
               f"prompt={prompt:6d}  {shown}")
         return row
 
+    server_ttft_start = _server_ttft(base)
     t_start = time.perf_counter()
     try:
         if args.concurrency > 1:
@@ -501,6 +531,19 @@ def cmd_replay(args: argparse.Namespace) -> int:
         print(f"  {e}", file=sys.stderr)
         return 1
     total = time.perf_counter() - t_start
+    server_ttft_end = _server_ttft(base)
+    server_ttft = None
+    if server_ttft_start and server_ttft_end:
+        n_server = server_ttft_end[1] - server_ttft_start[1]
+        server_ttft = {
+            "mean": (1000.0 * (server_ttft_end[0] - server_ttft_start[0]) / n_server
+                     if n_server else None),
+            "requests": int(n_server),
+        }
+        if int(n_server) != len(rows):
+            print(f"WARNING: the server timed {int(n_server)} first tokens in the measured "
+                  f"window, the replay sent {len(rows)} requests; its TTFT mean covers "
+                  f"other traffic too", file=sys.stderr)
 
     tot_prompt = sum(r["prompt_tokens"] for r in rows)
     tot_completion = sum(r["completion_tokens"] for r in rows)
@@ -519,6 +562,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
 
     lat = [r["latency_s"] for r in rows]
     ttft = [r["ttft_s"] for r in rows if r["ttft_s"] is not None]
+    first_text = [r["first_text_s"] for r in rows if r["first_text_s"] is not None]
     meta = {
         "requests": len(rows),
         "conversations": sum(p is None for p in prev),
@@ -541,11 +585,20 @@ def cmd_replay(args: argparse.Namespace) -> int:
             "p50": 1000.0 * _pct(lat, 0.50) if lat else None,
             "p95": 1000.0 * _pct(lat, 0.95) if lat else None,
         },
+        "ttft_from": "first chunk",
         "ttft_ms": {
             "mean": 1000.0 * statistics.fmean(ttft) if ttft else None,
             "p50": 1000.0 * _pct(ttft, 0.50) if ttft else None,
             "p95": 1000.0 * _pct(ttft, 0.95) if ttft else None,
         },
+        # Rows whose reply carries text; a reply of tool calls only has none.
+        "first_text_ms": {
+            "mean": 1000.0 * statistics.fmean(first_text) if first_text else None,
+            "rows": len(first_text),
+        },
+        # The server's own histogram over the measured window; None without
+        # --enable-metrics.
+        "server_ttft_ms": server_ttft,
     }
 
     print(
@@ -556,6 +609,9 @@ def cmd_replay(args: argparse.Namespace) -> int:
     if ttft:
         print(f"  TTFT     mean {meta['ttft_ms']['mean']:8.1f} ms  "
               f"p50 {meta['ttft_ms']['p50']:8.1f}  p95 {meta['ttft_ms']['p95']:8.1f}")
+        if server_ttft and server_ttft["mean"] is not None:
+            print(f"  TTFT     server mean {server_ttft['mean']:8.1f} ms over "
+                  f"{server_ttft['requests']} requests (sglang metrics)")
     else:
         print("  TTFT     n/a (--no-stream: a non-streamed reply arrives all at once)")
     print(f"  latency  mean {meta['latency_ms']['mean']:8.1f} ms  "
@@ -1107,6 +1163,8 @@ _SUMMARY_METRICS = (
     ("mean", "ms", lambda a, b, n: _client_stat(a, "ttft_ms", "mean"), "pct"),
     ("p50", "ms", lambda a, b, n: _client_stat(a, "ttft_ms", "p50"), "pct"),
     ("p95", "ms", lambda a, b, n: _client_stat(a, "ttft_ms", "p95"), "pct"),
+    ("server mean (sglang metrics)", "ms",
+     lambda a, b, n: _client_stat(a, "server_ttft_ms", "mean"), "pct"),
 
     ("END-TO-END LATENCY", None, None, None),
     ("mean", "ms", lambda a, b, n: _client_stat(a, "latency_ms", "mean"), "pct"),
@@ -1285,6 +1343,17 @@ def cmd_summary(args: argparse.Namespace) -> int:
         notes.append("no TTFT: those replays either ran with --no-stream or predate "
                      "streaming, and a reply that arrives all at once has no first "
                      "token to time")
+    if len({a["meta"].get("ttft_from") for a in arms
+            if _client_stat(a, "ttft_ms", "mean")}) > 1:
+        notes.append("the arms time TTFT differently: replays without ttft_from in "
+                     "their meta stop the clock at the first text delta, so a reply "
+                     "that opens with a tool call counts its decode; compare TTFT only "
+                     "between replays of the same kind")
+    with_metrics = [a["meta"].get("server_ttft_ms") is not None for a in arms if a["meta"]]
+    if any(with_metrics) and not all(with_metrics):
+        notes.append("only some arms read a server TTFT: those ran with METRICS=1 "
+                     "(--enable-metrics), which adds host work per streamed output, so "
+                     "the arms' server settings differ")
     if (_client_stat(base, "concurrency") or 1) == 1:
         notes.append("concurrency 1: throughput here is 1/latency by construction, "
                      "not serving capacity -- re-run with --concurrency for that")

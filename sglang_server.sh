@@ -36,6 +36,9 @@
 #   TOOL_PARSER=qwen3_coder REASONING_PARSER= QUANT=  empty drops the flag
 #   Qwen3-30B-A3B:  MODEL=Qwen/Qwen3-30B-A3B CTXLEN=40960 TOOL_PARSER=qwen REASONING_PARSER=qwen3
 #   TOPK_LAYER CDC_TARGET CDC_MIN CDC_MAX             unset keeps the server default
+#   METRICS=1         --enable-metrics: Prometheus counters at /metrics, incl. the server's
+#                     TTFT histogram that subcontext_bench.py replay reads; the same for
+#                     every arm compared
 #   AUDIT TRACE ROTATE_GPU DUMP_TREE                  diagnostics; timings then unusable
 #   SERVER_LOG CAPTURE FWD_TRACE STAGE                output paths; empty turns one off
 #
@@ -66,6 +69,11 @@ REASONING_PARSER=${REASONING_PARSER-}
 QUANT=${QUANT:-}
 AUDIT=${AUDIT:-}
 TRACE=${TRACE:-}
+METRICS=${METRICS:-}
+case "$METRICS" in
+  ""|1) ;;
+  *) echo "REFUSING: METRICS='$METRICS'; want 1 or unset"; exit 1 ;;
+esac
 
 for v in "TOPK_RATIO|write the ratio into the arm, e.g. ARM=cdc@0.15" \
          "MODEL_PATH|use MODEL" "SUBCTX_AUDIT|use AUDIT" "SUBCTX_TRACE|use TRACE"; do
@@ -172,7 +180,8 @@ backend:$BACKEND   audit: ${AUDIT:-off}   ctxlen: $CTXLEN   chunked prefill: ${C
 node:   $(hostname)  ip: $NODE_IP
 URL:    http://$([ "$HOST" = 0.0.0.0 ] && echo "$NODE_IP" || echo "$HOST"):${PORT}/v1
 log:    $SERVER_LOG
-capture:${CAPTURE:- off}
+capture:${CAPTURE:- off}${METRICS:+
+metrics: on (/metrics)}
 ==========================================
 EOF
 
@@ -195,4 +204,5 @@ python -u -m sglang.launch_server \
     ${TOOL_PARSER:+--tool-call-parser "$TOOL_PARSER"} \
     ${REASONING_PARSER:+--reasoning-parser "$REASONING_PARSER"} \
     ${QUANT:+--quantization "$QUANT"} \
+    ${METRICS:+--enable-metrics} \
     > "$SERVER_LOG" 2>&1
