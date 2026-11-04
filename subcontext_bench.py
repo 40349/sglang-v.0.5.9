@@ -1208,11 +1208,13 @@ def _overhead_value(
     return _added_us_per_req(arm, base, stage, n_req)
 
 
-def _split_ratio_stem(stem: str) -> Tuple[str, Optional[int]]:
-    """``"cdc_r15"`` -> ``("cdc", 15)``; any other stem -> ``(stem, None)``."""
+def _split_ratio_stem(stem: str) -> Tuple[str, Optional[Tuple[int, ...]]]:
+    """``"cdc_r15"`` -> ``("cdc", (15,))``; ``"cdc_r30-20-15"`` -> ``("cdc", (30, 20, 15))``;
+    any other stem -> ``(stem, None)``."""
     base, _, tail = stem.rpartition("_r")
-    if base and tail.isdigit():
-        return base, int(tail)
+    parts = tail.split("-")
+    if base and all(p.isdigit() for p in parts):
+        return base, tuple(int(p) for p in parts)
     return stem, None
 
 
@@ -1222,20 +1224,21 @@ def cmd_summary(args: argparse.Namespace) -> int:
     unknown = [s for s in want if _split_ratio_stem(s)[0] not in known]
     if unknown:
         print(f"unknown arm(s) {', '.join(unknown)}; want any of "
-              f"{', '.join(s for s, _ in ARM_STEMS)}, optionally with a recompute "
-              f"ratio appended as _rNN (e.g. cdc_r15)", file=sys.stderr)
+              f"{', '.join(s for s, _ in ARM_STEMS)}, optionally with recompute "
+              f"ratios appended as _rNN or _rNN-NN-... (e.g. cdc_r15, cdc_r30-20-15)",
+              file=sys.stderr)
         return 1
     arms = []
     # Arm order first, then ratio, so a sweep of one arm reads left to right.
     for stem in sorted(want, key=lambda s: (
         [k for k, _ in ARM_STEMS].index(_split_ratio_stem(s)[0]),
-        _split_ratio_stem(s)[1] or 0,
+        _split_ratio_stem(s)[1] or (),
     )):
-        base_stem, ratio = _split_ratio_stem(stem)
+        base_stem, ratios = _split_ratio_stem(stem)
         arm = _load_arm(args.dir, stem)
         if arm is not None:
             arm["label"] = known[base_stem] + (
-                f" +{ratio}% recompute" if ratio else ""
+                f" +{'/'.join(str(r) for r in ratios)}% recompute" if ratios else ""
             )
             arms.append(arm)
     if not arms:
