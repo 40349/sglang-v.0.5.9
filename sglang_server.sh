@@ -45,6 +45,9 @@
 #   Qwen3-30B-A3B:  MODEL=Qwen/Qwen3-30B-A3B CTXLEN=40960 TOOL_PARSER=qwen REASONING_PARSER=qwen3
 #   TOPK_LAYER CDC_TARGET CDC_MIN CDC_MAX             unset keeps the server default
 #   RELAY_TAU_DEV=1.5 RELAY_TAU_INF=1.45 RELAY_SUFFIX=10   relay's selection thresholds
+#   METRICS=1         --enable-metrics: Prometheus counters at /metrics, incl. the server's
+#                     TTFT histogram that subcontext_bench.py replay reads; the same for
+#                     every arm compared
 #   AUDIT TRACE ROTATE_GPU DUMP_TREE                  diagnostics; timings then unusable
 #   SERVER_LOG CAPTURE FWD_TRACE STAGE                output paths; empty turns one off
 #   RELAY_PROF                                        relay@profile's output path
@@ -84,10 +87,15 @@ QUANT=${QUANT:-}
 AUDIT=${AUDIT:-}
 TRACE=${TRACE:-}
 TEACHER_FORCE=${TEACHER_FORCE:-}
+METRICS=${METRICS:-}
 API_KEY=${API_KEY:-}
 case "$TEACHER_FORCE" in
   ""|1) ;;
   *) echo "REFUSING: TEACHER_FORCE='$TEACHER_FORCE'; want 1 or unset"; exit 1 ;;
+esac
+case "$METRICS" in
+  ""|1) ;;
+  *) echo "REFUSING: METRICS='$METRICS'; want 1 or unset"; exit 1 ;;
 esac
 if [ -n "$TEACHER_FORCE" ] && [ -z "$API_KEY" ]; then
   echo "REFUSING: TEACHER_FORCE=1 runs code clients send; set API_KEY, e.g. API_KEY=\$(openssl rand -hex 16)"
@@ -240,7 +248,8 @@ backend:$BACKEND   audit: ${AUDIT:-off}   ctxlen: $CTXLEN   chunked prefill: ${C
 node:   $(hostname)  ip: $NODE_IP
 URL:    http://$([ "$HOST" = 0.0.0.0 ] && echo "$NODE_IP" || echo "$HOST"):${PORT}/v1
 log:    $SERVER_LOG
-capture:${CAPTURE:- off}${TEACHER_FORCE:+
+capture:${CAPTURE:- off}${METRICS:+
+metrics: on (/metrics)}${TEACHER_FORCE:+
 teacher-forced requests: on (custom logit processors, no overlap scheduling)}${API_KEY:+
 api key: set}$([ "$NAME" = relay ] && echo "
 relay:  tau_dev ${RELAY_TAU_DEV:-1.5}   tau_inf ${RELAY_TAU_INF:-1.45}   suffix ${RELAY_SUFFIX:-10}   prefill hidden $([ -n "$PREFILL_HIDDEN" ] && echo on || echo off)")${RELAY_PROF:+
@@ -276,6 +285,7 @@ python -u -m sglang.launch_server \
     ${TOOL_PARSER:+--tool-call-parser "$TOOL_PARSER"} \
     ${REASONING_PARSER:+--reasoning-parser "$REASONING_PARSER"} \
     ${QUANT:+--quantization "$QUANT"} \
+    ${METRICS:+--enable-metrics} \
     ${TEACHER_FORCE:+--enable-custom-logit-processor --disable-overlap-schedule} \
     ${API_CONFIG:+--config "$API_CONFIG"} \
     > "$SERVER_LOG" 2>&1
