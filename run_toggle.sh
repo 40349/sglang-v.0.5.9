@@ -54,6 +54,18 @@ export PORT=${PORT:-8000}
 # all of it inside <think>, out of it.
 export REASONING_PARSER=${REASONING_PARSER-}
 
+# Refuses sglang_server.sh's teacher-forced settings in the environment.
+case "${1:-}" in
+  record|toggle)
+    for v in API_KEY TEACHER_FORCE; do
+      if [ -n "$(printenv "$v")" ]; then
+        echo "REFUSING: $v is set; it is for tf_kl.py's servers, and this script's servers" \
+             "and clients run without it. unset $v first."
+        exit 1
+      fi
+    done ;;
+esac
+
 # Every arm is checked before the first one runs.
 check_arm() {
   local out
