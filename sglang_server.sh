@@ -39,6 +39,9 @@
 #   METRICS=1         --enable-metrics: Prometheus counters at /metrics, incl. the server's
 #                     TTFT histogram that subcontext_bench.py replay reads; the same for
 #                     every arm compared
+#   DETERMINISTIC=1   --enable-deterministic-inference: batch-invariant kernels, so a request's
+#                     output does not depend on the requests batched with it; slower, timings
+#                     not comparable with runs without it
 #   AUDIT TRACE ROTATE_GPU DUMP_TREE                  diagnostics; timings then unusable
 #   SERVER_LOG CAPTURE FWD_TRACE STAGE                output paths; empty turns one off
 #   TEACHER_FORCE=1   accepts custom logit processors (code a client sends, run in the
@@ -78,6 +81,7 @@ AUDIT=${AUDIT:-}
 TRACE=${TRACE:-}
 TEACHER_FORCE=${TEACHER_FORCE:-}
 METRICS=${METRICS:-}
+DETERMINISTIC=${DETERMINISTIC:-}
 API_KEY=${API_KEY:-}
 case "$TEACHER_FORCE" in
   ""|1) ;;
@@ -87,6 +91,19 @@ case "$METRICS" in
   ""|1) ;;
   *) echo "REFUSING: METRICS='$METRICS'; want 1 or unset"; exit 1 ;;
 esac
+case "$DETERMINISTIC" in
+  ""|1) ;;
+  *) echo "REFUSING: DETERMINISTIC='$DETERMINISTIC'; want 1 or unset"; exit 1 ;;
+esac
+# Deterministic triton prefill cuts chunks at multiples of this many tokens.
+TRUNC_ALIGN=${SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE:-4096}
+if [ -n "$DETERMINISTIC" ] && [ "$BACKEND" = triton ] && [ "$CHUNKED_PREFILL" != -1 ] \
+   && { [ -z "$CHUNKED_PREFILL" ] || [ "$CHUNKED_PREFILL" -lt "$TRUNC_ALIGN" ]; }; then
+  echo "REFUSING: DETERMINISTIC=1 with triton never schedules a prompt that needs chunking when" \
+       "CHUNKED_PREFILL (now '${CHUNKED_PREFILL:-sglang default}') is below $TRUNC_ALIGN; set" \
+       "CHUNKED_PREFILL=8192 (or -1)"
+  exit 1
+fi
 if [ -n "$TEACHER_FORCE" ] && [ -z "$API_KEY" ]; then
   echo "REFUSING: TEACHER_FORCE=1 runs code clients send; set API_KEY, e.g. API_KEY=\$(openssl rand -hex 16)"
   exit 1
@@ -202,7 +219,8 @@ node:   $(hostname)  ip: $NODE_IP
 URL:    http://$([ "$HOST" = 0.0.0.0 ] && echo "$NODE_IP" || echo "$HOST"):${PORT}/v1
 log:    $SERVER_LOG
 capture:${CAPTURE:- off}${METRICS:+
-metrics: on (/metrics)}${TEACHER_FORCE:+
+metrics: on (/metrics)}${DETERMINISTIC:+
+deterministic inference: on (batch-invariant kernels; timings not comparable)}${TEACHER_FORCE:+
 teacher-forced requests: on (custom logit processors, no overlap scheduling)}${API_KEY:+
 api key: set}
 ==========================================
@@ -237,6 +255,7 @@ python -u -m sglang.launch_server \
     ${REASONING_PARSER:+--reasoning-parser "$REASONING_PARSER"} \
     ${QUANT:+--quantization "$QUANT"} \
     ${METRICS:+--enable-metrics} \
+    ${DETERMINISTIC:+--enable-deterministic-inference} \
     ${TEACHER_FORCE:+--enable-custom-logit-processor --disable-overlap-schedule} \
     ${API_CONFIG:+--config "$API_CONFIG"} \
     > "$SERVER_LOG" 2>&1

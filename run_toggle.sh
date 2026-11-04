@@ -159,7 +159,7 @@ replay() {
 # The tables at the end are written nowhere else. CONSOLE= disables the tee.
 CONSOLE=${CONSOLE-$OUT/${1:-run}.txt}
 if [ -n "$CONSOLE" ]; then
-  echo "### $(date -Is)  $0 ${*:-}  ARMS='$ARMS' AUDIT=${AUDIT:-off} CONC=$CONC GEN_TOKENS=$GEN_TOKENS METRICS=${METRICS:-off}" >> "$CONSOLE"
+  echo "### $(date -Is)  $0 ${*:-}  ARMS='$ARMS' AUDIT=${AUDIT:-off} CONC=$CONC GEN_TOKENS=$GEN_TOKENS METRICS=${METRICS:-off} DETERMINISTIC=${DETERMINISTIC:-off}" >> "$CONSOLE"
   exec > >(tee -a "$CONSOLE") 2>&1
   TEE_PID=$!
   trap 'exec 1>&- 2>&-; wait $TEE_PID 2>/dev/null || true' EXIT
@@ -254,6 +254,7 @@ TXT
     echo "  REQUESTS=<path>       replay a capture recorded elsewhere (e.g. the H200)"
     echo "  METRICS=1             sglang's /metrics on every arm; the replay reads the"
     echo "                        server's own TTFT from it"
+    echo "  DETERMINISTIC=1       batch-invariant kernels on every arm (sglang_server.sh)"
     echo "  MODEL CTXLEN PORT MEMFRAC BACKEND CHUNKED_PREFILL TOOL_PARSER QUANT ..."
     echo "                        server knobs, passed through to sglang_server.sh"
     exit 1;;
