@@ -26,9 +26,11 @@ register_amd_ci(est_time=5, suite="stage-b-test-small-1-gpu-amd")
 import itertools
 import unittest
 
+import numpy as np
 import torch
 
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache import subctx_index as subctx_index_module
 from sglang.srt.mem_cache.subctx_index import SubContextIndex, chunk_id
 from sglang.srt.utils import subctx_config
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -702,6 +704,171 @@ class TestChainedIndex(unittest.TestCase):
         owners = tree_slot_owners(cache)
         self.assertEqual(held - set(owners) - set(allocator.freed), set(), "lost slots")
         self.assertEqual(held & set(owners) & set(allocator.freed), set(), "freed but held")
+
+
+class TestSeedRuns(unittest.TestCase):
+    """Runs grown from seed hits: found inside a longer block, extended along the tree
+    across node edges, kept out of the exact prefix, dropped when short or evicted.
+    Every window is a seed here (``_SEED_MASK`` 0)."""
+
+    HEAD_A = list(range(1, 41))
+    HEAD_B = list(range(900, 910))
+    TAIL = list(range(500, 540))
+    OUT = list(range(600, 640))
+    MID = list(range(950, 958))
+    END = list(range(960, 968))
+
+    def setUp(self):
+        self._saved_ratios = subctx_config.TOPK_RATIOS
+        self._saved_mask = subctx_index_module._SEED_MASK
+        subctx_index_module._SEED_MASK = np.uint64(0)
+
+    def tearDown(self):
+        subctx_config.TOPK_RATIOS = self._saved_ratios
+        subctx_index_module._SEED_MASK = self._saved_mask
+
+    def _seeded(self, min_chunk=32):
+        cache, pool, _ = make_cache(rotator=FakeRotator())
+        wide_pool(pool)
+        cache.sub_context_index = SubContextIndex(min_chunk_tokens=min_chunk)
+        first = make_req("r1", [self.HEAD_A, self.TAIL])
+        prefill_chained(cache, pool, first, first_slot=100)
+        decode_and_finish(cache, pool, first, self.OUT, first_slot=400)
+        return cache
+
+    def _match(self, cache, blocks):
+        req = make_req("r2", blocks, req_pool_idx=1)
+        req.init_next_round_input(cache)
+        self.addCleanup(req.release_sub_context_rotated_slots, cache)
+        self.addCleanup(req.release_sub_context_match_locks, cache)
+        return req
+
+    def test_an_output_inside_a_longer_block_is_found_and_copied(self):
+        cache = self._seeded()
+        req = self._match(cache, [self.HEAD_B + self.MID + self.OUT + self.END])
+
+        self.assertEqual([(s, e) for s, e, _ in req.sub_context_layout], [(18, 58)])
+        src, dst, delta = cache.kv_rotator.calls[-1]
+        self.assertEqual(src, list(range(400, 440)))
+        self.assertEqual(delta, 18 - 80)
+        self.assertEqual(req.sub_context_layout[0][2].tolist(), dst)
+        self.assertEqual(req.sub_context_seed_tokens, 40)
+
+    def test_a_run_is_extended_across_the_edge_between_prompt_and_output(self):
+        cache = self._seeded()
+        shared = self.TAIL[20:] + self.OUT[:30]
+        req = self._match(cache, [self.HEAD_B + shared + self.END])
+
+        self.assertEqual([(s, e) for s, e, _ in req.sub_context_layout], [(10, 60)])
+        src, _dst, delta = cache.kv_rotator.calls[-1]
+        self.assertEqual(src, list(range(160, 180)) + list(range(400, 430)))
+        self.assertEqual(delta, 10 - 60)
+
+    def test_the_exact_prefix_is_not_copied_again(self):
+        cache = self._seeded()
+        req = self._match(cache, [self.HEAD_A, self.TAIL[:30] + self.OUT])
+
+        self.assertEqual(req.sub_context_exact_len, 70)
+        self.assertEqual(
+            [(s, e) for s, e, _ in req.sub_context_layout], [(0, 70), (70, 109)]
+        )
+        src, _dst, delta = cache.kv_rotator.calls[-1]
+        self.assertEqual(src, list(range(400, 439)))
+        self.assertEqual(delta, 70 - 80)
+
+    def test_a_run_shorter_than_the_minimum_is_not_used(self):
+        cache = self._seeded(min_chunk=40)
+        req = self._match(cache, [self.HEAD_B + self.MID + self.OUT[:39] + self.END])
+        self.assertIsNone(req.sub_context_layout)
+
+    def test_eviction_forgets_the_seeds_it_removes(self):
+        cache = self._seeded()
+        cache.evict(EvictParams(num_tokens=10**6))
+        self.assertEqual(cache._seeds_at, {})
+        scope = cache.sub_context_index._scopes.get(None)
+        self.assertFalse(scope is not None and scope.seeds)
+
+        req = self._match(cache, [self.HEAD_B + self.MID + self.OUT + self.END])
+        self.assertIsNone(req.sub_context_layout)
+
+    def test_repeated_content_is_extended_a_bounded_number_of_times(self):
+        cache, pool, _ = make_cache(rotator=FakeRotator())
+        wide_pool(pool, width=1024)
+        cache.sub_context_index = SubContextIndex(min_chunk_tokens=32)
+        periodic = list(range(1000, 1020)) * 30
+        first = make_req("r1", [periodic])
+        prefill_chained(cache, pool, first, first_slot=100)
+        decode_and_finish(cache, pool, first, [1, 2], first_slot=900)
+        calls = []
+        forward = cache._match_forward
+
+        def counted(*args):
+            calls.append(args[3])
+            return forward(*args)
+
+        cache._match_forward = counted
+        req = self._match(cache, [self.HEAD_B + periodic + self.END])
+
+        self.assertEqual([(s, e) for s, e, _ in req.sub_context_layout], [(10, 610)])
+        self.assertLessEqual(len(calls), subctx_index_module.SEED_KEEP)
+
+    def test_runs_meeting_at_a_seam_are_cut_to_cover_both(self):
+        cache, pool, _ = make_cache(rotator=FakeRotator())
+        wide_pool(pool)
+        cache.sub_context_index = SubContextIndex(min_chunk_tokens=32)
+        a, j, b = list(range(3000, 3060)), list(range(3100, 3110)), list(range(3200, 3260))
+        c, d, e, f = (list(range(x, x + 20)) for x in (3300, 3400, 3500, 3600))
+        x = make_req("rx", [a + j + c])
+        prefill_chained(cache, pool, x, first_slot=100)
+        decode_and_finish(cache, pool, x, [1, 2], first_slot=200)
+        y = make_req("ry", [d + j + b], req_pool_idx=2)
+        prefill_chained(cache, pool, y, first_slot=300)
+        decode_and_finish(cache, pool, y, [3, 4], first_slot=400)
+
+        req = self._match(cache, [e + a + j + b + f])
+        self.assertEqual(
+            [(s, e_) for s, e_, _ in req.sub_context_layout], [(20, 90), (90, 150)]
+        )
+        self.assertEqual(req.sub_context_seed_tokens, 130)
+
+    def test_eviction_moves_seeds_to_the_surviving_parent(self):
+        cache, pool, _ = make_cache(rotator=FakeRotator())
+        wide_pool(pool)
+        cache.sub_context_index = SubContextIndex(min_chunk_tokens=32)
+        whole = list(range(2000, 2300))
+        first = make_req("r1", [whole])
+        prefill_chained(cache, pool, first, first_slot=100)
+        decode_and_finish(cache, pool, first, [1, 2], first_slot=400)
+        other = make_req("r3", [whole[:200] + list(range(4000, 4100))], req_pool_idx=2)
+        prefill_chained(cache, pool, other, first_slot=500)
+        decode_and_finish(cache, pool, other, [5, 6], first_slot=700)
+        # r1's output leaf, then its prompt tail [200, 300) once that is a leaf.
+        cache.evict(EvictParams(num_tokens=3))
+        self.assertEqual(len(chain_slots(cache, whole)), 200)
+
+        req = self._match(cache, [self.HEAD_B + whole[20:180] + self.END])
+        self.assertEqual([(s, e) for s, e, _ in req.sub_context_layout], [(10, 170)])
+        src, _dst, delta = cache.kv_rotator.calls[-1]
+        self.assertEqual(src, list(range(120, 280)))
+        self.assertEqual(delta, 10 - 20)
+
+    def test_a_seed_keeps_its_first_locations_and_its_latest(self):
+        index = SubContextIndex(min_chunk_tokens=32)
+        window = list(range(300, 332))
+        nodes = [object() for _ in range(6)]
+        for node in nodes:
+            index.add_seeds(window, None, 0, node)
+        places = next(iter(index._scopes[None].seeds.values()))
+        keep = subctx_index_module.SEED_KEEP
+        self.assertEqual(
+            [w[0] for w in places], nodes[: keep - 1] + [nodes[-1]]
+        )
+        hits = index.seed_hits([7] * 5 + window, None, 0, 37)
+        self.assertEqual({at for at, _ in hits}, {5})
+
+        fp = next(iter(index._scopes[None].seeds))
+        index.drop_seed(None, fp, nodes[0])
+        self.assertNotIn(nodes[0], [w[0] for w in index._scopes[None].seeds[fp]])
 
 
 if __name__ == "__main__":

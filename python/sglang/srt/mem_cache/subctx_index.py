@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Dict, List, NamedTuple, Optional, Sequence
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import xxhash
@@ -24,6 +24,12 @@ MIN_CHUNK_TOKENS = int(os.environ.get("SGLANG_SUBCTX_MIN_CHUNK", "64"))
 
 # Leading tokens of a chunk the index fingerprints.
 ANCHOR_TOKENS = 32
+
+# Seeds: the stored windows whose fingerprint has its low SEED_BITS bits clear (one per
+# 2**SEED_BITS tokens on average), at most SEED_KEEP locations per fingerprint.
+SEED_BITS = 6
+SEED_KEEP = 4
+_SEED_MASK = np.uint64((1 << SEED_BITS) - 1)
 
 # Window fingerprint: ``sum(token_j * BASE**(W-1-j))`` mod 2**64, then mixed. BASE is
 # odd, hence invertible, so every window is read off one prefix sum.
@@ -227,11 +233,14 @@ def clip_block_ends(
 class _Scope:
     """The chunks registered under one ``extra_key``; a scan sees only its own scope."""
 
-    __slots__ = ("chunks", "by_anchor", "max_len", "_bits", "_mask")
+    __slots__ = ("chunks", "by_anchor", "seeds", "max_len", "_bits", "_mask")
 
     def __init__(self) -> None:
         self.chunks: Dict[str, np.ndarray] = {}
         self.by_anchor: Dict[int, List[str]] = {}
+        # Seed fingerprint -> its locations ``(node, position)``: the first ones, then
+        # the latest.
+        self.seeds: Dict[int, List[Tuple[object, int]]] = {}
         # Longest chunk ever registered here; not lowered on unregister.
         self.max_len = 0
         # Bloom filter over `by_anchor`'s keys; None means rebuild on next use.
@@ -293,6 +302,8 @@ class SubContextIndex:
         self.prompt_tokens = 0
         self.prefix_tokens = 0
         self.reused_tokens = 0
+        # Of `reused_tokens`, the ones in runs found from a seed.
+        self.seed_reused_tokens = 0
         self.rotated_tokens = 0
         # Requests whose layout did not fit one prefill pass and took the prefix only,
         # and the found tokens those requests dropped.
@@ -315,7 +326,8 @@ class SubContextIndex:
             f"{head} | matched {self.prompt_tokens} prompt tokens: prefix "
             f"{self.prefix_tokens} ({100.0 * self.prefix_tokens / denom:.0f}%), "
             f"scan found {self.reused_tokens} "
-            f"({100.0 * self.reused_tokens / denom:.0f}%), "
+            f"({100.0 * self.reused_tokens / denom:.0f}%; {self.seed_reused_tokens} "
+            f"from seeds), "
             f"{self.rotated_tokens} of them rotated into place"
             f" | {self.fell_back} requests too big for one pass "
             f"({self.fell_back_tokens} found tokens dropped), "
@@ -426,6 +438,120 @@ class SubContextIndex:
         self._scopes.clear()
         self._scope_of.clear()
         self._where.clear()
+
+    def add_seeds(
+        self,
+        token_ids: Sequence[int],
+        extra_key: Optional[str],
+        start: int,
+        node: object,
+    ) -> List[int]:
+        """Index the seeds of ``token_ids`` whose window holds a token at or past
+        ``start``, each at location ``(node, window start)``. Returns their fingerprints.
+        """
+        lo = max(0, start - ANCHOR_TOKENS + 1)
+        prints = anchor_fingerprints(np.asarray(token_ids[lo:], dtype=np.int32))
+        if prints.shape[0] == 0:
+            return []
+        scope = self._scopes.get(extra_key)
+        if scope is None:
+            scope = self._scopes[extra_key] = _Scope()
+        added = []
+        for at in np.flatnonzero((prints & _SEED_MASK) == 0).tolist():
+            fp = int(prints[at])
+            where = (node, lo + at)
+            places = scope.seeds.get(fp)
+            if places is None:
+                scope.seeds[fp] = [where]
+            elif len(places) < SEED_KEEP:
+                places.append(where)
+            else:
+                places[-1] = where
+            added.append(fp)
+        return added
+
+    def seed_hits(
+        self,
+        token_ids: Sequence[int],
+        extra_key: Optional[str],
+        lo: int,
+        hi: int,
+    ) -> List[Tuple[int, Tuple[object, int]]]:
+        """``(position, location)`` of every indexed seed among the windows inside
+        ``token_ids[lo:hi]``, in increasing position.
+        """
+        scope = self._scopes.get(extra_key)
+        if scope is None or not scope.seeds or hi - lo < ANCHOR_TOKENS:
+            return []
+        prints = anchor_fingerprints(np.asarray(token_ids[lo:hi], dtype=np.int32))
+        out = []
+        for at in np.flatnonzero((prints & _SEED_MASK) == 0).tolist():
+            for where in scope.seeds.get(int(prints[at]), ()):
+                out.append((lo + at, where))
+        return out
+
+    def seed_windows(
+        self,
+        token_ids: Sequence[int],
+        extra_key: Optional[str],
+        lo: int,
+        hi: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Start positions (increasing) and fingerprints of the seed windows inside
+        ``token_ids[lo:hi]``; empty when the scope holds no seed."""
+        scope = self._scopes.get(extra_key)
+        none = np.empty(0, dtype=np.int64), np.empty(0, dtype=np.uint64)
+        if scope is None or not scope.seeds or hi - lo < ANCHOR_TOKENS:
+            return none
+        prints = anchor_fingerprints(np.asarray(token_ids[lo:hi], dtype=np.int32))
+        at = np.flatnonzero((prints & _SEED_MASK) == 0)
+        return lo + at, prints[at]
+
+    def seed_locations(
+        self, extra_key: Optional[str], fp: int
+    ) -> List[Tuple[object, int]]:
+        """The locations of seed ``fp``, oldest first."""
+        scope = self._scopes.get(extra_key)
+        return [] if scope is None else scope.seeds.get(int(fp), [])
+
+    def drop_seed(self, extra_key: Optional[str], fp: int, node: object) -> None:
+        """Remove the locations of seed ``fp`` in ``node``."""
+        scope = self._scopes.get(extra_key)
+        places = None if scope is None else scope.seeds.get(fp)
+        if not places:
+            return
+        kept = [w for w in places if w[0] is not node]
+        if kept:
+            scope.seeds[fp] = kept
+        else:
+            del scope.seeds[fp]
+
+    def rehome_seed(
+        self,
+        extra_key: Optional[str],
+        fp: int,
+        node: object,
+        heir: Optional[object],
+        limit: int,
+    ) -> bool:
+        """The locations of seed ``fp`` in ``node`` move to ``heir`` when their window
+        starts at or before ``limit``, the others are removed. Whether any moved."""
+        scope = self._scopes.get(extra_key)
+        places = None if scope is None else scope.seeds.get(fp)
+        if not places:
+            return False
+        kept, moved = [], False
+        for where in places:
+            if where[0] is not node:
+                kept.append(where)
+            elif heir is not None and where[1] <= limit:
+                kept.append((heir, where[1]))
+                moved = True
+        if kept:
+            scope.seeds[fp] = kept
+        else:
+            del scope.seeds[fp]
+        return moved
 
     def unregister(self, cid: str) -> None:
         """Forget a chunk (called when the tree evicts it). Unknown ids are ignored."""

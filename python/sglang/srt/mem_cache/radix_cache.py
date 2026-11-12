@@ -31,6 +31,7 @@ from collections import Counter, defaultdict
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,7 @@ from sglang.srt.mem_cache.evict_policy import (
 )
 from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
 from sglang.srt.mem_cache.subctx_index import chunk_id as sub_context_chunk_id
-from sglang.srt.mem_cache.subctx_index import cut_points
+from sglang.srt.mem_cache.subctx_index import ANCHOR_TOKENS, cut_points
 from sglang.srt.utils import host_timer, subctx_config
 from sglang.srt.utils.subctx_trace import TRACE_ON, trace
 
@@ -285,6 +286,9 @@ class RadixCache(BasePrefixCache):
         self.sub_context_index = None
         # Chained requests: node id -> ids of the chunks whose last token it holds.
         self._chunks_at: dict = {}
+        # Chained requests: node id -> ``(extra_key, fingerprint)`` of the seeds located
+        # at it (the node holding a stored request's last token).
+        self._seeds_at: dict = {}
 
         self.kv_event_queue = []
 
@@ -355,6 +359,7 @@ class RadixCache(BasePrefixCache):
         self.protected_size_ = 0
         self.evictable_leaves.clear()
         self._chunks_at.clear()
+        self._seeds_at.clear()
         if self.sub_context_index is not None:
             self.sub_context_index.clear()
         self._record_all_cleared_event()
@@ -498,6 +503,186 @@ class RadixCache(BasePrefixCache):
                 held.discard(cid)
         if not held:
             del self._chunks_at[child.id]
+
+    def _register_seeds(
+        self, req: Req, token_ids: List[int], stored_from: int, last_node: TreeNode
+    ) -> None:
+        """Index the seeds of the windows holding a token stored past ``stored_from``,
+        located at ``last_node``, which holds ``token_ids[-1]``."""
+        if last_node is self.root_node:
+            return
+        fps = self.sub_context_index.add_seeds(
+            token_ids, req.extra_key, stored_from, last_node
+        )
+        if fps:
+            self._seeds_at.setdefault(last_node.id, []).extend(
+                (req.extra_key, fp) for fp in dict.fromkeys(fps)
+            )
+
+    def _forget_seeds_at(self, node: TreeNode) -> None:
+        """After evicting ``node``: the seed locations at it whose window lies in its
+        ancestors move to its parent, the others are dropped."""
+        held = self._seeds_at.pop(node.id, None)
+        if not held:
+            return
+        index = self.sub_context_index
+        parent = node.parent
+        heir = (
+            parent
+            if parent is not None and parent is not self.root_node
+            and self._node_in_tree(parent)
+            else None
+        )
+        limit = node.canonical_position - ANCHOR_TOKENS
+        moved = []
+        for extra_key, fp in set(held):
+            if index.rehome_seed(extra_key, fp, node, heir, limit):
+                moved.append((extra_key, fp))
+        if moved:
+            self._seeds_at.setdefault(heir.id, []).extend(moved)
+
+    def _child_of(self, node: TreeNode, token: int, extra_key) -> Optional[TreeNode]:
+        return node.children.get(token if extra_key is None else (extra_key, token))
+
+    @staticmethod
+    def _common_run(seg_of, q: np.ndarray, total: int) -> int:
+        """Length of the common run of ``seg_of(a, b)`` (the stored tokens ``a..b`` of a
+        span, numpy) and ``q``, compared in pieces of doubling size up to ``total``."""
+        n, step = 0, 64
+        while n < total:
+            length = min(step, total - n)
+            diff = np.flatnonzero(seg_of(n, n + length) != q[n : n + length])
+            if diff.size:
+                return n + int(diff[0])
+            n += length
+            step *= 2
+        return n
+
+    def _match_forward(
+        self, node: TreeNode, pos: int, q: np.ndarray, i: int, hi: int, extra_key
+    ) -> Tuple[int, TreeNode]:
+        """Length of the run where ``q[i:hi]`` equals the stored tokens from position
+        ``pos`` (held by ``node``) on, down the children; and the node holding its last
+        token (``node`` when the run is empty)."""
+        n, last = 0, node
+        while i + n < hi:
+            off = pos + n - node.canonical_position
+            key = node.key.token_ids
+            if off >= len(key):
+                child = self._child_of(node, int(q[i + n]), extra_key)
+                if child is None:
+                    break
+                node = child
+                continue
+            total = min(len(key) - off, hi - i - n)
+            got = self._common_run(
+                lambda a, b: np.asarray(key[off + a : off + b], dtype=np.int64),
+                q[i + n : i + n + total],
+                total,
+            )
+            if got:
+                last = node
+            n += got
+            if got < total:
+                break
+        return n, last
+
+    def _match_backward(
+        self, node: TreeNode, pos: int, q: np.ndarray, i: int, lo: int
+    ) -> int:
+        """Length of the run where ``q[lo:i]`` read backward equals the stored tokens
+        before position ``pos`` on the chain through ``node``."""
+        n = 0
+        while i - n > lo:
+            p = pos - n - 1
+            while node is not self.root_node and p < node.canonical_position:
+                node = node.parent
+            if node is self.root_node or node is None:
+                break
+            off = p - node.canonical_position
+            total = min(off + 1, i - n - lo)
+            key = node.key.token_ids
+            got = self._common_run(
+                lambda a, b: np.asarray(key[off + 1 - b : off + 1 - a], dtype=np.int64)[::-1],
+                q[i - n - total : i - n][::-1],
+                total,
+            )
+            n += got
+            if got < total:
+                break
+        return n
+
+    def seed_runs(
+        self, token_ids: List[int], extra_key, lo: int, hi: int, min_len: int
+    ) -> List[Tuple[int, int, TreeNode, int]]:
+        """Runs of ``token_ids[lo:hi]`` equal to stored tokens, found from the seeds:
+        a seed hit whose window no earlier run covers is extended token by token
+        backward up the chain and forward down the tree, at each of its locations. ``(start, end, node, src_start)``: ``token_ids[start:end]`` is
+        stored at positions ``src_start..`` on the chain ending in ``node``, which holds
+        its last token. Overlaps are cut off the later run; runs shorter than
+        ``min_len`` are dropped. Disjoint, in increasing start."""
+        index = self.sub_context_index
+        at, prints = index.seed_windows(token_ids, extra_key, lo, hi)
+        if not at.size:
+            return []
+        q = np.asarray(token_ids, dtype=np.int64)
+        covered = np.zeros(hi - lo, dtype=bool)
+        found = []
+        k = 0
+        while k < at.size:
+            i = int(at[k])
+            group = index.seed_locations(extra_key, prints[k])
+            k += 1
+            if not group:
+                continue
+            if covered[i - lo : i - lo + ANCHOR_TOKENS].all():
+                continue
+            reach = 0
+            for home, pos in group:
+                if not self._node_in_tree(home):
+                    continue
+                node = home
+                while node is not self.root_node and node.canonical_position > pos:
+                    node = node.parent
+                if node is self.root_node:
+                    continue
+                fwd, end_node = self._match_forward(node, pos, q, i, hi, extra_key)
+                if fwd < ANCHOR_TOKENS:
+                    continue
+                back = self._match_backward(node, pos, q, i, lo)
+                if back + fwd < min_len:
+                    continue
+                covered[i - back - lo : i + fwd - lo] = True
+                found.append((i - back, i + fwd, end_node, pos - back))
+                reach = max(reach, i + fwd)
+            if reach:
+                # Every later hit whose window ends by `reach` is covered.
+                k = max(k, int(np.searchsorted(at, reach - ANCHOR_TOKENS + 1)))
+        out = []
+        last_end = lo
+        for start, end, node, src in sorted(found, key=lambda r: (r[0], -r[1])):
+            if start < last_end:
+                src += last_end - start
+                start = last_end
+            if end - start >= min_len:
+                out.append((start, end, node, src))
+                last_end = end
+        return out
+
+    def chain_span_slots(
+        self, node: TreeNode, start: int, end: int
+    ) -> Optional[Tuple[torch.Tensor, Optional[List[int]]]]:
+        """KV slots of positions ``[start, end)`` on the chain ending in ``node``,
+        which holds position ``end - 1``, and their tokens when auditing; None if the
+        node left the tree or does not hold it."""
+        if not self._node_in_tree(node) or not (
+            node.canonical_position <= end - 1 < node.canonical_position + len(node.key)
+        ):
+            return None
+        slots, tokens = self._chain_span(node, start, end)
+        if slots is None:
+            return None
+        return slots, tokens
 
     def _forget_chunks_at(self, node: TreeNode) -> None:
         """After evicting ``node``: drop the chunk locations whose last token it held."""
@@ -713,6 +898,7 @@ class RadixCache(BasePrefixCache):
                     self._register_chain(
                         req, keys, new_prefix_len, result.last_node, final=True
                     )
+                    self._register_seeds(req, keys, new_prefix_len, result.last_node)
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : len(keys)]
@@ -802,6 +988,7 @@ class RadixCache(BasePrefixCache):
                 self._register_chain(
                     req, keys, new_prefix_len, new_last_node, final=False
                 )
+                self._register_seeds(req, keys, new_prefix_len, new_last_node)
             # The locks on the nodes the scan copied from.
             req.release_sub_context_match_locks(self)
 
@@ -834,6 +1021,7 @@ class RadixCache(BasePrefixCache):
 
             if self.sub_context_index is not None:
                 self._forget_chunks_at(x)
+                self._forget_seeds_at(x)
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
                 new_priority = self.eviction_strategy.get_priority(x.parent)

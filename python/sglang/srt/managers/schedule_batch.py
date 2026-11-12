@@ -658,6 +658,8 @@ class Req(ReqDllmMixin):
         # time the request runs (`sub_context_counted`).
         self.sub_context_tally: Optional[Tuple[int, int, int, int, int, int]] = None
         self.sub_context_counted: bool = False
+        # Of the last match's found tokens, the ones in runs grown from seeds.
+        self.sub_context_seed_tokens: int = 0
 
         self.lora_id = lora_id
         self.routing_key = routing_key
@@ -1052,6 +1054,7 @@ class Req(ReqDllmMixin):
             return
         if index is not None and not self.sub_context_counted:
             index.count_match(*self.sub_context_tally)
+            index.seed_reused_tokens += self.sub_context_seed_tokens
             self.sub_context_counted = True
         self.sub_context_tally = None
 
@@ -1218,10 +1221,12 @@ class Req(ReqDllmMixin):
         """Match the prefix as a plain request does, then find this prompt's cached
         chunks past it.
 
-        Each found run is copied into slots of this request's own, rotated when it sits
-        at another position than it was computed at; the request is later stored as one
-        chain, like a plain one. The gaps are computed. With no run found, or a layout
-        too big for one prefill pass, the request is a plain prefix hit.
+        Runs are the registered chunks found whole, and the runs grown from seed hits
+        token by token along the tree (``seed_runs``). Each found run is copied into
+        slots of this request's own, rotated when it sits at another position than it
+        was computed at; the request is later stored as one chain, like a plain one.
+        The gaps are computed. With no run found, or a layout too big for one prefill
+        pass, the request is a plain prefix hit.
         """
         self.release_sub_context_match_locks(tree_cache)
         self.release_sub_context_rotated_slots(tree_cache)
@@ -1269,12 +1274,45 @@ class Req(ReqDllmMixin):
                 head[run] = start - found.start
                 candidates.append(run)
 
+        # Seed run id -> (node holding its last stored token, stored start).
+        seeded = {}
+        if not self.sub_context_index_declined:
+            with host_timer.record("scan_seeds"):
+                for n, (start, end, node, src) in enumerate(
+                    tree_cache.seed_runs(
+                        self.fill_ids, self.extra_key, exact, limit,
+                        index.min_chunk_tokens,
+                    )
+                ):
+                    run = SubContextMatch(start, end, f"seed:{n}")
+                    head[run] = 0
+                    seeded[run.chunk_id] = (node, src)
+                    candidates.append(run)
+
         moved = rotated = discarded = 0
         fell_back = fell_back_tokens = 0
         located = []
         with host_timer.record("scan_locate"):
             for run in index.select(candidates):
-                where = tree_cache.chain_chunk_slots(run.chunk_id)
+                if run.chunk_id in seeded:
+                    node, computed_at = seeded[run.chunk_id]
+                    span = tree_cache.chain_span_slots(
+                        node, computed_at, computed_at + run.length
+                    )
+                    if span is not None and span[1] is not None and span[1] != list(
+                        self.fill_ids[run.start : run.end]
+                    ):
+                        logger.error(
+                            "SUBCTX-SEED-MISMATCH rid=%s run=[%d,%d) src=%d -- the stored "
+                            "tokens differ", self.rid, run.start, run.end, computed_at,
+                        )
+                        span = None
+                    if span is None:
+                        discarded += run.length
+                        continue
+                    where = (span[0], node, computed_at)
+                else:
+                    where = tree_cache.chain_chunk_slots(run.chunk_id)
                 if where is None:
                     discarded += run.length
                     continue
@@ -1309,6 +1347,7 @@ class Req(ReqDllmMixin):
                 tree_cache.dec_lock_ref(self.last_node)
             runs = []
             nodes = []
+            seed_tokens = 0
             for run, src, node, delta in located:
                 dst = self._copy_sub_context_run(tree_cache, src, delta)
                 if dst is None:
@@ -1322,6 +1361,8 @@ class Req(ReqDllmMixin):
                     rotated += run.length
                 runs.append((run.start, run.end, dst))
                 nodes.append(node)
+                if run.chunk_id in seeded:
+                    seed_tokens += run.length
         self.sub_context_match_nodes = nodes or None
 
         if runs:
@@ -1344,10 +1385,12 @@ class Req(ReqDllmMixin):
                 moved += rotated
                 runs = []
                 rotated = 0
+                seed_tokens = 0
 
         self.sub_context_moved = moved
         self.sub_context_rotated = rotated
         self.sub_context_discarded = discarded
+        self.sub_context_seed_tokens = seed_tokens
         self.sub_context_tally = (
             len(self.fill_ids),
             exact,
