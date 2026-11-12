@@ -1046,6 +1046,7 @@ def cmd_parity(args: argparse.Namespace) -> int:
 ARM_STEMS = (
     ("base", "baseline"),
     ("cdc", "cdc"),
+    ("relay", "relay"),
 )
 
 
@@ -1210,7 +1211,10 @@ def _overhead_value(
 
 def _split_ratio_stem(stem: str) -> Tuple[str, Optional[Tuple[int, ...]]]:
     """``"cdc_r15"`` -> ``("cdc", (15,))``; ``"cdc_r30-20-15"`` -> ``("cdc", (30, 20, 15))``;
-    any other stem -> ``(stem, None)``."""
+    ``"relay_L8-9-47"`` / ``"relay_profile"`` -> ``("relay", None)``; any other stem ->
+    ``(stem, None)``."""
+    if stem.startswith("relay_"):
+        return "relay", None
     base, _, tail = stem.rpartition("_r")
     parts = tail.split("-")
     if base and all(p.isdigit() for p in parts):
@@ -1225,8 +1229,8 @@ def cmd_summary(args: argparse.Namespace) -> int:
     if unknown:
         print(f"unknown arm(s) {', '.join(unknown)}; want any of "
               f"{', '.join(s for s, _ in ARM_STEMS)}, optionally with recompute "
-              f"ratios appended as _rNN or _rNN-NN-... (e.g. cdc_r15, cdc_r30-20-15)",
-              file=sys.stderr)
+              f"ratios appended as _rNN or _rNN-NN-... (e.g. cdc_r15, cdc_r30-20-15), "
+              f"relay with its tag (e.g. relay_L8-9-47)", file=sys.stderr)
         return 1
     arms = []
     # Arm order first, then ratio, so a sweep of one arm reads left to right.
@@ -1237,8 +1241,11 @@ def cmd_summary(args: argparse.Namespace) -> int:
         base_stem, ratios = _split_ratio_stem(stem)
         arm = _load_arm(args.dir, stem)
         if arm is not None:
-            arm["label"] = known[base_stem] + (
-                f" +{'/'.join(str(r) for r in ratios)}% recompute" if ratios else ""
+            arm["label"] = (
+                stem.replace("_", " ", 1)
+                if base_stem == "relay"
+                else known[base_stem]
+                + (f" +{'/'.join(str(r) for r in ratios)}% recompute" if ratios else "")
             )
             arms.append(arm)
     if not arms:

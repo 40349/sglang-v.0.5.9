@@ -21,11 +21,19 @@
 #   off   no split -- the stock radix cache
 #   cdc   cut each prompt by content, match its prefix, find its cached chunks past the
 #         prefix in the index, rotate the displaced ones into place, prefill the gaps
+#   relay cdc, with the reused tokens rectified the RelayCaching way (arXiv 2603.13289)
+#   relay+ relay, with prefill also storing each computed token's L_start input, so
+#         reused tokens the model read skip [0, L_start) too, not only decoded ones
 #
 # cdc takes a recompute ratio after `@`: cdc@0.15 recomputes 15% of the tokens it
 # reuses, chosen at layer TOPK_LAYER. Several ratios score consecutive layers from
 # TOPK_LAYER on, each picking from what the previous one kept: cdc@0.3,0.2,0.15. The arm
 # is the only place a ratio is set.
+#
+# relay takes its layers after `@`: relay@1,3,18 is L_start 1, L_det 3, L_end 18.
+# relay@profile recomputes every reused token on every layer and writes per-layer
+# deviations to RELAY_PROF; scripts/subcontext_sim/relay_layers.py picks the layers
+# from that file. relay+ takes layers the same way, L_start > 0, and is tagged _ph.
 #
 # Knobs:
 #
@@ -36,6 +44,7 @@
 #   TOOL_PARSER=qwen3_coder REASONING_PARSER= QUANT=  empty drops the flag
 #   Qwen3-30B-A3B:  MODEL=Qwen/Qwen3-30B-A3B CTXLEN=40960 TOOL_PARSER=qwen REASONING_PARSER=qwen3
 #   TOPK_LAYER CDC_TARGET CDC_MIN CDC_MAX             unset keeps the server default
+#   RELAY_TAU_DEV=1.5 RELAY_TAU_INF=1.45 RELAY_SUFFIX=10   relay's selection thresholds
 #   METRICS=1         --enable-metrics: Prometheus counters at /metrics, incl. the server's
 #                     TTFT histogram that subcontext_bench.py replay reads; the same for
 #                     every arm compared
@@ -44,6 +53,7 @@
 #                     not comparable with runs without it
 #   AUDIT TRACE ROTATE_GPU DUMP_TREE                  diagnostics; timings then unusable
 #   SERVER_LOG CAPTURE FWD_TRACE STAGE                output paths; empty turns one off
+#   RELAY_PROF                                        relay@profile's output path
 #   TEACHER_FORCE=1   accepts custom logit processors (code a client sends, run in the
 #                     server) and turns overlap scheduling off; for tf_kl.py's runs
 #   API_KEY           every endpoint but /health and /metrics then wants the header
@@ -62,7 +72,7 @@ REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 [ -d "$REPO/python/sglang" ] || { echo "REFUSING: no checkout found; submit from it"; exit 1; }
 WORK_DIR=${WORK_DIR:-$(dirname "$REPO")}
 
-ARM=${ARM:?set ARM=off, cdc or cdc@ratio}
+ARM=${ARM:?set ARM=off, cdc, cdc@ratio, relay@L_start,L_det,L_end, relay@profile or relay+@L_start,L_det,L_end}
 MODEL=${MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}
 CTXLEN=${CTXLEN:-81920}
 PORT=${PORT:-8000}
@@ -114,6 +124,7 @@ esac
 [ -z "$API_KEY" ] || umask 077
 
 for v in "TOPK_RATIO|write the ratio into the arm, e.g. ARM=cdc@0.15" \
+         "RELAY_PREFILL_HIDDEN|use the arm, e.g. ARM=relay+@4,5,40" \
          "MODEL_PATH|use MODEL" "SUBCTX_AUDIT|use AUDIT" "SUBCTX_TRACE|use TRACE"; do
   if [ -n "$(printenv "${v%%|*}")" ]; then
     echo "REFUSING: ${v%%|*} is no longer read; ${v#*|}."; exit 1
@@ -121,6 +132,8 @@ for v in "TOPK_RATIO|write the ratio into the arm, e.g. ARM=cdc@0.15" \
 done
 for v in SGLANG_DISABLE_SUBCONTEXT SGLANG_SUBCTX_TOPK_RATIO SGLANG_SUBCTX_TOPK_LAYER \
          SGLANG_SUBCTX_CDC_TARGET SGLANG_SUBCTX_MIN_CHUNK SGLANG_SUBCTX_CDC_MAX \
+         SGLANG_SUBCTX_RELAY_LAYERS SGLANG_SUBCTX_RELAY_PROFILE SGLANG_SUBCTX_RELAY_TAU_DEV \
+         SGLANG_SUBCTX_RELAY_TAU_INF SGLANG_SUBCTX_RELAY_SUFFIX SGLANG_SUBCTX_RELAY_PREFILL_HIDDEN \
          SGLANG_SUBCTX_AUDIT SGLANG_SUBCTX_TRACE SGLANG_SUBCTX_ROTATE_GPU SGLANG_DUMP_TREE; do
   if [ -n "$(printenv "$v")" ]; then
     echo "REFUSING: $v is set in the environment; the arm and the knobs above set it."
@@ -131,11 +144,26 @@ done
 NAME=${ARM%%@*}
 RATIO=0
 case "$ARM" in *@*) RATIO=${ARM#*@} ;; esac
+PREFILL_HIDDEN=
 case "$NAME" in
-  off|cdc) ;;
-  *) echo "REFUSING: unknown ARM='$ARM'; want off, cdc or cdc@ratio"; exit 1 ;;
+  off|cdc|relay) ;;
+  relay+) NAME=relay PREFILL_HIDDEN=1 ;;
+  *) echo "REFUSING: unknown ARM='$ARM'; want off, cdc, cdc@ratio, relay@... or relay+@..."
+     exit 1 ;;
 esac
-if [ "$ARM" != "$NAME" ]; then
+RELAY_LAYERS=
+if [ "$NAME" = relay ]; then
+  case "$RATIO" in
+    profile) ;;
+    *) awk -v ls="$RATIO" 'BEGIN { n = split(ls, l, ","); if (n != 3) exit 1
+         for (i = 1; i <= 3; i++) if (l[i] !~ /^[0-9]+$/) exit 1
+         exit !(l[1] < l[2] && l[2] <= l[3]) }' || {
+         echo "REFUSING: ARM=$ARM: want relay@L_start,L_det,L_end with" \
+              "L_start < L_det <= L_end, or relay@profile"; exit 1; }
+       RELAY_LAYERS=$RATIO ;;
+  esac
+  RATIO=0
+elif [ "$ARM" != "$NAME" ]; then
   [ "$NAME" = cdc ] || { echo "REFUSING: ARM=$ARM: only cdc takes a ratio"; exit 1; }
   awk -v rs="$RATIO" 'BEGIN { n = split(rs, r, ","); for (i = 1; i <= n; i++) {
       if (!(r[i] ~ /^[0-9]*\.?[0-9]+$/ && r[i] >= 0 && r[i] <= 1)) exit 1
@@ -143,10 +171,21 @@ if [ "$ARM" != "$NAME" ]; then
     echo "REFUSING: ARM=$ARM: want ratios in [0, 1], comma-separated, not increasing"
     exit 1; }
 fi
+if [ -n "$PREFILL_HIDDEN" ] && { [ -z "$RELAY_LAYERS" ] || [ "${RELAY_LAYERS%%,*}" -eq 0 ]; }; then
+  echo "REFUSING: ARM=$ARM: relay+ stores the input of L_start; want relay+@L_start,L_det,L_end" \
+       "with L_start > 0"
+  exit 1
+fi
 TAG=$NAME
 if awk -v rs="$RATIO" 'BEGIN { split(rs, r, ","); exit !(r[1] > 0) }'; then
   TAG=${NAME}_r$(awk -v rs="$RATIO" 'BEGIN { n = split(rs, r, ",")
     for (i = 1; i <= n; i++) printf "%s%02d", (i > 1 ? "-" : ""), int(r[i] * 100 + 0.5) }')
+fi
+if [ "$NAME" = relay ]; then
+  TAG=relay_$([ -n "$RELAY_LAYERS" ] && echo "L${RELAY_LAYERS//,/-}" || echo profile)
+  # Thresholds set in the environment show in the tag.
+  TAG=$TAG${RELAY_TAU_DEV:+_dev$RELAY_TAU_DEV}${RELAY_TAU_INF:+_inf$RELAY_TAU_INF}
+  TAG=$TAG${RELAY_SUFFIX:+_suf$RELAY_SUFFIX}${PREFILL_HIDDEN:+_ph}
 fi
 
 if [ "${1:-}" = check ]; then echo "$TAG"; exit 0; fi
@@ -176,7 +215,9 @@ SERVER_LOG=${SERVER_LOG:-$WORK_DIR/logs/sglang_${SUF}.log}
 CAPTURE=${CAPTURE-$WORK_DIR/traces/requests_${SUF}.jsonl}
 FWD_TRACE=${FWD_TRACE-$WORK_DIR/traces/trace_${SUF}.jsonl}
 STAGE=${STAGE-$WORK_DIR/traces/stage_${SUF}}
-for p in "$SERVER_LOG" "$CAPTURE" "$FWD_TRACE" "$STAGE"; do
+RELAY_PROF=${RELAY_PROF:-$WORK_DIR/traces/relay_profile_${SUF}.jsonl}
+{ [ "$NAME" = relay ] && [ -z "$RELAY_LAYERS" ]; } || RELAY_PROF=
+for p in "$SERVER_LOG" "$CAPTURE" "$FWD_TRACE" "$STAGE" "$RELAY_PROF"; do
   [ -z "$p" ] || mkdir -p "$(dirname "$p")"
 done
 
@@ -193,11 +234,17 @@ if [ "$rc" != 7 ]; then
   exit 1
 fi
 
-export SGLANG_DISABLE_SUBCONTEXT= SGLANG_SUBCTX_TOPK_RATIO=0
+export SGLANG_DISABLE_SUBCONTEXT= SGLANG_SUBCTX_TOPK_RATIO=0 \
+  SGLANG_SUBCTX_RELAY_LAYERS= SGLANG_SUBCTX_RELAY_PROFILE= SGLANG_SUBCTX_RELAY_PREFILL_HIDDEN=
 case "$NAME" in
   off) SGLANG_DISABLE_SUBCONTEXT=1 ;;
   cdc) SGLANG_SUBCTX_TOPK_RATIO=$RATIO ;;
+  relay) SGLANG_SUBCTX_RELAY_LAYERS=$RELAY_LAYERS SGLANG_SUBCTX_RELAY_PROFILE=$RELAY_PROF
+         SGLANG_SUBCTX_RELAY_PREFILL_HIDDEN=$PREFILL_HIDDEN ;;
 esac
+[ -z "${RELAY_TAU_DEV:-}" ] || export SGLANG_SUBCTX_RELAY_TAU_DEV=$RELAY_TAU_DEV
+[ -z "${RELAY_TAU_INF:-}" ] || export SGLANG_SUBCTX_RELAY_TAU_INF=$RELAY_TAU_INF
+[ -z "${RELAY_SUFFIX:-}" ] || export SGLANG_SUBCTX_RELAY_SUFFIX=$RELAY_SUFFIX
 export SGLANG_SUBCTX_AUDIT=$AUDIT SGLANG_SUBCTX_TRACE=$TRACE \
   SGLANG_SUBCTX_ROTATE_GPU=${ROTATE_GPU:-} SGLANG_DUMP_TREE=${DUMP_TREE:-}
 [ -z "${TOPK_LAYER:-}" ] || export SGLANG_SUBCTX_TOPK_LAYER=$TOPK_LAYER
@@ -222,7 +269,9 @@ capture:${CAPTURE:- off}${METRICS:+
 metrics: on (/metrics)}${DETERMINISTIC:+
 deterministic inference: on (batch-invariant kernels; timings not comparable)}${TEACHER_FORCE:+
 teacher-forced requests: on (custom logit processors, no overlap scheduling)}${API_KEY:+
-api key: set}
+api key: set}$([ "$NAME" = relay ] && echo "
+relay:  tau_dev ${RELAY_TAU_DEV:-1.5}   tau_inf ${RELAY_TAU_INF:-1.45}   suffix ${RELAY_SUFFIX:-10}   prefill hidden $([ -n "$PREFILL_HIDDEN" ] && echo on || echo off)")${RELAY_PROF:+
+relay profile: $RELAY_PROF}
 ==========================================
 EOF
 

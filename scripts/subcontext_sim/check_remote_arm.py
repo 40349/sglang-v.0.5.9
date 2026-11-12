@@ -4,7 +4,8 @@ Reads the ``sub_context`` block of ``/server_info`` (absent on a server not runn
 this fork). Exits non-zero with the reason on any mismatch.
 
 Usage:
-    check_remote_arm.py URL --arm off|cdc[@ratio[,ratio...]] [--audit B]
+    check_remote_arm.py URL --arm off|cdc[@ratio[,ratio...]]|relay@S,D,E|relay@profile|relay+@S,D,E
+        [--audit B]
 """
 
 from __future__ import annotations
@@ -29,7 +30,8 @@ def main() -> int:
     ap.add_argument(
         "--arm",
         required=True,
-        help="an arm as sglang_server.sh takes it: off, cdc or cdc@ratio[,ratio...]",
+        help="an arm as sglang_server.sh takes it: off, cdc, cdc@ratio[,ratio...], "
+        "relay@L_start,L_det,L_end, relay@profile or relay+@L_start,L_det,L_end",
     )
     ap.add_argument(
         "--audit",
@@ -39,11 +41,24 @@ def main() -> int:
         "the port)",
     )
     args = ap.parse_args()
-    name, _, ratio = args.arm.partition("@")
-    if name not in ("off", "cdc") or (ratio and name != "cdc"):
-        ap.error(f"unknown arm {args.arm!r}; want off, cdc or cdc@ratio")
-    want_split = name == "cdc"
-    want_ratios = _ratios(ratio or "0")
+    name, _, param = args.arm.partition("@")
+    want_prefill_hidden = name == "relay+"
+    if want_prefill_hidden:
+        name = "relay"
+        if not param or param == "profile":
+            ap.error("relay+ takes its layers: relay+@4,5,40")
+    if name not in ("off", "cdc", "relay") or (param and name == "off"):
+        ap.error(f"unknown arm {args.arm!r}; want off, cdc, cdc@ratio, relay@... or relay+@...")
+    if name == "relay" and not param:
+        ap.error("relay takes its layers or `profile`: relay@1,3,18, relay@profile")
+    want_split = name != "off"
+    want_ratios = _ratios(param or "0") if name == "cdc" else [0.0]
+    want_relay_profile = name == "relay" and param == "profile"
+    want_relay_layers = (
+        [int(x) for x in param.split(",")]
+        if name == "relay" and not want_relay_profile
+        else None
+    )
 
     base = args.url.rstrip("/")
     try:
@@ -89,6 +104,26 @@ def main() -> int:
             f"REFUSING: asked for topk_ratios={want_ratios} but the server reports "
             f"topk_ratios={got!r}. Ratios are swept within one arm name, so a mismatch "
             "here produces a table whose rows are all the same run.",
+            file=sys.stderr,
+        )
+        return 1
+
+    got_layers = sub.get("relay_layers")
+    got_profile = bool(sub.get("relay_profile"))
+    if got_layers != want_relay_layers or got_profile != want_relay_profile:
+        print(
+            f"REFUSING: asked for {args.arm} (relay_layers={want_relay_layers}, "
+            f"relay_profile={want_relay_profile}) but the server reports "
+            f"relay_layers={got_layers!r}, relay_profile={got_profile}",
+            file=sys.stderr,
+        )
+        return 1
+
+    got_prefill_hidden = bool(sub.get("relay_prefill_hidden"))
+    if got_prefill_hidden != want_prefill_hidden:
+        print(
+            f"REFUSING: asked for {args.arm} (relay_prefill_hidden={want_prefill_hidden}) "
+            f"but the server reports relay_prefill_hidden={got_prefill_hidden}",
             file=sys.stderr,
         )
         return 1

@@ -253,6 +253,13 @@ class SchedulerMetricsMixin:
         if index is not None:
             # Running totals of the sub-context index.
             msg += f"\n{index.report()}"
+            relay = getattr(
+                self.tree_cache.token_to_kv_pool_allocator.get_kvcache(),
+                "relay_state",
+                None,
+            )
+            if relay is not None:
+                msg += f"\n{relay.report()}"
 
         logger.info(msg)
 

@@ -394,6 +394,11 @@ def alloc_for_extend(
     )
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+    relay_state = getattr(batch.req_to_token_pool, "relay_state", None)
+    if relay_state is not None:
+        relay_state.set_out_start(
+            req_pool_indices_device, [len(r.origin_input_ids) for r in batch.reqs]
+        )
 
     # Allocate KV cache (throws exception on failure)
     if batch.tree_cache.page_size == 1:
@@ -427,12 +432,23 @@ def alloc_for_extend(
             batch.req_to_token_pool,
         )
         if batch.subctx_probe_positions is not None:
-            from sglang.srt.mem_cache.subctx_blend import build_plan
-            from sglang.srt.utils.subctx_config import TOPK_LAYER, TOPK_RATIOS
+            from sglang.srt.utils import subctx_config
 
-            batch.subctx_blend_plan = build_plan(
-                batch, out_cache_loc, list(TOPK_RATIOS), TOPK_LAYER
-            )
+            if subctx_config.relay_active():
+                from sglang.srt.mem_cache.subctx_relay import build_relay_plan
+
+                batch.subctx_blend_plan = build_relay_plan(
+                    batch, out_cache_loc, subctx_config.RELAY_LAYERS
+                )
+            else:
+                from sglang.srt.mem_cache.subctx_blend import build_plan
+
+                batch.subctx_blend_plan = build_plan(
+                    batch,
+                    out_cache_loc,
+                    list(subctx_config.TOPK_RATIOS),
+                    subctx_config.TOPK_LAYER,
+                )
         return out_cache_loc, req_pool_indices_device, req_pool_indices
 
     write_cache_indices(
