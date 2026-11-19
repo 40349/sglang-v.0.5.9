@@ -53,6 +53,7 @@ from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import host_timer
+from sglang.srt.mem_cache.subctx_docs import prompt_doc_spans
 from sglang.srt.mem_cache.subctx_index import cut_points
 from sglang.srt.utils.subctx_config import (
     CDC_MAX_TOKENS,
@@ -135,6 +136,9 @@ class OpenAIServingChat(OpenAIServingBase):
         self._message_start_id: Optional[int] = None
         # (length, hash of the token ids) -> cut_points of that message.
         self._message_cuts: OrderedDict[tuple[int, int], List[int]] = OrderedDict()
+        # (length, hash of the token ids, character spans) -> that message's document
+        # token spans, None if they could not be placed.
+        self._message_docs: OrderedDict[tuple, Optional[List[tuple]]] = OrderedDict()
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
@@ -343,6 +347,7 @@ class OpenAIServingChat(OpenAIServingBase):
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             sub_context_ends=processed_messages.sub_context_ends,
+            doc_spans=processed_messages.doc_spans,
             require_reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
@@ -485,6 +490,38 @@ class OpenAIServingChat(OpenAIServingBase):
             return None
         return ends
 
+    @host_timer.timed("subctx_docs")
+    def _compute_doc_spans(
+        self, messages: List[Dict], prompt_ids: List[int], doc_spans: List
+    ) -> Optional[List[List[int]]]:
+        """Token spans of ``doc_spans`` in ``prompt_ids``, increasing (``prompt_doc_spans``).
+        A message whose spans cannot be placed is left out with a warning. None if no
+        span is placed.
+        """
+        marker = self._message_start_token()
+        if marker is None or not doc_spans:
+            return None
+        ids = prompt_ids if isinstance(prompt_ids, list) else list(prompt_ids)
+        by_message: Dict[int, List[tuple]] = {}
+        for d in doc_spans:
+            by_message.setdefault(d.message, []).append((d.start, d.end))
+        out, left_out = prompt_doc_spans(
+            self.tokenizer_manager.tokenizer,
+            ids,
+            marker,
+            [m.get("content") for m in messages],
+            by_message,
+            memo=self._message_docs,
+            memo_size=MESSAGE_CUTS_CACHED,
+        )
+        if left_out:
+            logger.warning(
+                "Sub-context: documents of messages %s are not marked: no text content, "
+                "or it is not among the message's tokens",
+                left_out,
+            )
+        return out or None
+
     @host_timer.timed("tpl_render")
     def _apply_jinja_template(
         self,
@@ -496,6 +533,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt = ""
         prompt_ids = []
         sub_context_ends = None
+        doc_spans = None
         openai_compatible_messages = []
         image_data = []
         video_data = []
@@ -640,6 +678,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 sub_context_ends = self._compute_sub_context_ends(
                     openai_compatible_messages, prompt_ids
                 )
+                if sub_context_ends is not None and request.doc_spans:
+                    doc_spans = self._compute_doc_spans(
+                        openai_compatible_messages, prompt_ids, request.doc_spans
+                    )
 
         stop = request.stop
         image_data = image_data if image_data else None
@@ -655,6 +697,7 @@ class OpenAIServingChat(OpenAIServingBase):
             modalities=modalities,
             stop=stop,
             sub_context_ends=sub_context_ends,
+            doc_spans=doc_spans,
         )
 
     def _apply_conversation_template(

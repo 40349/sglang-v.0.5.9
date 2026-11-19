@@ -301,6 +301,10 @@ class SubContextIndex:
         # Requests refused for KV room with nothing else running; matched on the
         # prefix only from then on.
         self.no_room = 0
+        # With isolated documents: document tokens past the prefix, and those reused
+        # from the copy computed alone; the rest were computed in place.
+        self.doc_tokens = 0
+        self.doc_alone_tokens = 0
 
     def report(self) -> str:
         """One-line summary of the tallies."""
@@ -320,6 +324,13 @@ class SubContextIndex:
             f" | {self.fell_back} requests too big for one pass "
             f"({self.fell_back_tokens} found tokens dropped), "
             f"{self.no_room} refused for room"
+            + (
+                f" | isolated documents: {self.doc_tokens} tokens past the prefix, "
+                f"{self.doc_alone_tokens} reused alone, "
+                f"{self.doc_tokens - self.doc_alone_tokens} computed in place"
+                if self.doc_tokens
+                else ""
+            )
         )
 
     def count_match(
@@ -330,6 +341,8 @@ class SubContextIndex:
         rotated: int,
         fell_back: int,
         fell_back_tokens: int,
+        doc_tokens: int = 0,
+        doc_alone_tokens: int = 0,
     ) -> None:
         """Add one admitted request's match to the live tallies."""
         self.prompt_tokens += prompt
@@ -338,6 +351,8 @@ class SubContextIndex:
         self.rotated_tokens += rotated
         self.fell_back += fell_back
         self.fell_back_tokens += fell_back_tokens
+        self.doc_tokens += doc_tokens
+        self.doc_alone_tokens += doc_alone_tokens
 
     def __len__(self) -> int:
         return sum(len(s.chunks) for s in self._scopes.values())

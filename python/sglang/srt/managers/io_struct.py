@@ -256,6 +256,15 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # SGLANG_DISABLE_SUBCONTEXT=1). Dropped with a warning unless they increase and the
     # last equals ``len(input_ids)``.
     sub_context_ends: Optional[List[int]] = None
+    # ``[start, end)`` token spans of the documents in input_ids, increasing, each kept
+    # as one block: the prompt is cut at both edges of each, with or without
+    # sub_context_ends. Set by the OpenAI chat path from its ``doc_spans``, or by a
+    # `/generate` caller. Dropped with a warning unless valid; ignored under
+    # SGLANG_DISABLE_SUBCONTEXT=1.
+    doc_spans: Optional[List[List[int]]] = None
+    # The whole prompt is one document computed alone (SGLANG_SUBCTX_DOCS=isolated): it
+    # is matched on its prefix only and registered as one chunk.
+    doc_block: bool = False
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
@@ -685,6 +694,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             priority=self.priority,
             extra_key=self.extra_key,
             sub_context_ends=self.sub_context_ends,
+            doc_spans=self.doc_spans,
+            doc_block=self.doc_block,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -763,6 +774,10 @@ class TokenizedGenerateReqInput(BaseReq):
     # Sub-context: end offset of each block in input_ids, increasing, the last
     # ``len(input_ids)``. None when not split.
     sub_context_ends: Optional[List[int]] = None
+    # Sub-context: token spans of the documents, each one block of the split.
+    doc_spans: Optional[List[List[int]]] = None
+    # Sub-context: the prompt is one document computed alone.
+    doc_block: bool = False
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None

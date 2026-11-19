@@ -526,6 +526,14 @@ class ToolChoice(BaseModel):
     type: Literal["function"] = Field(default="function", examples=["function"])
 
 
+class DocSpan(BaseModel):
+    """A document inside a message: ``[start, end)`` character offsets of its content."""
+
+    message: int
+    start: int
+    end: int
+
+
 class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -608,6 +616,10 @@ class ChatCompletionRequest(BaseModel):
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+
+    # Sub-context: documents in the messages, each kept as one block. Ignored when the
+    # split is off.
+    doc_spans: Optional[List[DocSpan]] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -1372,6 +1384,9 @@ class MessageProcessingResult:
     # Sub-context: end offset of each block of prompt_ids, increasing, the last
     # len(prompt_ids). None when the prompt was not split.
     sub_context_ends: Optional[List[int]] = None
+    # Sub-context: ``[start, end)`` token spans of the documents in prompt_ids. None
+    # when the request marks none or the prompt was not split.
+    doc_spans: Optional[List[List[int]]] = None
 
 
 class ToolCallProcessingResult(NamedTuple):

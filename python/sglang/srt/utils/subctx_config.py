@@ -47,6 +47,16 @@ MIN_CHUNK_TOKENS = int(os.environ.get("SGLANG_SUBCTX_MIN_CHUNK", "64"))
 CDC_TARGET_TOKENS = int(os.environ.get("SGLANG_SUBCTX_CDC_TARGET", "256"))
 CDC_MAX_TOKENS = int(os.environ.get("SGLANG_SUBCTX_CDC_MAX", "1024"))
 
+# Documents a request marks (``doc_spans``) are one block each, with no cut inside.
+# "isolated": every document's KV is first computed alone from position 0, and a
+# request reuses that copy, rotated into place; the request's own copy of a document is
+# stored in its chain but not registered. Unset: documents are computed in the request
+# that first holds them and registered there, like any other block.
+_DOCS_ENV = os.environ.get("SGLANG_SUBCTX_DOCS", "")
+if _DOCS_ENV not in ("", "isolated"):
+    raise ValueError(f"SGLANG_SUBCTX_DOCS={_DOCS_ENV!r}; want 'isolated' or unset")
+DOCS_ISOLATED = _DOCS_ENV == "isolated"
+
 # Fractions of the reused tokens to recompute, picked by how far their key moved, one per
 # scored layer ("0.3,0.2,0.15"): the i-th is taken at layer TOPK_LAYER + i from the tokens
 # the previous one kept, and the last holds for the layers after. 0 recomputes nothing;

@@ -30,6 +30,11 @@
 # TOPK_LAYER on, each picking from what the previous one kept: cdc@0.3,0.2,0.15. The arm
 # is the only place a ratio is set.
 #
+# DOCS=isolated (any arm but off) computes each document a request marks (doc_spans)
+# alone, from position 0, and reuses that copy rotated into place; the arm's recompute
+# still applies. Unset, a document is computed where it first appears. Either way each
+# marked document is one block. Tagged _iso.
+#
 # relay takes its layers after `@`: relay@1,3,18 is L_start 1, L_det 3, L_end 18.
 # relay@profile recomputes every reused token on every layer and writes per-layer
 # deviations to RELAY_PROF; scripts/subcontext_sim/relay_layers.py picks the layers
@@ -88,6 +93,7 @@ AUDIT=${AUDIT:-}
 TRACE=${TRACE:-}
 TEACHER_FORCE=${TEACHER_FORCE:-}
 METRICS=${METRICS:-}
+DOCS=${DOCS:-}
 API_KEY=${API_KEY:-}
 case "$TEACHER_FORCE" in
   ""|1) ;;
@@ -96,6 +102,10 @@ esac
 case "$METRICS" in
   ""|1) ;;
   *) echo "REFUSING: METRICS='$METRICS'; want 1 or unset"; exit 1 ;;
+esac
+case "$DOCS" in
+  ""|isolated) ;;
+  *) echo "REFUSING: DOCS='$DOCS'; want isolated or unset"; exit 1 ;;
 esac
 if [ -n "$TEACHER_FORCE" ] && [ -z "$API_KEY" ]; then
   echo "REFUSING: TEACHER_FORCE=1 runs code clients send; set API_KEY, e.g. API_KEY=\$(openssl rand -hex 16)"
@@ -117,7 +127,8 @@ for v in SGLANG_DISABLE_SUBCONTEXT SGLANG_SUBCTX_TOPK_RATIO SGLANG_SUBCTX_TOPK_L
          SGLANG_SUBCTX_CDC_TARGET SGLANG_SUBCTX_MIN_CHUNK SGLANG_SUBCTX_CDC_MAX \
          SGLANG_SUBCTX_RELAY_LAYERS SGLANG_SUBCTX_RELAY_PROFILE SGLANG_SUBCTX_RELAY_TAU_DEV \
          SGLANG_SUBCTX_RELAY_TAU_INF SGLANG_SUBCTX_RELAY_SUFFIX SGLANG_SUBCTX_RELAY_PREFILL_HIDDEN \
-         SGLANG_SUBCTX_AUDIT SGLANG_SUBCTX_TRACE SGLANG_SUBCTX_ROTATE_GPU SGLANG_DUMP_TREE; do
+         SGLANG_SUBCTX_AUDIT SGLANG_SUBCTX_TRACE SGLANG_SUBCTX_ROTATE_GPU SGLANG_DUMP_TREE \
+         SGLANG_SUBCTX_DOCS; do
   if [ -n "$(printenv "$v")" ]; then
     echo "REFUSING: $v is set in the environment; the arm and the knobs above set it."
     exit 1
@@ -154,6 +165,9 @@ elif [ "$ARM" != "$NAME" ]; then
     echo "REFUSING: ARM=$ARM: want ratios in [0, 1], comma-separated, not increasing"
     exit 1; }
 fi
+if [ -n "$DOCS" ] && [ "$NAME" = off ]; then
+  echo "REFUSING: DOCS=$DOCS needs the split; ARM=off has none"; exit 1
+fi
 if [ -n "$PREFILL_HIDDEN" ] && { [ -z "$RELAY_LAYERS" ] || [ "${RELAY_LAYERS%%,*}" -eq 0 ]; }; then
   echo "REFUSING: ARM=$ARM: relay+ stores the input of L_start; want relay+@L_start,L_det,L_end" \
        "with L_start > 0"
@@ -170,6 +184,7 @@ if [ "$NAME" = relay ]; then
   TAG=$TAG${RELAY_TAU_DEV:+_dev$RELAY_TAU_DEV}${RELAY_TAU_INF:+_inf$RELAY_TAU_INF}
   TAG=$TAG${RELAY_SUFFIX:+_suf$RELAY_SUFFIX}${PREFILL_HIDDEN:+_ph}
 fi
+TAG=$TAG${DOCS:+_iso}
 
 if [ "${1:-}" = check ]; then echo "$TAG"; exit 0; fi
 
@@ -228,6 +243,7 @@ esac
 [ -z "${RELAY_TAU_DEV:-}" ] || export SGLANG_SUBCTX_RELAY_TAU_DEV=$RELAY_TAU_DEV
 [ -z "${RELAY_TAU_INF:-}" ] || export SGLANG_SUBCTX_RELAY_TAU_INF=$RELAY_TAU_INF
 [ -z "${RELAY_SUFFIX:-}" ] || export SGLANG_SUBCTX_RELAY_SUFFIX=$RELAY_SUFFIX
+export SGLANG_SUBCTX_DOCS=$DOCS
 export SGLANG_SUBCTX_AUDIT=$AUDIT SGLANG_SUBCTX_TRACE=$TRACE \
   SGLANG_SUBCTX_ROTATE_GPU=${ROTATE_GPU:-} SGLANG_DUMP_TREE=${DUMP_TREE:-}
 [ -z "${TOPK_LAYER:-}" ] || export SGLANG_SUBCTX_TOPK_LAYER=$TOPK_LAYER
@@ -242,7 +258,7 @@ NODE_IP=$(hostname -I | awk '{print $1}')
 
 cat <<EOF
 ==========================================
-sglang server -- arm: $ARM
+sglang server -- arm: $ARM${DOCS:+   documents: $DOCS}
 model:  $MODEL
 backend:$BACKEND   audit: ${AUDIT:-off}   ctxlen: $CTXLEN   chunked prefill: ${CHUNKED_PREFILL:-default}   kv splits: ${KV_SPLITS:-default}
 node:   $(hostname)  ip: $NODE_IP

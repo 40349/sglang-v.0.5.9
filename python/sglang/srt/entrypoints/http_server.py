@@ -617,6 +617,7 @@ async def server_info():
             "min_chunk": subctx_config.MIN_CHUNK_TOKENS,
             "cdc_target": subctx_config.CDC_TARGET_TOKENS,
             "cdc_max": subctx_config.CDC_MAX_TOKENS,
+            "docs": "isolated" if subctx_config.DOCS_ISOLATED else "in_context",
             "topk_ratios": list(subctx_config.TOPK_RATIOS),
             "topk_layer": subctx_config.TOPK_LAYER,
             "relay_layers": (
@@ -675,12 +676,15 @@ if os.environ.get("SGLANG_DUMPER_SERVER_PORT") == "reuse":
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
-    # /generate keeps a caller's sub_context_ends only when the split is on; with
-    # SGLANG_DISABLE_SUBCONTEXT=1 it is never split.
+    # /generate keeps a caller's sub_context_ends and doc_spans only when the split is
+    # on; with SGLANG_DISABLE_SUBCONTEXT=1 it is never split. doc_block is the server's
+    # own.
     from sglang.srt.utils import subctx_config
 
     if subctx_config.DISABLE_SUBCONTEXT:
         obj.sub_context_ends = None
+        obj.doc_spans = None
+    obj.doc_block = False
 
     if obj.stream:
 

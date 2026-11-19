@@ -381,11 +381,12 @@ class RadixCache(BasePrefixCache):
         )
 
     def chain_chunk_slots(
-        self, cid: str
+        self, cid: str, computed_at: Optional[int] = None
     ) -> Optional[Tuple[torch.Tensor, TreeNode, int]]:
         """``(slots, node, start)`` of a registered chunk at its oldest location still
         in the tree: its KV slots in order, the node holding its last token, and the
-        position its first token was computed at.
+        position its first token was computed at. With ``computed_at``, only a location
+        whose first token was computed there.
 
         Locations no longer holding the chunk are dropped on the way; None, and the
         chunk forgotten, when none is left. Refreshes the access time of the nodes the
@@ -395,6 +396,8 @@ class RadixCache(BasePrefixCache):
         length = index.chunk_len(cid)
         for where in index.locations(cid):
             node, start = where
+            if computed_at is not None and start != computed_at:
+                continue
             end = start + length
             if length == 0 or not self._node_in_tree(node) or not (
                 node.canonical_position <= end - 1 < node.canonical_position + len(node.key)
@@ -522,13 +525,19 @@ class RadixCache(BasePrefixCache):
 
         ``last_node`` ends the request's chain at ``len(token_ids)``. Block edges are
         the split the request arrived with; with ``final``, the last block runs to the
-        end of the generated tokens and is cut again by ``cut_points``.
+        end of the generated tokens and is cut again by ``cut_points``, unless it is a
+        document. With isolated documents, the request's documents are not registered;
+        a document computed alone is, also when the tree already held all of it.
         """
         if self.sub_context_index is None or not req.sub_context_ends:
             return
+        if req.doc_block:
+            stored_from = 0
         covered = len(token_ids)
         edges = [0, *req.sub_context_ends]
-        if final and covered > edges[-1]:
+        docs = {tuple(span) for span in req.doc_spans or ()}
+        last_is_doc = req.doc_block or (edges[-2], edges[-1]) in docs
+        if final and covered > edges[-1] and not last_is_doc:
             head = edges[-2]
             cuts = cut_points(
                 token_ids[head:covered],
@@ -539,10 +548,11 @@ class RadixCache(BasePrefixCache):
             edges = edges[:-1] + [head + c for c in cuts] + [covered]
 
         min_len = self.sub_context_index.min_chunk_tokens
+        skip = docs if subctx_config.DOCS_ISOLATED else ()
         blocks = [
             (a, b)
             for a, b in zip(edges, edges[1:])
-            if stored_from < b <= covered and b - a >= min_len
+            if stored_from < b <= covered and b - a >= min_len and (a, b) not in skip
         ]
         node = last_node
         for a, b in reversed(blocks):
@@ -708,7 +718,9 @@ class RadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
             )
-            if self.chains_sub_contexts(req) and len(keys) > new_prefix_len:
+            if self.chains_sub_contexts(req) and (
+                len(keys) > new_prefix_len or req.doc_block
+            ):
                 with host_timer.record("register_finished"):
                     self._register_chain(
                         req, keys, new_prefix_len, result.last_node, final=True

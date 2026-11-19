@@ -575,7 +575,7 @@ class TestChainedIndex(unittest.TestCase):
         self.assertEqual(allocator.allocated, [])
         self.assertIsNone(second.sub_context_match_nodes)
         self.assertEqual(cache.protected_size(), 0)
-        self.assertEqual(second.sub_context_tally[4:], (1, 39))
+        self.assertEqual(second.sub_context_tally[4:6], (1, 39))
         self.assertEqual(second.sub_context_moved, 39)
 
     def test_a_layout_left_too_big_by_failed_copies_keeps_the_prefix_only(self):
@@ -592,7 +592,7 @@ class TestChainedIndex(unittest.TestCase):
         self.assertEqual(sorted(allocator.freed), sorted(cache.kv_rotator.calls[-1][1]))
         self.assertIsNone(second.sub_context_match_nodes)
         self.assertEqual(cache.protected_size(), 0)
-        self.assertEqual(second.sub_context_tally[4:], (1, 39))
+        self.assertEqual(second.sub_context_tally[4:6], (1, 39))
         self.assertEqual((second.sub_context_moved, second.sub_context_rotated), (39, 0))
 
     def test_a_run_out_of_rotation_range_is_never_locked(self):
@@ -702,6 +702,226 @@ class TestChainedIndex(unittest.TestCase):
         owners = tree_slot_owners(cache)
         self.assertEqual(held - set(owners) - set(allocator.freed), set(), "lost slots")
         self.assertEqual(held & set(owners) & set(allocator.freed), set(), "freed but held")
+
+
+class TestDocSpans(unittest.TestCase):
+    """Document spans: validity, the block ends they force, and how a run lies on them."""
+
+    def test_spans_must_increase_inside_the_prompt(self):
+        from sglang.srt.mem_cache.subctx_docs import valid_doc_spans
+
+        self.assertTrue(valid_doc_spans([[0, 10], [10, 20], [30, 40]], 40))
+        self.assertFalse(valid_doc_spans([[0, 10], [5, 20]], 40), "overlap")
+        self.assertFalse(valid_doc_spans([[10, 10]], 40), "empty")
+        self.assertFalse(valid_doc_spans([[30, 41]], 40), "past the prompt")
+        self.assertFalse(valid_doc_spans([[20, 30], [0, 10]], 40), "decreasing")
+        self.assertFalse(valid_doc_spans([[0, 10, 2]], 40))
+
+    def test_a_document_is_cut_at_both_edges_and_not_inside(self):
+        from sglang.srt.mem_cache.subctx_docs import doc_block_ends
+
+        self.assertEqual(
+            doc_block_ends([10, 50, 70, 100], [[20, 60]], 100), [10, 20, 60, 70, 100]
+        )
+        self.assertEqual(doc_block_ends([100], [[0, 30], [30, 100]], 100), [30, 100])
+
+    def test_a_run_is_on_no_document_one_document_or_across_one(self):
+        from sglang.srt.mem_cache.subctx_docs import doc_relation
+
+        spans = [[10, 20], [30, 40]]
+        starts = [10, 30]
+        self.assertEqual(doc_relation(spans, starts, 0, 10), 0)
+        self.assertEqual(doc_relation(spans, starts, 20, 30), 0)
+        self.assertEqual(doc_relation(spans, starts, 30, 40), 1)
+        self.assertEqual(doc_relation(spans, starts, 5, 15), -1)
+        self.assertEqual(doc_relation(spans, starts, 10, 40), -1)
+        self.assertEqual(doc_relation(spans, starts, 35, 50), -1)
+
+    def test_character_spans_become_the_tokens_wholly_inside(self):
+        from transformers import AutoTokenizer
+
+        from sglang.srt.mem_cache.subctx_docs import message_doc_spans
+
+        try:
+            tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", local_files_only=True)
+        except Exception as e:
+            self.skipTest(f"no local Qwen3 tokenizer: {e}")
+        docs = ["[Alpha]\nThe first body ends here.", "[Beta]\nSecond body, no stop"]
+        content = (
+            "<tool_response>\nA search for 'x' found 2 results:\n\n## Web Results\n"
+            f"1. {docs[0]}\n\n2. {docs[1]}\n</tool_response>"
+        )
+        ids = tok("<|im_start|>user\n" + content + "<|im_end|>\n")["input_ids"]
+        chars = [(content.index(d), content.index(d) + len(d)) for d in docs]
+        spans = message_doc_spans(tok, ids, content, chars)
+        self.assertEqual(len(spans), 2)
+        for (a, b), d in zip(spans, docs):
+            text = tok.decode(ids[a:b])
+            self.assertIn(text, d)
+            # Only tokens that run across an edge are left out.
+            self.assertGreater(len(text), len(d) - 4)
+        self.assertIsNone(message_doc_spans(tok, ids, "not in it", chars))
+
+
+class TestDocuments(unittest.TestCase):
+    """Documents a request marks: one block each; with isolated documents a request
+    reuses the copy computed alone from position 0 and does not register its own."""
+
+    HEAD_A = list(range(1, 41))
+    HEAD_B = list(range(900, 910))
+    DOC = list(range(2000, 2048))
+    TAIL = list(range(500, 540))
+    MORE = list(range(700, 740))
+    LEAD = list(range(3000, 3032))
+
+    def setUp(self):
+        self._saved = subctx_config.DOCS_ISOLATED
+        subctx_config.DOCS_ISOLATED = False
+
+    def tearDown(self):
+        subctx_config.DOCS_ISOLATED = self._saved
+
+    def _cache(self):
+        cache, pool, allocator = make_cache(rotator=FakeRotator())
+        wide_pool(pool)
+        cache.sub_context_index = SubContextIndex(min_chunk_tokens=32)
+        return cache, pool, allocator
+
+    def _req(self, rid, blocks, docs=None, doc_block=False, req_pool_idx=0):
+        req = make_req(rid, blocks, req_pool_idx=req_pool_idx)
+        req.doc_spans = docs
+        req.doc_block = doc_block
+        return req
+
+    def _run(self, cache, pool, req, first_slot, output=()):
+        prefill_chained(cache, pool, req, first_slot=first_slot)
+        decode_and_finish(cache, pool, req, list(output), first_slot=first_slot + 1000)
+
+    def _starts(self, cache, ids):
+        return [s for _n, s in cache.sub_context_index.locations(chunk_id(ids, None))]
+
+    def test_a_document_alone_is_one_chunk_computed_at_zero(self):
+        cache, pool, _ = self._cache()
+        doc = self._req("d", [self.DOC], doc_block=True)
+        self._run(cache, pool, doc, first_slot=100, output=[7])
+
+        self.assertEqual(self._starts(cache, self.DOC), [0])
+        self.assertEqual(len(cache.sub_context_index), 1, "the reply did not re-cut it")
+
+    def test_a_document_alone_scans_nothing(self):
+        cache, pool, _ = self._cache()
+        self._run(cache, pool, self._req("r1", [self.HEAD_A, self.TAIL]), 100)
+        doc = self._req("d", [self.HEAD_B + self.TAIL], doc_block=True, req_pool_idx=1)
+        doc.init_next_round_input(cache)
+        self.assertIsNone(doc.sub_context_layout)
+        self.assertEqual(cache.kv_rotator.calls, [])
+
+    def test_isolated_documents_are_copied_from_zero_and_not_registered(self):
+        subctx_config.DOCS_ISOLATED = True
+        cache, pool, _ = self._cache()
+        self._run(cache, pool, self._req("d", [self.DOC], doc_block=True), 100)
+        main = self._req(
+            "m", [self.HEAD_A, self.DOC, self.TAIL], docs=[[40, 88]], req_pool_idx=1
+        )
+        main.init_next_round_input(cache)
+        self.assertEqual([(s, e) for s, e, _ in main.sub_context_layout], [(40, 88)])
+        src, _dst, delta = cache.kv_rotator.calls[-1]
+        self.assertEqual((src, delta), (list(range(100, 148)), 40))
+        main.release_sub_context_rotated_slots(cache)
+        main.release_sub_context_match_locks(cache)
+
+        self._run(cache, pool, main, first_slot=5000)
+        self.assertEqual(self._starts(cache, self.DOC), [0])
+        self.assertEqual(self._starts(cache, self.HEAD_A), [0])
+        self.assertEqual(self._starts(cache, self.TAIL), [88])
+
+    def test_isolated_documents_skip_locations_computed_in_context(self):
+        cache, pool, _ = self._cache()
+        first = self._req("r1", [self.HEAD_A, self.DOC, self.TAIL], docs=[[40, 88]])
+        self._run(cache, pool, first, 100)
+        self.assertEqual(self._starts(cache, self.DOC), [40], "registered in context")
+
+        subctx_config.DOCS_ISOLATED = True
+        self._run(cache, pool, self._req("d", [self.DOC], doc_block=True), 300)
+        self.assertEqual(self._starts(cache, self.DOC), [40, 0])
+        main = self._req(
+            "m", [self.HEAD_B, self.DOC, self.MORE], docs=[[10, 58]], req_pool_idx=1
+        )
+        main.init_next_round_input(cache)
+        self.addCleanup(main.release_sub_context_rotated_slots, cache)
+        self.addCleanup(main.release_sub_context_match_locks, cache)
+        src, _dst, delta = cache.kv_rotator.calls[-1]
+        self.assertEqual((src, delta), (list(range(300, 348)), 10))
+
+    def test_isolated_documents_drop_runs_across_their_edges(self):
+        cache, pool, _ = self._cache()
+        across = self.LEAD + self.DOC[:16]
+        self._run(cache, pool, self._req("r1", [self.HEAD_A, across]), 100)
+        subctx_config.DOCS_ISOLATED = True
+        self._run(cache, pool, self._req("d", [self.DOC], doc_block=True), 300)
+
+        main = self._req(
+            "m",
+            [self.HEAD_B, self.LEAD, self.DOC, self.MORE],
+            docs=[[42, 90]],
+            req_pool_idx=1,
+        )
+        main.init_next_round_input(cache)
+        self.addCleanup(main.release_sub_context_rotated_slots, cache)
+        self.addCleanup(main.release_sub_context_match_locks, cache)
+        self.assertEqual([(s, e) for s, e, _ in main.sub_context_layout], [(42, 90)])
+
+    def test_a_document_alone_is_registered_when_the_tree_already_holds_it(self):
+        """A document that is the head of a longer one computed alone before."""
+        subctx_config.DOCS_ISOLATED = True
+        cache, pool, _ = self._cache()
+        longer = self._req("d1", [self.DOC + [7]], doc_block=True)
+        self._run(cache, pool, longer, 100)
+        self.assertEqual(self._starts(cache, self.DOC), [])
+        self._run(cache, pool, self._req("d2", [self.DOC], doc_block=True), 300)
+        self.assertEqual(self._starts(cache, self.DOC), [0])
+
+        main = self._req(
+            "m", [self.HEAD_A, self.DOC, self.TAIL], docs=[[40, 88]], req_pool_idx=1
+        )
+        main.init_next_round_input(cache)
+        self.addCleanup(main.release_sub_context_rotated_slots, cache)
+        self.addCleanup(main.release_sub_context_match_locks, cache)
+        src, _dst, delta = cache.kv_rotator.calls[-1]
+        self.assertEqual((src, delta), (list(range(100, 148)), 40))
+
+    def test_isolated_document_tokens_are_tallied(self):
+        subctx_config.DOCS_ISOLATED = True
+        cache, pool, _ = self._cache()
+        doc = self._req("d", [self.DOC], doc_block=True)
+        doc.init_next_round_input(cache)
+        self.assertIsNone(doc.sub_context_tally, "a document alone is not counted")
+        self._run(cache, pool, doc, 100)
+
+        main = self._req(
+            "m",
+            [self.HEAD_A, self.DOC, self.TAIL, self.MORE],
+            docs=[[40, 88], [128, 168]],
+            req_pool_idx=1,
+        )
+        main.init_next_round_input(cache)
+        self.addCleanup(main.release_sub_context_rotated_slots, cache)
+        self.addCleanup(main.release_sub_context_match_locks, cache)
+        # MORE was never computed alone: computed in place.
+        self.assertEqual(main.sub_context_tally[6:], (48 + 40, 48))
+        main.count_sub_context_match(cache.sub_context_index)
+        self.assertIn(
+            "isolated documents: 88 tokens past the prefix, 48 reused alone, 40 computed "
+            "in place",
+            cache.sub_context_index.report(),
+        )
+
+    def test_a_document_ending_the_prompt_is_not_cut_again(self):
+        cache, pool, _ = self._cache()
+        req = self._req("r1", [self.HEAD_A, self.DOC], docs=[[40, 88]])
+        self._run(cache, pool, req, 100, output=self.MORE)
+        self.assertEqual(self._starts(cache, self.DOC), [40])
+        self.assertEqual(self._starts(cache, self.DOC + self.MORE), [])
 
 
 if __name__ == "__main__":

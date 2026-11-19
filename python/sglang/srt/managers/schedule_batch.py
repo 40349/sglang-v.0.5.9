@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.subctx_docs import doc_relation
 from sglang.srt.mem_cache.subctx_index import Match as SubContextMatch
 from sglang.srt.utils import subctx_config
 from sglang.srt.utils.subctx_trace import TRACE_ON, trace
@@ -564,6 +565,8 @@ class Req(ReqDllmMixin):
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
         sub_context_ends: Optional[List[int]] = None,
+        doc_spans: Optional[List[List[int]]] = None,
+        doc_block: bool = False,
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
@@ -631,6 +634,12 @@ class Req(ReqDllmMixin):
         # Sub-context: end offset of each block in origin_input_ids, cut by content;
         # increasing, the last len(origin_input_ids). None for normal requests.
         self.sub_context_ends = sub_context_ends
+        # Sub-context: ``[start, end)`` spans of the documents in origin_input_ids, each a
+        # block of the split. None when the request marks none.
+        self.doc_spans = doc_spans
+        # Sub-context: the prompt is one document computed alone; matched on its prefix
+        # only and registered as one chunk.
+        self.doc_block = doc_block
         # Tokens matched in the tree but not reused. Drained by the forward trace.
         self.sub_context_discarded: int = 0
         # The nodes the scan copied runs from, locked until the copies are in the tree.
@@ -656,7 +665,7 @@ class Req(ReqDllmMixin):
         # The last match's (prompt, prefix, found, rotated) tokens, fell-back flag and
         # found tokens dropped by the fall back, added to the index tallies the first
         # time the request runs (`sub_context_counted`).
-        self.sub_context_tally: Optional[Tuple[int, int, int, int, int, int]] = None
+        self.sub_context_tally: Optional[Tuple[int, ...]] = None
         self.sub_context_counted: bool = False
 
         self.lora_id = lora_id
@@ -1265,29 +1274,44 @@ class Req(ReqDllmMixin):
         # Trimmed run -> tokens trimmed off the chunk's head.
         head = {}
         candidates = []
+        # With isolated documents, a run over a document is that document's copy
+        # computed alone, from position 0.
+        docs = self.doc_spans if subctx_config.DOCS_ISOLATED else None
+        doc_starts = [a for a, _ in docs] if docs else None
+        doc_runs = set()
         # Runs end before a logprob request's logprob start (`token_ids` stops there).
         with host_timer.record("scan_index"):
             found_runs = (
                 []
-                if self.sub_context_index_declined
+                if self.sub_context_index_declined or self.doc_block
                 else index.scan(
                     self.fill_ids, self.extra_key, min_end=exact + index.min_chunk_tokens
                 )
             )
             for found in found_runs:
+                on_doc = (
+                    doc_relation(docs, doc_starts, found.start, found.end) if docs else 0
+                )
+                if on_doc < 0:
+                    continue
                 start, end = max(found.start, exact), min(found.end, limit)
                 if end - start < index.min_chunk_tokens:
                     continue
                 run = SubContextMatch(start, end, found.chunk_id)
                 head[run] = start - found.start
+                if on_doc:
+                    doc_runs.add(run)
                 candidates.append(run)
 
         moved = rotated = discarded = 0
         fell_back = fell_back_tokens = 0
+        doc_alone = 0
         located = []
         with host_timer.record("scan_locate"):
             for run in index.select(candidates):
-                where = tree_cache.chain_chunk_slots(run.chunk_id)
+                where = tree_cache.chain_chunk_slots(
+                    run.chunk_id, computed_at=0 if run in doc_runs else None
+                )
                 if where is None:
                     discarded += run.length
                     continue
@@ -1333,6 +1357,8 @@ class Req(ReqDllmMixin):
                     continue
                 if delta:
                     rotated += run.length
+                if run in doc_runs:
+                    doc_alone += run.length
                 runs.append((run.start, run.end, dst))
                 nodes.append(node)
         self.sub_context_match_nodes = nodes or None
@@ -1357,17 +1383,30 @@ class Req(ReqDllmMixin):
                 moved += rotated
                 runs = []
                 rotated = 0
+                doc_alone = 0
 
         self.sub_context_moved = moved
         self.sub_context_rotated = rotated
         self.sub_context_discarded = discarded
+        # Isolated document tokens past the prefix, of documents long enough to reuse.
+        doc_past = sum(
+            b - max(a, exact)
+            for a, b in docs or ()
+            if b > exact and b - a >= index.min_chunk_tokens
+        )
         self.sub_context_tally = (
-            len(self.fill_ids),
-            exact,
-            sum(e - s for s, e, _ in runs),
-            rotated,
-            fell_back,
-            fell_back_tokens,
+            None
+            if self.doc_block
+            else (
+                len(self.fill_ids),
+                exact,
+                sum(e - s for s, e, _ in runs),
+                rotated,
+                fell_back,
+                fell_back_tokens,
+                doc_past,
+                doc_alone,
+            )
         )
 
         if TRACE_ON:

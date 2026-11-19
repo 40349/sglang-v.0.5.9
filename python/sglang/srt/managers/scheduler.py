@@ -1670,13 +1670,17 @@ class Scheduler(
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
-                    self.metrics_collector if self.enable_metrics else None
+                    self.metrics_collector
+                    if self.enable_metrics and not recv_req.doc_block
+                    else None
                 ),
                 routing_key=recv_req.routing_key,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 extra_key=recv_req.extra_key,
                 sub_context_ends=recv_req.sub_context_ends,
+                doc_spans=recv_req.doc_spans,
+                doc_block=recv_req.doc_block,
             )
             req.tokenizer = self.tokenizer
 
@@ -1765,6 +1769,12 @@ class Scheduler(
         if req.sub_context_ends:
             req.sub_context_ends = clip_block_ends(
                 req.sub_context_ends, len(req.origin_input_ids), req.rid
+            )
+        if req.doc_spans:
+            req.doc_spans = (
+                [s for s in req.doc_spans if s[1] <= len(req.origin_input_ids)] or None
+                if req.sub_context_ends
+                else None
             )
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:

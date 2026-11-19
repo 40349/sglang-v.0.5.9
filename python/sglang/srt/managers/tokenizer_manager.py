@@ -45,7 +45,17 @@ from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
-from sglang.srt.mem_cache.subctx_index import clip_block_ends, valid_block_ends
+from sglang.srt.mem_cache.subctx_docs import doc_block_ends, valid_doc_spans
+from sglang.srt.mem_cache.subctx_index import (
+    ANCHOR_TOKENS,
+    clip_block_ends,
+    valid_block_ends,
+)
+from sglang.srt.utils.subctx_config import (
+    DISABLE_SUBCONTEXT,
+    DOCS_ISOLATED,
+    MIN_CHUNK_TOKENS,
+)
 from sglang.srt.utils.subctx_trace import TRACE_ON, trace
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
@@ -767,6 +777,26 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             sub_context_ends = clip_block_ends(
                 sub_context_ends, len(input_ids), obj.rid
             )
+        # Documents: one block each, cut at both edges, no cut inside.
+        doc_spans = None
+        if (
+            getattr(obj, "doc_spans", None)
+            and input_ids is not None
+            and not DISABLE_SUBCONTEXT
+        ):
+            if valid_doc_spans(obj.doc_spans, len(input_ids)):
+                doc_spans = [[int(a), int(b)] for a, b in obj.doc_spans]
+                sub_context_ends = doc_block_ends(
+                    sub_context_ends or [len(input_ids)], doc_spans, len(input_ids)
+                )
+                if DOCS_ISOLATED:
+                    await self._compute_docs_alone(obj, input_ids, doc_spans)
+            else:
+                logger.warning(
+                    "Sub-context: ignoring doc_spans that are not increasing, "
+                    "non-overlapping spans inside the prompt (%d tokens).",
+                    len(input_ids),
+                )
         trace_slice_end(RequestStage.TOKENIZE, obj.rid)
         return self._create_tokenized_object(
             obj,
@@ -776,7 +806,61 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             mm_inputs,
             token_type_ids,
             sub_context_ends=sub_context_ends,
+            doc_spans=doc_spans,
         )
+
+    async def _compute_docs_alone(
+        self, obj: GenerateReqInput, input_ids: List[int], doc_spans: List[List[int]]
+    ) -> None:
+        """Run each document of ``doc_spans`` alone, from position 0, as a request of its
+        own, and wait for all of them: the tree then holds each one, registered as one
+        chunk. A document already held is a prefix hit. Documents shorter than the
+        shortest chunk the index registers are skipped, and a document repeated in the
+        prompt runs once.
+        """
+        args = self.server_args
+        if args.tokenizer_worker_num > 1 or args.dp_size > 1:
+            raise ValueError(
+                "SGLANG_SUBCTX_DOCS=isolated needs one tokenizer worker and dp_size 1"
+            )
+
+        async def one(a: int, b: int) -> None:
+            sub = GenerateReqInput(
+                input_ids=list(input_ids[a:b]),
+                sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+                sub_context_ends=[b - a],
+                doc_block=True,
+                extra_key=obj.extra_key,
+                lora_path=obj.lora_path,
+                log_metrics=False,
+            )
+            sub.normalize_batch_and_arguments()
+            await self._validate_and_resolve_lora(sub)
+            tokenized = await self._tokenize_one_request(sub)
+            state = self._send_one_request(sub, tokenized, time.time())
+            async for _ in self._wait_one_response(sub, state):
+                pass
+
+        shortest = max(MIN_CHUNK_TOKENS, ANCHOR_TOKENS)
+        spans, seen = [], set()
+        for a, b in doc_spans:
+            key = tuple(input_ids[a:b])
+            if b - a >= shortest and key not in seen:
+                seen.add(key)
+                spans.append((a, b))
+        results = await asyncio.gather(
+            *(one(a, b) for a, b in spans), return_exceptions=True
+        )
+        failed = [(a, b) for (a, b), r in zip(spans, results) if isinstance(r, Exception)]
+        if failed:
+            logger.warning(
+                "Sub-context: rid=%s: %d of %d documents could not be computed alone "
+                "(first error: %s); the request computes them in place",
+                obj.rid,
+                len(failed),
+                len(spans),
+                next(r for r in results if isinstance(r, Exception)),
+            )
 
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
@@ -930,6 +1014,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         mm_inputs: Optional[Dict] = None,
         token_type_ids: Optional[List[int]] = None,
         sub_context_ends: Optional[List[int]] = None,
+        doc_spans: Optional[List[List[int]]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
         # Parse sampling parameters
@@ -975,6 +1060,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 sub_context_ends=sub_context_ends,
+                doc_spans=doc_spans,
+                doc_block=obj.doc_block,
                 routing_key=obj.routing_key,
                 need_wait_for_image=obj.need_wait_for_image,
                 num_items_assigned=obj.num_items_assigned,
